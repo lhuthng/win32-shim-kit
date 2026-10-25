@@ -1,0 +1,8 @@
+target/
+*.wasm
+__pycache__/
+*.pyc
+.DS_Store
+release/
+# A built payload: the module plus the game's own files, which the kit never owns.
+dist/

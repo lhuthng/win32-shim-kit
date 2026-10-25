@@ -1,0 +1,13 @@
+[package]
+name = "host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+# A library only: the browser ABI belongs to a port, which knows which
+# executable and which page it serves, so it lives in the target crate.
+crate-type = ["rlib"]
+
+[dependencies]

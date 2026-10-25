@@ -1,0 +1,94 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "shimkit payload",
+  "description": "What a payload says about itself: the module that runs it, the executables it can boot, and the facts a loader shows before it starts. Format 1 named a single `executable`; format 2 lists `executables` and names a `default`. Readers accept both.",
+  "oneOf": [{ "$ref": "#/definitions/format2" }, { "$ref": "#/definitions/format1" }],
+  "definitions": {
+    "executable": {
+      "type": "object",
+      "required": ["name", "bytes", "entry", "entry_hex", "image_bytes", "imports"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Root-level file name, exactly as `game/files.json` lists it. This is what a loader passes to wh_set_exe_name."
+        },
+        "bytes": { "type": "integer", "description": "Size of the file on disk." },
+        "entry": { "type": "integer", "description": "Entry address, already at the image's fixed base." },
+        "entry_hex": { "type": "string", "description": "The same address, formatted for display." },
+        "image_bytes": { "type": "integer", "description": "SizeOfImage the loader maps." },
+        "imports": { "type": "integer", "description": "Import count derived from the image's own import directory." }
+      }
+    },
+    "screen": {
+      "type": "object",
+      "required": ["width", "height", "depth"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "depth": {
+          "type": "integer",
+          "enum": [8, 16, 32],
+          "description": "Bits per pixel of the mode the module seeds before the guest asks."
+        }
+      }
+    },
+    "format2": {
+      "type": "object",
+      "required": ["format", "executables", "game"],
+      "properties": {
+        "format": { "const": 2 },
+        "kit": {
+          "type": "object",
+          "required": ["version", "abi"],
+          "description": "The base build this payload was produced with. A composed module records its own `composed_on` in its release manifest; this field is the kit version the writer used.",
+          "properties": {
+            "version": { "type": "string" },
+            "abi": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "screen": { "$ref": "#/definitions/screen" },
+        "default": {
+          "type": "string",
+          "description": "Executable a loader boots when no `?exe=` names one. Must appear in `executables`."
+        },
+        "executables": { "type": "array", "items": { "$ref": "#/definitions/executable" } },
+        "module": {
+          "type": "object",
+          "required": ["name", "bytes"],
+          "properties": { "name": { "type": "string" }, "bytes": { "type": "integer" } }
+        },
+        "game": {
+          "type": "object",
+          "required": ["root", "files", "bytes"],
+          "properties": {
+            "root": { "const": "game" },
+            "files": { "type": "integer" },
+            "bytes": { "type": "integer" }
+          }
+        }
+      }
+    },
+    "format1": {
+      "type": "object",
+      "required": ["format", "executable", "game"],
+      "properties": {
+        "format": { "const": 1 },
+        "executable": { "$ref": "#/definitions/executable" },
+        "module": {
+          "type": "object",
+          "required": ["name", "bytes"],
+          "properties": { "name": { "type": "string" }, "bytes": { "type": "integer" } }
+        },
+        "game": {
+          "type": "object",
+          "required": ["root", "files", "bytes"],
+          "properties": {
+            "root": { "const": "game" },
+            "files": { "type": "integer" },
+            "bytes": { "type": "integer" }
+          }
+        }
+      }
+    }
+  }
+}

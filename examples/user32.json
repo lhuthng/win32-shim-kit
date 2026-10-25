@@ -1,0 +1,143 @@
+{
+  "kind": "shim",
+  "dll": "USER32.dll",
+  "target": "sample",
+  "notes": "The window layer. The browser page is the window, so there is no window manager: CreateWindowExA reports the client rectangle it was given, and the frame loop is a PeekMessageA loop that draws when the queue is empty.",
+  "functions": [
+    {
+      "name": "RegisterClassA",
+      "args": ["lpWndClass: *const u8"],
+      "returns": "u16",
+      "arg_bytes": 4,
+      "rust_name": "register_class",
+      "stub": { "kind": "custom", "body": "Ok(Return(1))" },
+      "description": "The class only has to be remembered so CreateWindowExA can find its window procedure. The atom is a stable non-zero index, not a real atom table entry.",
+      "evidence": "trace: one registration before the only window is created"
+    },
+    {
+      "name": "CreateWindowExA",
+      "args": [
+        "dwExStyle: u32",
+        "lpClassName: *const u8",
+        "lpWindowName: *const u8",
+        "dwStyle: u32",
+        "x: i32",
+        "y: i32",
+        "nWidth: i32",
+        "nHeight: i32",
+        "hWndParent: u32",
+        "hMenu: u32",
+        "hInstance: u32",
+        "lpParam: *const u8"
+      ],
+      "returns": "u32",
+      "arg_bytes": 48,
+      "rust_name": "create_window_ex",
+      "stub": { "kind": "custom", "body": "Ok(Return(0x0001_0100))" },
+      "description": "The one window the game draws into. All four coordinates arrive as CW_USEDEFAULT, so the host substitutes the 640x480 surface instead of asking the OS.",
+      "evidence": "trace: called once with CW_USEDEFAULT for x, y, width and height"
+    },
+    {
+      "name": "ShowWindow",
+      "args": ["hWnd: u32", "nCmdShow: i32"],
+      "returns": "i32",
+      "arg_bytes": 8,
+      "rust_name": "show_window",
+      "stub": { "kind": "custom", "body": "host.notice(\"window shown\".to_string());\n    Ok(Return(1))" },
+      "description": "The page is visible whenever the guest runs, so this is where the activation messages are queued exactly once: WM_ACTIVATE, WM_SETFOCUS, WM_ACTIVATEAPP. Posting them on every call would make the game re-initialise its input each frame.",
+      "evidence": "trace: called once from WinMain, immediately followed by the message loop"
+    },
+    {
+      "name": "PeekMessageA",
+      "args": [
+        "lpMsg: *const u8",
+        "hWnd: u32",
+        "wMsgFilterMin: u32",
+        "wMsgFilterMax: u32",
+        "wRemoveMsg: u32"
+      ],
+      "returns": "i32",
+      "arg_bytes": 20,
+      "rust_name": "peek_message",
+      "stub": { "kind": "custom", "body": "Ok(Return(0))" },
+      "description": "Zero means \"no message\", and that is what makes the frame loop draw: the guest only paints when the queue is empty, exactly as it did on Windows with no input arriving.",
+      "evidence": "trace: 30-60 calls per second, one per frame, in every screen"
+    },
+    {
+      "name": "GetMessageA",
+      "args": ["lpMsg: *const u8", "hWnd: u32", "wMsgFilterMin: u32", "wMsgFilterMax: u32"],
+      "returns": "i32",
+      "arg_bytes": 16,
+      "rust_name": "get_message",
+      "stub": { "kind": "custom", "body": "Ok(Return(1))" },
+      "description": "Cannot block, because the page cannot interrupt a host call and a real block would freeze the tab. An empty queue is answered with WM_NULL rather than WM_QUIT, so the guest keeps running long enough for the next event.",
+      "evidence": "trace: reached only on the dialog paths; returning WM_QUIT there ended the process immediately"
+    },
+    {
+      "name": "DispatchMessageA",
+      "args": ["lpMsg: *const u8"],
+      "returns": "u32",
+      "arg_bytes": 4,
+      "rust_name": "dispatch_message",
+      "stub": { "kind": "custom", "body": "Ok(Return(0))" },
+      "description": "Hands the message to the window procedure the class registered, through the session's guest-call mechanism. The import finishes with that procedure's return value, so the guest sees a normal dispatch.",
+      "evidence": "trace: window procedure at 0x00457da3 receives WM_KEYDOWN from this path"
+    },
+    {
+      "name": "AdjustWindowRectEx",
+      "args": ["lpRect: *const u8", "dwStyle: u32", "bMenu: i32", "dwExStyle: u32"],
+      "returns": "i32",
+      "arg_bytes": 16,
+      "rust_name": "adjust_window_rect",
+      "stub": { "kind": "return", "value": "1" },
+      "description": "Leaves the rectangle untouched: the rehost has no border and no title bar, so the client rectangle is already the window rectangle.",
+      "evidence": "trace: called once before CreateWindowExA; the game never re-reads the result"
+    },
+    {
+      "name": "GetAsyncKeyState",
+      "args": ["vKey: i32"],
+      "returns": "i16",
+      "arg_bytes": 4,
+      "rust_name": "get_async_key_state",
+      "stub": {
+        "kind": "custom",
+        "body": "Ok(Return(u32::from(host.input.async_state(call.arg(0)? as u8))))"
+      },
+      "description": "Bit 15 is the key's state now, bit 0 whether it was pressed since the last read, and that second bit is consumed by the read as on Windows. Losing the consume makes a single tap repeat forever.",
+      "evidence": "trace: polled every frame by the game's own key handling, not through the message queue"
+    },
+    {
+      "name": "ShowCursor",
+      "args": ["bShow: i32"],
+      "returns": "i32",
+      "arg_bytes": 4,
+      "rust_name": "show_cursor",
+      "stub": {
+        "kind": "custom",
+        "body": "host.windows.cursor_visible += if call.arg(0)? != 0 { 1 } else { -1 };\n    Ok(Return(host.windows.cursor_visible as u32))"
+      },
+      "description": "Windows keeps a display counter that hides the pointer at zero. Keeping the same arithmetic means the game's ShowCursor(FALSE) hides the page's own pointer instead of doing nothing.",
+      "evidence": "trace: balanced pairs around the play screens, unbalanced around the menus"
+    },
+    {
+      "name": "SystemParametersInfoA",
+      "args": ["uAction: u32", "uParam: u32", "lpvParam: *mut u8", "fuWinIni: u32"],
+      "returns": "i32",
+      "arg_bytes": 16,
+      "rust_name": "system_parameters_info",
+      "stub": { "kind": "custom", "body": "Ok(Return(1))" },
+      "description": "SPI_GETWORKAREA is answered with the surface rect (no taskbar, no other windows). Anything else is refused with ERROR_INVALID_PARAMETER rather than writing zeroes the game would act on.",
+      "evidence": "trace: only SPI_GETWORKAREA is requested, once, to centre the window"
+    },
+    {
+      "name": "ReleaseDC",
+      "args": ["hWnd: u32", "hDC: u32"],
+      "returns": "i32",
+      "arg_bytes": 8,
+      "rust_name": "release_dc",
+      "stub": { "kind": "return", "value": "1" },
+      "description": "Device contexts here are numbers with no resource behind them, so releasing always succeeds.",
+      "evidence": "trace: paired with GetDC in the same routine"
+    }
+  ]
+}

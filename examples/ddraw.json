@@ -1,0 +1,90 @@
+{
+  "kind": "shim",
+  "dll": "DDRAW.dll",
+  "target": "sample",
+  "notes": "Only DirectDrawCreate is an import: everything else is a COM method the guest reaches through the vtable, which the host dispatches from crates/web-host/src/shim/ddraw.rs. Entries carrying an object are documented here and are not emitted into the import table. The palette methods are what the screen fades run on, so they are the part that must be exact.",
+  "functions": [
+    {
+      "name": "DirectDrawCreate",
+      "args": ["lpGUID: *const u8", "lplpDD: *mut u32", "pUnkOuter: *const u8"],
+      "returns": "i32",
+      "arg_bytes": 12,
+      "rust_name": "direct_draw_create",
+      "stub": { "kind": "custom", "body": "Ok(Return(1))" },
+      "description": "Hands back the one DirectDraw object. Null GUID means the primary driver, which is the only one this host presents.",
+      "evidence": "trace: called once during startup, immediately followed by SetCooperativeLevel"
+    },
+    {
+      "name": "SetDisplayMode",
+      "object": "IDirectDraw",
+      "args": ["this: u32", "width: u32", "height: u32", "bpp: u32"],
+      "returns": "i32",
+      "stub": { "kind": "custom", "body": "Ok(Return(0))" },
+      "description": "Records 640x480x8 and refuses any other depth loudly: the page presents an 8-bit indexed surface and a 16-bit request would otherwise be silently misread.",
+      "evidence": "trace: (640, 480, 8) once at startup and again after the display mode is restored"
+    },
+    {
+      "name": "SetCooperativeLevel",
+      "object": "IDirectDraw",
+      "args": ["this: u32", "hWnd: u32", "flags: u32"],
+      "returns": "i32",
+      "stub": { "kind": "custom", "body": "Ok(Return(0))" },
+      "description": "Stores the flags (exclusive vs normal) because the game queries them later when it decides whether to clip the pointer.",
+      "evidence": "trace: DDSCL_ALLNOTEXCLUSIVE | DDSCL_NORMAL at startup"
+    },
+    {
+      "name": "CreatePalette",
+      "object": "IDirectDraw",
+      "args": ["this: u32", "flags: u32", "entries: *const u8", "palette: *mut u32", "outer: *const u8"],
+      "returns": "i32",
+      "stub": { "kind": "custom", "body": "Ok(Return(0))" },
+      "description": "Allocates the palette object the fades write through. The guest immediately calls SetEntries on it, so a null palette here breaks every fade in the game.",
+      "evidence": "trace: one palette created per screen that fades"
+    },
+    {
+      "name": "CreateSurface",
+      "object": "IDirectDraw",
+      "args": ["this: u32", "desc: *const u8", "surface: *mut u32", "outer: *const u8"],
+      "returns": "i32",
+      "stub": { "kind": "custom", "body": "Ok(Return(0))" },
+      "description": "The primary and back surfaces. The surface's pixels come out of the host arena, which is why a released surface must really free them or a board session runs out of memory.",
+      "evidence": "trace: two surfaces at startup, one extra per screen transition"
+    },
+    {
+      "name": "SetEntries",
+      "object": "IDirectDrawPalette",
+      "args": ["this: u32", "flags: u32", "start: u32", "count: u32", "entries: *const u8"],
+      "returns": "i32",
+      "stub": { "kind": "custom", "body": "Ok(Return(0))" },
+      "description": "The fade primitive. Every fade in this game keeps the same frame and rewrites palette entries only, never flipping, so the host must bump its palette revision here or the page repaints the old frame and the fade is invisible.",
+      "evidence": "trace: 256 entries rewritten per fade step, no Flip between steps"
+    },
+    {
+      "name": "Flip",
+      "object": "IDirectDrawSurface7",
+      "args": ["this: u32", "target: u32", "flags: u32"],
+      "returns": "i32",
+      "stub": { "kind": "custom", "body": "Ok(Return(0))" },
+      "description": "Presents the frame and increments the flip counter the page watches. A screen that only fades presents once, which is why the flip count alone is not enough to drive repaints.",
+      "evidence": "trace: 1 flip for the logo screen, 30-60 per second in the board"
+    },
+    {
+      "name": "Blt",
+      "object": "IDirectDrawSurface7",
+      "args": ["this: u32", "destRect: *const u8", "source: u32", "sourceRect: *const u8", "flags: u32", "bltFx: *const u8"],
+      "returns": "i32",
+      "stub": { "kind": "custom", "body": "Ok(Return(0))" },
+      "description": "Copies sprites into the surface with the colour key applied. This is the busiest call in the game and the one a port would optimise first.",
+      "evidence": "trace: thousands per frame on the board screen"
+    },
+    {
+      "name": "WaitForVerticalBlank",
+      "object": "IDirectDraw",
+      "args": ["this: u32", "flags: u32", "event: u32"],
+      "returns": "i32",
+      "stub": { "kind": "custom", "body": "Ok(Return(0))" },
+      "description": "Succeeds without waiting: the page's own frame callback is the vsync. Sleeping here would stall the interpreter for a frame on every call.",
+      "evidence": "trace: called before each Flip in the board loop"
+    }
+  ]
+}

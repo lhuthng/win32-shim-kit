@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://win32-shim-kit/schema/function-map.schema.json",
+  "title": "Win32 function map",
+  "description": "One file per DLL per target: what that target needs from a Windows DLL, and how the host answers it.",
+  "type": "object",
+  "required": ["kind", "dll", "target", "functions"],
+  "additionalProperties": false,
+  "properties": {
+    "kind": {
+      "enum": ["shim", "inventory"],
+      "description": "shim: the host must answer these calls. inventory: a record of usage, for a port that replaces the platform layer instead."
+    },
+    "dll": {
+      "type": "string",
+      "description": "DLL name as the guest imports it, e.g. KERNEL32.dll"
+    },
+    "target": {
+      "type": "string",
+      "description": "Which game/profile this map belongs to, e.g. doraemon-monopoly-1998"
+    },
+    "notes": { "type": "string" },
+    "functions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/function" }
+    }
+  },
+  "$defs": {
+    "function": {
+      "type": "object",
+      "required": ["name", "description"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "dll": {
+          "type": "string",
+          "description": "Only when this entry belongs to a different DLL than the file's."
+        },
+        "object": {
+          "type": "string",
+          "description": "COM interface this method belongs to (IDirectDraw, IDirectDrawSurface7, IUnknown...). Such a method has no import slot: the guest reaches it through its vtable, which the host dispatches separately. Entries with an object are documented, not emitted into the import table."
+        },
+        "rust_name": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_]*$",
+          "description": "Override the generated Rust identifier. Needed where the project already chose a name that is not a plain snake_case of the Win32 name (CreateWindowExA -> create_window_ex)."
+        },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Declared signature, for documentation and arg_bytes estimation."
+        },
+        "returns": { "type": "string" },
+        "arg_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Bytes of arguments the callee pops. Authoritative: the session cross-checks it against the dispatch table."
+        },
+        "stub": { "$ref": "#/$defs/stub" },
+        "status": {
+          "enum": ["implemented", "stub", "unimplemented", "replaced", "not-needed"],
+          "description": "inventory maps: what the port currently does about this call."
+        },
+        "replaced_by": {
+          "type": "string",
+          "description": "inventory maps: file/symbol that takes over this behaviour in a source port."
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why this entry exists, in terms of the game's behaviour."
+        },
+        "evidence": {
+          "type": "string",
+          "description": "Trace line, call count, or source call site that proved the requirement."
+        }
+      }
+    },
+    "stub": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["return", "noop", "custom", "unimplemented"] },
+        "value": {
+          "type": "string",
+          "description": "For kind=return: the Rust expression to return, e.g. \"0\" or \"WINDOWS_VERSION\"."
+        },
+        "body": {
+          "type": "string",
+          "description": "For kind=custom: a verbatim Rust body. Must return Result<Action>."
+        },
+        "reason": {
+          "type": "string",
+          "description": "For kind=unimplemented: what the run should print when the guest reaches it."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "return" } }, "required": ["kind"] },
+          "then": { "required": ["value"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "custom" } }, "required": ["kind"] },
+          "then": { "required": ["body"] }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,99 @@
+{
+  "kind": "shim",
+  "dll": "KERNEL32.dll",
+  "target": "sample",
+  "notes": "A representative slice of crates/web-host/src/shim/kernel32.rs, where about fifty bindings live. Handles are plain addresses here: the guest never dereferences a heap handle it received.",
+  "functions": [
+    {
+      "name": "GetVersion",
+      "args": [],
+      "returns": "u32",
+      "arg_bytes": 0,
+      "stub": { "kind": "return", "value": "0x0a28_0105" },
+      "description": "Claim Windows XP 5.1 (build 2600) so the version checks take the branch the art was drawn for. The localization's own volume fix targets newer versions separately.",
+      "evidence": "trace: called once during CRT init, result compared against 0x80000000 in the guest's startup path"
+    },
+    {
+      "name": "GetModuleHandleA",
+      "args": ["lpModuleName: *const u8"],
+      "returns": "u32",
+      "arg_bytes": 4,
+      "rust_name": "get_module_handle",
+      "stub": { "kind": "return", "value": "0x0040_0000" },
+      "description": "The image base. The guest passes null and expects its own module; there is exactly one module in this host.",
+      "evidence": "trace: null argument at instruction 184412, result reused as the instance handle in RegisterClassA"
+    },
+    {
+      "name": "GetLastError",
+      "args": [],
+      "returns": "u32",
+      "arg_bytes": 0,
+      "stub": { "kind": "custom", "body": "Ok(Return(host.last_error))" },
+      "description": "Reports the error the previous shim chose to set, so a caller that checks after a refusal sees the code Windows would have produced.",
+      "evidence": "trace: read immediately after LoadLibraryA in the CRT's DLL probe"
+    },
+    {
+      "name": "HeapAlloc",
+      "args": ["hHeap: u32", "dwFlags: u32", "dwBytes: u32"],
+      "returns": "u32",
+      "arg_bytes": 12,
+      "stub": { "kind": "custom", "body": "host.allocate(call.arg(2)?, 8).map(Return)" },
+      "description": "The game allocates and frees every frame; the arena is bump-with-reuse so the churn does not consume the reserve. A request the arena cannot hold answers NULL, which is what the guest's own out-of-memory path tests for.",
+      "evidence": "trace: 4-10 calls per frame during the board; size histogram peaks at 160 bytes"
+    },
+    {
+      "name": "HeapFree",
+      "args": ["hHeap: u32", "dwFlags: u32", "lpMem: *mut u8"],
+      "returns": "i32",
+      "arg_bytes": 12,
+      "stub": { "kind": "custom", "body": "host.release(call.arg(2)?);\n    Ok(Return(1))" },
+      "description": "Returns the block to the free list. Without this the per-frame churn grows the arena until the host reports heap_used climbing without bound.",
+      "evidence": "trace: paired one-for-one with HeapAlloc in the same routine"
+    },
+    {
+      "name": "Sleep",
+      "args": ["dwMilliseconds: u32"],
+      "returns": "i32",
+      "arg_bytes": 4,
+      "stub": { "kind": "return", "value": "0" },
+      "description": "Must not block: a blocking sleep would freeze the page, and the frame clock already owns pacing.",
+      "evidence": "trace: called on the game's own frame limit; frame time is unchanged with the stub"
+    },
+    {
+      "name": "IsBadReadPtr",
+      "args": ["lp: *const u8", "ucb: u32"],
+      "returns": "i32",
+      "arg_bytes": 8,
+      "stub": { "kind": "return", "value": "0" },
+      "description": "Answers \"the pointer is fine\" so the CRT's own validation never short-circuits a real access. The memory layer checks every access anyway and reports the fault with an address.",
+      "evidence": "trace: the CRT probes its own stack buffers, which are always valid"
+    },
+    {
+      "name": "LoadLibraryA",
+      "args": ["lpFileName: *const u8"],
+      "returns": "u32",
+      "arg_bytes": 4,
+      "stub": { "kind": "custom", "body": "host.last_error = 126; // ERROR_MOD_NOT_FOUND\n    Ok(Return(0))" },
+      "description": "There are no further libraries to load: every needed DLL is a shim table in this host. Answering null with the matching error lets the CRT take its missing-DLL path instead of hanging.",
+      "evidence": "trace: probes DSETUP.dll and then continues with its own defaults"
+    },
+    {
+      "name": "GlobalLock",
+      "args": ["hMem: u32"],
+      "returns": "u32",
+      "arg_bytes": 4,
+      "stub": { "kind": "custom", "body": "Ok(Return(call.arg(0)?))" },
+      "description": "Every handle the game holds is already a stable pointer, so locking is identity. Returning null here would make the guest treat a valid block as unavailable.",
+      "evidence": "trace: called on handles produced by GlobalAlloc, which this host does not move"
+    },
+    {
+      "name": "lstrcmpiA",
+      "args": ["lpString1: *const u8", "lpString2: *const u8"],
+      "returns": "i32",
+      "arg_bytes": 8,
+      "stub": { "kind": "return", "value": "0" },
+      "description": "Known-incomplete: this says every pair of strings is equal. It is safe for the one call site that compares a name it just wrote, and it is recorded here as a stub rather than a result to trust.",
+      "evidence": "trace: one call site, used as a cache-key probe whose miss is harmless"
+    }
+  ]
+}

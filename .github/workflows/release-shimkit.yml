@@ -1,0 +1,127 @@
+name: Release shimkit
+
+# Publishing is CI's job, not a local script: a tag push is the only way an
+# asset becomes public, so the bytes a consumer downloads are the bytes CI built
+# from the tagged commit. See docs/release.md for what the tag means.
+on:
+  push:
+    tags:
+      - "shimkit-v*"
+  # A rehearsal: builds and stages the assets as an artifact, publishes nothing.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag is the workspace version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          expected="shimkit-v$version"
+          if [ "$GITHUB_REF_NAME" != "$expected" ]; then
+            printf 'the tag %s does not match %s from Cargo.toml; bump the version or fix the tag\n' \
+              "$GITHUB_REF_NAME" "$expected" >&2
+            exit 1
+          fi
+
+      - name: Install the wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Build the module
+        run: cargo build --release -p host-wasm --lib --target wasm32-unknown-unknown
+
+      - name: Stage the assets
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME:-shimkit-v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)}"
+          out="release/$tag"
+          mkdir -p "$out"
+          cp target/wasm32-unknown-unknown/release/host_wasm.wasm "$out/host_wasm.wasm"
+          cp schema/artifact.schema.json "$out/artifact.schema.json"
+          node --input-type=module - "$out/host_wasm.wasm" "$tag" "$out/shimkit.json" <<'EOF'
+          import { readFileSync, writeFileSync } from "node:fs";
+          import { createHash } from "node:crypto";
+          const [, , file, tag, destination] = process.argv;
+          const bytes = readFileSync(file);
+          const module = new WebAssembly.Module(bytes);
+          const exports = WebAssembly.Module.exports(module).map((entry) => entry.name);
+          const required = ["wh_alloc", "wh_load", "wh_run", "wh_provide_file", "wh_message_ptr"];
+          const missing = required.filter((name) => !exports.includes(name));
+          if (missing.length) {
+            console.error(`the module does not export ${missing.join(", ")}`);
+            process.exit(1);
+          }
+          const manifest = {
+            format: 1,
+            version: tag.replace(/^shimkit-v/, ""),
+            tag,
+            abi: 1,
+            artifact: 2,
+            module: { name: "host_wasm.wasm", bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") },
+            imports: WebAssembly.Module.imports(module).length,
+            exports,
+            built: new Date().toISOString().slice(0, 10),
+          };
+          writeFileSync(destination, JSON.stringify(manifest, null, 2) + "\n");
+          console.log(`${manifest.module.bytes} bytes, ${exports.length} exports, ${manifest.imports} imports`);
+          EOF
+          (cd "$out" && sha256sum host_wasm.wasm shimkit.json artifact.schema.json > SHA256SUMS)
+          cat "$out/SHA256SUMS"
+
+      - name: Check the wire budget
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME:-shimkit-v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)}"
+          sudo apt-get install -y --no-install-recommends brotli >/dev/null
+          wire="$(brotli -q 11 -c "release/$tag/host_wasm.wasm" | wc -c | tr -d ' ')"
+          echo "brotli: $wire bytes"
+          test "$wire" -le 262144 || {
+            echo "the module is over the 256 KiB brotli budget; split it into variants instead of shipping it whole" >&2
+            exit 1
+          }
+
+      - name: Upload the staged assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: shimkit-assets
+          path: release/
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          out="release/$tag"
+          # Read the manifest rather than `require` it: a relative path handed to
+          # require is resolved against the eval module, not the workspace, so
+          # `require("release/...")` looks for a package of that name.
+          title="$(node -e '
+            const { readFileSync } = require("node:fs");
+            const m = JSON.parse(readFileSync(process.argv[1], "utf8"));
+            console.log(`${m.version} · abi ${m.abi} · artifact ${m.artifact} · module ${m.module.bytes} B`);
+          ' "$out/shimkit.json")"
+          notes="$(node -e '
+            const { readFileSync } = require("node:fs");
+            const m = JSON.parse(readFileSync(process.argv[1], "utf8"));
+            console.log([
+              "The engine module, the facts needed to use it, and the payload schema it writes.",
+              "",
+              `module   ${m.module.sha256}`,
+              `exports  ${m.exports.length}`,
+              `imports  ${m.imports}`,
+              "",
+              "Verify with `sha256sum -c SHA256SUMS`. docs/release.md explains the contract.",
+            ].join("\n"));
+          ' "$out/shimkit.json")"
+          gh release create "$tag" \
+            --title "shimkit $title" \
+            --notes "$notes" \
+            "$out/host_wasm.wasm" "$out/shimkit.json" "$out/artifact.schema.json" "$out/SHA256SUMS"

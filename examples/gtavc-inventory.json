@@ -1,0 +1,473 @@
+{
+  "kind": "inventory",
+  "dll": "platform layer",
+  "target": "gtavc-revc-wasm",
+  "notes": "The full platform-layer surface of the GTA: Vice City browser port, taken from reVC and the wasm probe tree. Entries are Win32 calls where the game used one, and named capabilities where the browser answered something Win32 never had (frame pacing, save persistence, asset streaming). Status is what the port does about it now, not whether it works in principle. Win32 names appear in skel/win/win.cpp, which is the D3D9 build and is not compiled for web; every replacement named here is in the tree the wasm build actually uses. Paths are relative to reVC/src, wasm-revc-probe/, or hosting/public/.",
+  "functions": [
+    {
+      "name": "CreateWindowExW",
+      "status": "replaced",
+      "replaced_by": "vendor/librw/src/gl/gl3device.cpp",
+      "description": "The window is librw's GL3 device: it creates the SDL window and the GL context. Nothing above the skeleton holds an HWND, so there is no handle to pass around.",
+      "evidence": "SDL_CreateWindow appears only in vendor/librw/src/gl/gl3device.cpp; skel/win/win.cpp is guarded by RW_D3D9 || RWLIBS || __MWERKS__"
+    },
+    {
+      "name": "RegisterClassW",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp, src/skel/events.cpp",
+      "description": "There is no window procedure. Input arrives as an RsEvent and is handed to RsKeyboardEventHandler/KeyboardHandler instead of a WndProc callback.",
+      "evidence": "skeleton.h declares AppEventHandler/RsEventHandler/RsKeyboardEventHandler; events.cpp defines KeyboardHandler and PadHandler"
+    },
+    {
+      "name": "ShowWindow",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "The canvas is visible whenever the page is. Fullscreen is an SDL window state, not a show/hide command.",
+      "evidence": "win.cpp ShowWindow calls are on the D3D9 startup path only"
+    },
+    {
+      "name": "AdjustWindowRectEx",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "The canvas is the client area: there is no border or title bar to add to the requested size.",
+      "evidence": "gl3device.cpp sizes the drawable from the canvas, not from a decorated window rect"
+    },
+    {
+      "name": "SetWindowPos",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "Resolution and mode changes go through the skeleton's video-mode path and SDL_SetWindowSize, not window z-order.",
+      "evidence": "sdl2.cpp calls SDL_SetWindowSize once, for the mode switch"
+    },
+    {
+      "name": "PeekMessageW",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "One SDL_PollEvent loop per frame feeds the handlers directly. There is no message queue above the skeleton, which is why the pause and focus paths are events rather than messages.",
+      "evidence": "sdl2.cpp: while (SDL_PollEvent(&event)) { switch (event.type) ... }"
+    },
+    {
+      "name": "DispatchMessageW",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "The poll loop dispatches as it goes: SDL_KEYDOWN/UP call RsKeyboardEventHandler, motion calls cursorCB, wheel calls scrollCB.",
+      "evidence": "sdl2.cpp lines around the poll loop"
+    },
+    {
+      "name": "TranslateMessage",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp, src/skel/events.cpp",
+      "description": "There is no WM_CHAR. Shift states are folded into the key event by _InputTranslateShiftKeyUpDown, and KeyboardHandler builds the game's character and key state from that.",
+      "evidence": "sdl2.cpp: _InputTranslateShiftKeyUpDown emits rsLSHIFT/rsRSHIFT key events"
+    },
+    {
+      "name": "PostQuitMessage",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "Quitting sets the skeleton's quit flag so the frame loop ends after the current frame, instead of posting a message nobody pumps.",
+      "evidence": "skeleton.h RsGlobalType.quit; HandleExit in platform.h"
+    },
+    {
+      "name": "GetSystemMetrics",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "Screen size is the canvas size the skeleton was given, exposed as RsGlobal.width/height and the ViceScreenWidth/Height exports.",
+      "evidence": "win.cpp asks the OS four times; sdl2.cpp answers from the canvas and display mode"
+    },
+    {
+      "name": "GetClientRect",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "The client rectangle is the raster size the renderer was built for.",
+      "evidence": "ViceRenderWidth/ViceRasterW are exported from the skeleton for the shell to read"
+    },
+    {
+      "name": "SystemParametersInfoA",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "Work area, display and screen-saver queries are answered from the canvas and display mode. There is no desktop to ask, and no screen saver to suppress.",
+      "evidence": "win.cpp makes ten SystemParametersInfo calls, all on the D3D9 path"
+    },
+    {
+      "name": "ChangeDisplaySettingsA",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "Mode switching is SDL_SetWindowFullscreen/SDL_SetWindowSize through the skeleton. EnumDisplaySettings does not exist in the browser, so the mode list is the player's choice of aspect and resolution instead.",
+      "evidence": "win.cpp: EnumDisplaySettings/ChangeDisplaySettings; sdl2.cpp: one SDL_SetWindowSize and canvas resizing"
+    },
+    {
+      "name": "SetWindowLongA",
+      "status": "not-needed",
+      "description": "Win32 used it to subclass the window procedure for raw input and IME. The SDL skeleton routes its own events, so there is no procedure to replace.",
+      "evidence": "win.cpp: SetWindowLong (GWL_WNDPROC) around raw input registration"
+    },
+    {
+      "name": "MessageBoxA",
+      "status": "replaced",
+      "replaced_by": "re3_debug (src/core/Debug.*)",
+      "description": "Fatal errors and assertions go to the runtime log the page shows, not to a modal dialog a browser cannot draw.",
+      "evidence": "win.cpp: six MessageBox calls, all fatal-error paths; crossplatform.h maps OutputDebugString to re3_debug"
+    },
+    {
+      "name": "CoInitialize",
+      "status": "not-needed",
+      "description": "DirectShow is the only COM user in the Win32 build, and movie playback is disabled in the browser build. No apartment is created, so CoCreateInstance is never reached.",
+      "evidence": "sdl2.cpp GS_LOGO_MPEG: PlayMovieInWindow is commented out and the state just advances"
+    },
+    {
+      "name": "CoCreateInstance",
+      "status": "not-needed",
+      "description": "Same reason: the IMediaControl/IMediaEvent objects existed only to play the logo and intro MPEGs, which the port skips.",
+      "evidence": "win.cpp: CoCreateInstance for DirectShow; sdl2.cpp never constructs it"
+    },
+    {
+      "name": "GetAsyncKeyState",
+      "status": "replaced",
+      "replaced_by": "src/skel/events.cpp",
+      "description": "Key state comes from the skeleton's own state, fed by the SDL poll loop. There is no per-key async query to the OS.",
+      "evidence": "win.cpp has no GetAsyncKeyState; events.cpp KeyboardHandler maintains key status"
+    },
+    {
+      "name": "GetKeyboardState",
+      "status": "replaced",
+      "replaced_by": "src/skel/events.cpp",
+      "description": "The whole keyboard state is the skeleton's array, updated on key down and up events rather than sampled.",
+      "evidence": "events.cpp HandleKeyDown/HandleKeyUp update RsKeyStatus"
+    },
+    {
+      "name": "MapVirtualKeyA",
+      "status": "replaced",
+      "replaced_by": "src/skel/events.cpp",
+      "description": "The mapping from a native key to an RsKeyCode is a table in the skeleton. There is no virtual-key space to translate into.",
+      "evidence": "win.cpp: MapVirtualKey; events.cpp key tables"
+    },
+    {
+      "name": "RegisterRawInputDevices",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "Relative mouse motion is SDL motion deltas with SDL_SetRelativeMouseMode; the raw-input device registration existed to get the same thing from Win32.",
+      "evidence": "sdl2.cpp: SDL_SetRelativeMouseMode plus mouseRelX/mouseRelY accumulation"
+    },
+    {
+      "name": "DirectInput8Create",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "Gamepads come from SDL_GameControllerOpen. There is no DirectInput object, and no device enumeration beyond what SDL reports.",
+      "evidence": "sdl2.cpp: two SDL_GameControllerOpen calls (joy1/joy2); DirectInput8Create only in win.cpp"
+    },
+    {
+      "name": "joyGetPosEx",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "Pad state is SDL controller state, including the axis and button mapping the old joystick API did not unify.",
+      "evidence": "win.cpp: joyGetPosEx in the D3D9 build; sdl2.cpp CapturePad/joysChangeCB"
+    },
+    {
+      "name": "ClipCursor",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "Confining the pointer is SDL_SetRelativeMouseMode plus SDL_WarpMouseInWindow. The browser will not let a page pin the real cursor, and does not need to.",
+      "evidence": "sdl2.cpp: SDL_SetRelativeMouseMode and SDL_WarpMouseInWindow"
+    },
+    {
+      "name": "SetCursorPos",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "The game's notion of the pointer is the skeleton's mouse position; the visible pointer is the canvas cursor, which SDL_ShowCursor controls.",
+      "evidence": "sdl2.cpp: SDL_WarpMouseInWindow; ViceMouseX/ViceDrawnMouseX exports"
+    },
+    {
+      "name": "ShowCursor",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "Two SDL_ShowCursor calls track the game's show/hide, so the menu shows the browser pointer and the game hides it.",
+      "evidence": "sdl2.cpp: SDL_ShowCursor appears twice"
+    },
+    {
+      "name": "SetCapture",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "Mouse state is delivered for the whole canvas regardless of where the press started, so there is no capture handoff to emulate.",
+      "evidence": "win.cpp: SetCapture/ReleaseCapture (3 and 4 hits) in the D3D9 build only"
+    },
+    {
+      "name": "ReleaseCapture",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "Same as SetCapture: the canvas owns mouse input for as long as the pointer is over it.",
+      "evidence": "win.cpp only"
+    },
+    {
+      "name": "GetCursorPos",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "The skeleton tracks the pointer from motion events and exposes it to the shell; nothing polls the OS.",
+      "evidence": "sdl2.cpp cursorCB, ViceMouseX/ViceMouseY exports"
+    },
+    {
+      "name": "ImmGetContext",
+      "status": "not-needed",
+      "description": "There is no IME and no window to attach an input context to. The game takes no text entry, so nothing is lost.",
+      "evidence": "win.cpp has no Imm* calls in the files this port compiles"
+    },
+    {
+      "name": "DirectSoundCreate8",
+      "status": "replaced",
+      "replaced_by": "src/audio/sampman_oal.cpp",
+      "description": "Audio is OpenAL: emscripten's port over WebAudio (-lopenal). The sample manager speaks OpenAL directly, so there is no DirectSound object and no primary buffer.",
+      "evidence": "src/CMakeLists.txt: AUDIO_OAL + -lopenal for EMSCRIPTEN; no DirectSound in the OAL path"
+    },
+    {
+      "name": "auxSetVolume",
+      "status": "replaced",
+      "replaced_by": "src/audio/oal/channel.cpp",
+      "description": "Volume is an AL gain on the source. The Win32 auxiliary-device mixer does not exist in the browser.",
+      "evidence": "channel.cpp CChannel::SetVolume -> SetGain; win.cpp aux* calls are the Win32 mixer path"
+    },
+    {
+      "name": "mciSendString",
+      "status": "not-needed",
+      "description": "No MCI: streamed radio is decoded by libopus/libmpg123 inside the sample manager, not by a system media device.",
+      "evidence": "win.cpp has no mciSendString; stream.cpp handles MP3/Opus directly"
+    },
+    {
+      "name": "EnvironmentReverb",
+      "status": "unimplemented",
+      "description": "EFX is missing from emscripten's OpenAL, so EAX environmental reverb is unavailable in the browser build. Nothing crashes: every EFX call is already behind alcIsExtensionPresent(ALC_EXT_EFX_NAME), which fails, so the pointers stay null. Music, radio, speech and positional SFX are unaffected.",
+      "evidence": "wasm-revc-probe/src/audio/oal/emscripten/AL/efx.h says exactly this; CMakeLists adds that include dir for EMSCRIPTEN"
+    },
+    {
+      "name": "StreamedRadioDecoding",
+      "status": "implemented",
+      "replaced_by": "src/audio/sampman_oal.cpp, scripts/build-audio-deps.sh",
+      "description": "The nine stations are Opus at 32 kbps instead of 48 kbps MP3, which is a third smaller. opus and opusfile are not emscripten ports, so they are built for wasm by build-audio-deps.sh; ogg is a port.",
+      "evidence": "src/CMakeLists.txt REVC_OPUS_PREFIX + -sUSE_OGG; sampman.h StreamedNameTable uses .OPUS for the nine stations"
+    },
+    {
+      "name": "SampleRateDescriptor",
+      "status": "implemented",
+      "replaced_by": "src/audio/sampman.h, src/audio/oal/channel.cpp",
+      "description": "A resampled sample bank stores its real rate in tSample.nDataFrequency, while nFrequency keeps the 22050 the engine's pitch tables and doppler limits assume. Only the OpenAL buffer is declared at the real rate. The struct is asserted at 24 bytes because it is the on-disk descriptor record, and both layouts are read by size.",
+      "evidence": "sampman.h static_assert(sizeof(tSample) == 24); sampman_oal.cpp reads the descriptor record by record and keys off its size"
+    },
+    {
+      "name": "timeGetTime",
+      "status": "replaced",
+      "replaced_by": "src/skel/crossplatform.cpp",
+      "description": "psTimer is the only clock in the port. On wasm it reads emscripten_get_now().",
+      "evidence": "platform.h declares psTimer; sdl2.cpp psTimer returns emscripten_get_now()"
+    },
+    {
+      "name": "QueryPerformanceCounter",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "Same clock. The trap worth recording: emscripten declares CLOCK_MONOTONIC_RAW but the call fails and leaves the timespec untouched, so the clock reads one value forever and the frontend fade never leaves alpha 0. The browser clock is the only correct answer.",
+      "evidence": "sdl2.cpp psTimer comment and #ifdef __EMSCRIPTEN__ branch"
+    },
+    {
+      "name": "GetTickCount",
+      "status": "replaced",
+      "replaced_by": "src/skel/crossplatform.cpp",
+      "description": "Milliseconds come from the same skeleton clock; there is no tick counter to query.",
+      "evidence": "win.cpp: GetTickCount in the D3D9 path"
+    },
+    {
+      "name": "timeBeginPeriod",
+      "status": "not-needed",
+      "description": "There is no system timer resolution to raise, and nothing to restore afterwards.",
+      "evidence": "win.cpp: timeBeginPeriod/timeEndPeriod, D3D9 only"
+    },
+    {
+      "name": "Sleep",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "The frame yield is an EM_ASYNC_JS that suspends the whole C++ stack on requestAnimationFrame. A real sleep would either freeze the tab or move drawing outside the animation frame, where the WebGL back buffer is not preserved and the canvas goes black.",
+      "evidence": "sdl2.cpp reVCYieldFrame EM_ASYNC_JS; comment explains the black-canvas failure"
+    },
+    {
+      "name": "FramePacing",
+      "status": "implemented",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "Pacing comes from the compositor: each frame waits for requestAnimationFrame, so the game runs inside the display cadence instead of a timer.",
+      "evidence": "sdl2.cpp reVCYieldFrame promise resolves on requestAnimationFrame"
+    },
+    {
+      "name": "HiddenTabProgress",
+      "status": "implemented",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "A background tab stops firing requestAnimationFrame, which would suspend the engine between frames for as long as the tab stays hidden. A small worker with a 16 ms setInterval releases the wait instead, and whichever source fires first wins.",
+      "evidence": "sdl2.cpp reVCYieldFrame: Worker(setInterval(postMessage, 16)) plus __reVCWaiters"
+    },
+    {
+      "name": "CreateFileA",
+      "status": "replaced",
+      "replaced_by": "hosting/public/shell.js, src/fakerw/",
+      "description": "Reads go through CFileMgr into MEMFS. The shell mounts small startup files eagerly and presents everything else as a block-backed node whose blocks are fetched on first read; nothing calls the OS.",
+      "evidence": "shell.js mountStreamed/mount and blockGet; gamefiles.json lists the overlay files"
+    },
+    {
+      "name": "ReadFile",
+      "status": "replaced",
+      "replaced_by": "hosting/public/shell.js",
+      "description": "A block node reports its real size to the engine and fetches whole blocks as they are read, so a multi-hundred-MB model file never has to be resident.",
+      "evidence": "shell.js: FS.createNode with a custom stream_ops.read and blockGet(base, block)"
+    },
+    {
+      "name": "FindFirstFileA",
+      "status": "replaced",
+      "replaced_by": "src/skel/crossplatform.cpp",
+      "description": "The non-Windows compatibility layer implements FindFirstFile over opendir and fills a WIN32_FIND_DATA, so the game's directory scans keep working on a POSIX filesystem.",
+      "evidence": "crossplatform.cpp line 85: HANDLE FindFirstFile(const char*, WIN32_FIND_DATA*)"
+    },
+    {
+      "name": "FindNextFileA",
+      "status": "replaced",
+      "replaced_by": "src/skel/crossplatform.cpp",
+      "description": "Companion to FindFirstFile, backed by readdir over the same DIR handle.",
+      "evidence": "crossplatform.cpp line 120: bool FindNextFile(HANDLE, WIN32_FIND_DATA*)"
+    },
+    {
+      "name": "DeleteFileA",
+      "status": "replaced",
+      "replaced_by": "src/skel/crossplatform.h",
+      "description": "DeleteFile is #defined to unlink for every non-Windows build, including wasm.",
+      "evidence": "crossplatform.h: #define DeleteFile unlink"
+    },
+    {
+      "name": "GetLocalTime",
+      "status": "replaced",
+      "replaced_by": "src/skel/crossplatform.cpp",
+      "description": "GetLocalTime_CP fills a local SYSTEMTIME. Saves and stats are stamped with it, so the on-disk format matches what the Win32 build wrote.",
+      "evidence": "crossplatform.cpp line 76: void GetLocalTime_CP(SYSTEMTIME *out)"
+    },
+    {
+      "name": "FileTimeToSystemTime",
+      "status": "replaced",
+      "replaced_by": "src/skel/crossplatform.cpp",
+      "description": "Reimplemented over time_t so file timestamps reach the save screen in the same shape as before.",
+      "evidence": "crossplatform.cpp line 158: void FileTimeToSystemTime(time_t*, SYSTEMTIME*)"
+    },
+    {
+      "name": "GetDateFormat",
+      "status": "replaced",
+      "replaced_by": "src/skel/crossplatform.cpp",
+      "description": "Formats the date the way the game's save slots expect, without a locale API.",
+      "evidence": "crossplatform.cpp line 142: void GetDateFormat(...)"
+    },
+    {
+      "name": "GetModuleFileNameA",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "There is no module file. The install root is the skeleton's base path inside MEMFS, which the shell sets up before the engine starts.",
+      "evidence": "shell.js FS.mkdirTree(GAME_ROOT) and FS.chdir(GAME_ROOT)"
+    },
+    {
+      "name": "RegOpenKeyExA",
+      "status": "replaced",
+      "replaced_by": "src/core/re3.cpp",
+      "description": "Settings live in userfiles/reVC.ini through mINI. That directory is the one the page keeps, so options survive a reload instead of being lost with the tab.",
+      "evidence": "re3.cpp: mINI::INIFile ini(\"userfiles/reVC.ini\") under __EMSCRIPTEN__"
+    },
+    {
+      "name": "RegQueryValueExA",
+      "status": "replaced",
+      "replaced_by": "src/core/re3.cpp",
+      "description": "Reads come from the ini; absent keys fall back to the compiled-in defaults, which is what the Win32 build's missing-registry path did too.",
+      "evidence": "re3.cpp ReadIniIfExists"
+    },
+    {
+      "name": "RegSetValueExA",
+      "status": "replaced",
+      "replaced_by": "src/core/re3.cpp",
+      "description": "Writes go to the same ini in userfiles, which is mounted on IndexedDB and flushed after writes.",
+      "evidence": "re3.cpp ini write path; web/src/main.ts mountPersistent(userfiles)"
+    },
+    {
+      "name": "ShellExecuteA",
+      "status": "not-needed",
+      "description": "No external program can be launched from the page, and the game only used it to open URLs and folders.",
+      "evidence": "win.cpp: ShellExecute (D3D9 path only)"
+    },
+    {
+      "name": "CaseInsensitivePathLookup",
+      "status": "replaced",
+      "replaced_by": "src/skel/crossplatform.cpp",
+      "description": "The game's data references use Windows' mixed case and backslashes. casepath/_fcaseopen resolve them against a case-sensitive filesystem; without it every asset lookup misses and the game looks like its data is missing.",
+      "evidence": "crossplatform.cpp: casepath (line 244), _fcaseopen (line 206), _caserename (line 219)"
+    },
+    {
+      "name": "VirtualAlloc",
+      "status": "not-needed",
+      "description": "Nothing in reVC calls it. The engine has its own MemoryMgr, and the wasm heap is fixed at link time rather than reserved at runtime.",
+      "evidence": "no VirtualAlloc/HeapAlloc occurrences in reVC/src"
+    },
+    {
+      "name": "GetSystemInfo",
+      "status": "replaced",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "There is no OS to ask for physical memory. _dwMemAvailPhys is emscripten_get_heap_size(), which the engine uses to size its pools. The heap is a fixed 1 GiB with growth disabled: growing it detaches the typed-array views WebGL and the audio path hold, and this 2002 code casts pointers to signed ints anyway.",
+      "evidence": "sdl2.cpp __EMSCRIPTEN__ branch; src/CMakeLists.txt -sINITIAL_MEMORY=1073741824 -sALLOW_MEMORY_GROWTH=0"
+    },
+    {
+      "name": "CreateThread",
+      "status": "not-needed",
+      "description": "The pthread CD-stream backend (CdStream_posix) is compiled out on wasm, and Threads::Threads is not linked for the emscripten target. Model data is read through CFileMgr instead of pthread streaming channels, so there is no thread to create.",
+      "evidence": "CdStream_posix.cpp line 1: #if !defined(_WIN32) && !defined(__EMSCRIPTEN__); CMakeLists: Threads::Threads only if(NOT EMSCRIPTEN)"
+    },
+    {
+      "name": "AudioFileOpsThread",
+      "status": "not-needed",
+      "description": "Stream decoding runs on the main thread: MULTITHREADED_AUDIO is never defined by the build, so the std::thread in stream.cpp is compiled out even though the file still contains it.",
+      "evidence": "stream.cpp guards std::thread behind #ifdef MULTITHREADED_AUDIO; no definition in either CMakeLists"
+    },
+    {
+      "name": "PageTelemetry",
+      "status": "implemented",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "ViceLogicFrame and its siblings are exported so the page can tell a live loop from a stale status line: frame counter, game state, menu state, fade value, heap used, mouse and window size.",
+      "evidence": "src/CMakeLists.txt EXPORTED_FUNCTIONS list; sdl2.cpp EMSCRIPTEN_KEEPALIVE ViceLogicFrame"
+    },
+    {
+      "name": "CanvasResolution",
+      "status": "implemented",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "The shell can ask for a resolution and read back the screen, render and raster sizes, so the canvas and the engine's drawable stay in step.",
+      "evidence": "ViceSetResolution/ViceScreenWidth/ViceRenderWidth/ViceRasterW exports"
+    },
+    {
+      "name": "SavePersistence",
+      "status": "implemented",
+      "replaced_by": "web/src/main.ts",
+      "description": "userfiles is mounted on IDBFS and read back at boot; the engine calls ViceSyncSaves after each write. The shell logs what came back every boot, because a player whose save silently vanished cannot be asked to open a console.",
+      "evidence": "web/src/main.ts mountSaves/reportSaves; -lidbfs.js and FS,IDBFS in EXPORTED_RUNTIME_METHODS"
+    },
+    {
+      "name": "AssetBlockStreaming",
+      "status": "implemented",
+      "replaced_by": "hosting/public/shell.js",
+      "description": "Small startup probes are mounted whole; everything else is a block-backed FS node fetched whole on first read, with HTTP Range fallback for files not cut into blocks. Block size is per-file, so a recompressed asset can be cut differently from the shell default.",
+      "evidence": "shell.js mountStreamed: entry.blocks.blockSize, blockGet(base, block), Range for non-blocked files"
+    },
+    {
+      "name": "FirstRunLanguage",
+      "status": "implemented",
+      "replaced_by": "src/skel/sdl2/sdl2.cpp",
+      "description": "On a genuinely first run the browser's language picks the game language. Detecting it by gta_vc.set was wrong under LOAD_INI_SETTINGS, which never writes that file, so it reported first run on every boot and overrode the player's choice forever.",
+      "evidence": "sdl2.cpp __EMSCRIPTEN__ block: viceFirstRun from userfiles/reVC.ini, then viceLanguageFromBrowser()"
+    },
+    {
+      "name": "WebGL2Requirement",
+      "status": "implemented",
+      "replaced_by": "src/CMakeLists.txt, vendor/librw/src/gl/gl3device.cpp",
+      "description": "librw's gl3 backend runs as GLES3 on WebGL2. WebGL1 is not supported, so a browser without WebGL2 cannot run the port at all; that is a hard floor, not a fallback.",
+      "evidence": "src/CMakeLists.txt: MIN_WEBGL_VERSION=2, MAX_WEBGL_VERSION=2, FULL_ES3=1"
+    },
+    {
+      "name": "AsyncifyFrameYield",
+      "status": "implemented",
+      "replaced_by": "src/CMakeLists.txt",
+      "description": "The engine keeps its blocking loop and yields once per frame through Asyncify, which suspends and resumes the whole C++ stack. Without it the 2002 game loop would have to be rewritten as a state machine.",
+      "evidence": "src/CMakeLists.txt: -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=131072"
+    }
+  ]
+}
