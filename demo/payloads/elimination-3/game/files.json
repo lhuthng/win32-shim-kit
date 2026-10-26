@@ -1,0 +1,54 @@
+[
+  {
+    "bytes": 108544,
+    "name": "elim3b.exe"
+  },
+  {
+    "bytes": 26797,
+    "name": "music1.mid"
+  },
+  {
+    "bytes": 15434,
+    "name": "music10.mid"
+  },
+  {
+    "bytes": 23690,
+    "name": "music2.mid"
+  },
+  {
+    "bytes": 64195,
+    "name": "music3.mid"
+  },
+  {
+    "bytes": 92564,
+    "name": "music4.mid"
+  },
+  {
+    "bytes": 8410,
+    "name": "music5.mid"
+  },
+  {
+    "bytes": 4260,
+    "name": "music6.mid"
+  },
+  {
+    "bytes": 6963,
+    "name": "music7.mid"
+  },
+  {
+    "bytes": 27521,
+    "name": "music8.mid"
+  },
+  {
+    "bytes": 30974,
+    "name": "music9.mid"
+  },
+  {
+    "bytes": 462778,
+    "name": "res.dat"
+  },
+  {
+    "bytes": 116,
+    "name": "settings.dat"
+  }
+]

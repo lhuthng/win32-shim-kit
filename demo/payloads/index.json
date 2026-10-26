@@ -1,0 +1,17 @@
+{
+  "payloads": [
+    {
+      "slug": "elimination-3",
+      "title": "Elimination III",
+      "note": "A 2000 DirectDraw arena shooter, booted from its own executable. Written for DirectX 3: DirectDraw, DirectSound by ordinal, and DirectInput 3.0."
+    },
+    {
+      "slug": "cavestory",
+      "title": "Cave Story",
+      "note": "Studio Pixel's 2004 freeware platformer, booted from Doukutsu.exe with its 400 game files: DirectDraw surfaces, DirectSound, DirectInput, and GDI text through CreateFontA and TextOutA. It renders every music track into PCM before its first screen, so it takes a while to load.",
+      "instructions": 900000000,
+      "lit": 0.01,
+      "saves": ["profile.dat", "290.rec"]
+    }
+  ]
+}

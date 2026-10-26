@@ -210,6 +210,21 @@ impl DirectSound {
             .map_or(&[], |buffer| buffer.pcm.as_slice())
     }
 
+    /// Where a voice's samples live, in guest memory, and how many bytes the
+    /// buffer holds. A guest that keeps the pointer it locked writes into the
+    /// buffer while it plays, so a mixer reads here rather than trusting the
+    /// copy taken at Play.
+    pub fn samples(&self, voice: u32) -> Option<(u32, u32)> {
+        let buffer = self
+            .buffers
+            .get(&voice)
+            .or_else(|| self.retired.get(&voice))?;
+        if buffer.primary || buffer.data == 0 {
+            return None;
+        }
+        Some((buffer.data, buffer.size))
+    }
+
     /// The page has processed every event, so a released voice's samples can go.
     pub fn clear_events(&mut self) {
         self.events.clear();
@@ -997,6 +1012,32 @@ mod tests {
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[1].volume, -1_500);
         assert_eq!(updates[1].pan, -4_000);
+    }
+
+    #[test]
+    fn a_voice_names_the_memory_its_samples_live_in() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let device = open(&mut host, &mut memory);
+        let buffer = create_secondary(&mut host, &mut memory, device, 8, 1, 22_050);
+        let (address, length) = host.audio.samples(buffer).expect("a voice has samples");
+        assert_eq!(length, 8);
+        assert_ne!(address, 0);
+        // The guest writes into that memory, so what the page reads is the sound
+        // as it stands, not a copy taken when `Play` was called.
+        memory.write_bytes(address, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let bytes = memory.read_bytes(address, 8).unwrap().to_vec();
+        assert_eq!(bytes, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+        // A released voice has had its memory handed back, so the page has to
+        // fall back on the copy the host kept.
+        let mut release = invoke(&mut memory, &[buffer]);
+        assert_eq!(
+            serve(&mut host, &mut release, thunks::DSOUND_BUFFER, "Release").unwrap(),
+            Return(0)
+        );
+        assert!(host.audio.samples(buffer).is_none());
     }
 
     #[test]

@@ -215,6 +215,9 @@ pub enum Mnemonic {
     Cmovcc(Condition),
     Cwde,
     Cdq,
+    /// `bswap r32`: the four bytes of a register reversed, which is how a byte
+    /// order read off a file is turned into a word.
+    Bswap,
     /// `xlat`: `al = [ebx + al]`, which MSVC uses to index a byte table.
     Xlat,
     Lahf,
@@ -504,6 +507,33 @@ impl Registers {
 /// [`crate::pe::IMAGE_BASE`], which is why this range is unambiguous.
 pub const HOST_FUNCTION_BASE: u32 = 0x00f0_0000;
 
+/// Where a name a program resolved with `GetProcAddress` lives.
+///
+/// An import table is not the only way a guest reaches the host: a program that
+/// binds its own functions at run time -- a packed or wrapped executable, an
+/// extension DLL's host -- calls `GetProcAddress` and then calls the address it
+/// was given. That address has to land on something the step loop recognises, and
+/// it cannot be an import slot: there is no slot, the program never imported the
+/// name. So each resolved name gets its own four-byte address here, and the host
+/// keeps the binding it stands for. The region ends well below
+/// [`crate::thunks::THUNK_BASE`], so the three ranges stay disjoint.
+pub const PROC_BASE: u32 = 0x00d0_0000;
+
+/// How many resolved names one session may hand out: 16384 addresses, up to
+/// `PROC_BASE + 0x10000`, still clear of the thunks.
+pub const PROC_LIMIT: u32 = 0x4000;
+
+/// The resolved-name index a program counter points at, when it lands in that
+/// range. Which binding it is, is the host's business: this only says the address
+/// is one of them.
+pub fn proc_at(eip: u32) -> Option<usize> {
+    let offset = eip.wrapping_sub(PROC_BASE);
+    if offset >= PROC_LIMIT * 4 || offset & 3 != 0 {
+        return None;
+    }
+    Some((offset / 4) as usize)
+}
+
 /// Where a host-called guest routine returns to. A timer callback is entered by
 /// the session with this address pushed as its `ret` target, so the interpreter
 /// can tell a callback's return from the guest's own and restore the frame it
@@ -532,6 +562,85 @@ pub fn host_slot_at(eip: u32, table: crate::dispatch::Table) -> Option<usize> {
     }
     let slot = (offset / 4) as usize;
     (slot < table.len()).then_some(slot)
+}
+
+/// What a shim asks the float stack to do, when the answer lives in `st0`
+/// rather than in `eax`.
+///
+/// A C function that returns a `double` leaves it on the x87 stack, and a shim has
+/// no access to it: the FPU belongs to the interpreter, which the shim runs
+/// inside. So a shim names the operation and the session applies it, which is the
+/// only way a maths import can answer with the value the caller expects.
+pub enum FloatOp {
+    /// Push a value the shim computed from its stack arguments: `sqrt(2.0)`,
+    /// whose argument is a dword pair the shim has already read.
+    Push(u64),
+    /// Replace the top of the stack with `function(top)`.
+    Unary(Unary),
+    /// `_CIpow`: the exponent is on top, the base under it.
+    Pow,
+    /// `_ftol`: truncate the top into `edx:eax` and pop it.
+    TruncateToInt,
+}
+
+impl std::fmt::Debug for FloatOp {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Push(bits) => write!(formatter, "Push({})", f64::from_bits(*bits)),
+            Self::Unary(function) => write!(formatter, "Unary({function:?})"),
+            Self::Pow => write!(formatter, "Pow"),
+            Self::TruncateToInt => write!(formatter, "TruncateToInt"),
+        }
+    }
+}
+
+impl PartialEq for FloatOp {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Push(one), Self::Push(two)) => one == two,
+            (Self::Unary(one), Self::Unary(two)) => one == two,
+            (Self::Pow, Self::Pow) | (Self::TruncateToInt, Self::TruncateToInt) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for FloatOp {}
+
+impl Clone for FloatOp {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl Copy for FloatOp {}
+
+/// The one-argument float functions the CRT exports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unary {
+    Sqrt,
+    Sin,
+    Cos,
+    Atan,
+    Asin,
+    Acos,
+    Floor,
+    Abs,
+}
+
+impl Unary {
+    fn apply(self, value: f64) -> f64 {
+        match self {
+            Self::Sqrt => value.sqrt(),
+            Self::Sin => value.sin(),
+            Self::Cos => value.cos(),
+            Self::Atan => value.atan(),
+            Self::Asin => value.asin(),
+            Self::Acos => value.acos(),
+            Self::Floor => value.floor(),
+            Self::Abs => value.abs(),
+        }
+    }
 }
 
 pub const FPU_STACK: usize = 8;
@@ -603,6 +712,41 @@ impl Fpu {
         }
     }
 
+    /// Applies a [`FloatOp`] a shim asked for, and answers what `edx:eax` must
+    /// hold.
+    pub fn apply(&mut self, op: FloatOp) -> (u32, u32) {
+        match op {
+            FloatOp::Push(bits) => {
+                self.push(f64::from_bits(bits));
+                (0, 0)
+            }
+            FloatOp::Unary(function) => {
+                let value = self.st(0);
+                self.set_st(0, function.apply(value));
+                (0, 0)
+            }
+            FloatOp::Pow => {
+                // The exponent is on top and the base under it, which is the way
+                // the compiler leaves them for `fyl2x`.
+                let exponent = self.st(0);
+                let base = self.st(1);
+                // Two values go in and one comes out.
+                self.pop();
+                self.set_st(0, base.powf(exponent));
+                (0, 0)
+            }
+            FloatOp::TruncateToInt => {
+                let value = self.st(0);
+                self.pop();
+                // Toward zero, as `fistp` truncates. A value outside the range of
+                // a 64-bit integer is 0x80000000 on the hardware and saturates
+                // here, which is the one place the two differ.
+                let truncated = value as i64;
+                (truncated as u32, (truncated >> 32) as u32)
+            }
+        }
+    }
+
     pub fn reset(&mut self) {
         *self = Self::default();
     }
@@ -616,6 +760,52 @@ impl Fpu {
 /// address, so a collision costs a decode and never a wrong answer.
 const DECODE_CACHE_ENTRIES: usize = 1 << 14;
 
+/// The decoded instructions, by address.
+///
+/// This is separate from [`Cpu`] so the executor can borrow the instruction it is
+/// running while it mutates the registers: a 48-byte `Instruction` copied out of
+/// the cache on every step is most of what the step loop would otherwise cost.
+///
+/// An entry is keyed by the `pc` it carries, and an empty slot is one whose `pc`
+/// is zero: nothing is mapped below [`crate::pe::IMAGE_BASE`], so a blank entry
+/// can never be taken for a hit.
+///
+/// Decoding costs about as much as running an instruction, and the guest runs the
+/// same loops millions of times -- its drawing and its blitting loops are most of
+/// what this interpreter executes. `.text` is read-only in this host (a write
+/// there is refused), so a decoded instruction cannot go stale; the only writes
+/// to code happen before the first instruction runs, when the loader maps the
+/// image and the import table.
+pub struct Decodes {
+    entries: Vec<Instruction>,
+}
+
+impl Default for Decodes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decodes {
+    pub fn new() -> Self {
+        Self {
+            entries: vec![Instruction::default(); DECODE_CACHE_ENTRIES],
+        }
+    }
+
+    /// The instruction at `pc`, from the cache when it is there.
+    #[inline]
+    pub fn fetch(&mut self, memory: &GuestMemory, pc: u32) -> Result<&Instruction> {
+        let slot = (pc as usize >> 1) & (DECODE_CACHE_ENTRIES - 1);
+        if self.entries[slot].pc == pc {
+            return Ok(&self.entries[slot]);
+        }
+        let instruction = decode(memory, pc)?;
+        self.entries[slot] = instruction;
+        Ok(&self.entries[slot])
+    }
+}
+
 /// Machine state that is not a register. `instructions` is what the diagnostics
 /// page and the throughput measurement read.
 #[derive(Clone, Debug, Default)]
@@ -626,15 +816,6 @@ pub struct Cpu {
     /// stub. Copied in because a table is a `&'static` slice.
     pub table: crate::dispatch::Table,
     pub instructions: u64,
-    /// Instructions already decoded, by address.
-    ///
-    /// The guest runs the same loops millions of times -- its drawing and its
-    /// blitting loops are most of what this interpreter executes -- and decoding
-    /// an instruction costs about as much as running it. `.text` is read-only in
-    /// this host (a write there is refused), so a decoded instruction cannot go
-    /// stale; the only writes to code happen before the first instruction runs,
-    /// when the loader maps the image and the import table.
-    decode_cache: Vec<Option<(u32, Instruction)>>,
 }
 
 impl Cpu {
@@ -652,22 +833,7 @@ impl Cpu {
             fpu: Fpu::default(),
             table,
             instructions: 0,
-            decode_cache: vec![None; DECODE_CACHE_ENTRIES],
         }
-    }
-
-    /// The instruction at `pc`, from the cache when it is there.
-    #[inline]
-    fn fetch(&mut self, memory: &GuestMemory, pc: u32) -> Result<Instruction> {
-        let slot = (pc as usize >> 1) & (DECODE_CACHE_ENTRIES - 1);
-        if let Some((cached_pc, instruction)) = self.decode_cache[slot] {
-            if cached_pc == pc {
-                return Ok(instruction);
-            }
-        }
-        let instruction = decode(memory, pc)?;
-        self.decode_cache[slot] = Some((pc, instruction));
-        Ok(instruction)
     }
 
     pub fn registers(&self) -> [(u8, u32); 8] {
@@ -693,6 +859,9 @@ pub struct HostCall {
     /// The interface method this call went through, when the guest called a host
     /// object instead of an import slot.
     pub thunk: Option<(u8, u8)>,
+    /// The name `GetProcAddress` resolved, when the guest called one of those
+    /// instead of an import slot: an index into the host's resolved list.
+    pub proc: Option<usize>,
     pub iat_va: u32,
     /// The value the `call` pushed; where execution resumes after the host
     /// function returns.
@@ -719,11 +888,39 @@ pub enum Step {
 ///
 /// `eip` is advanced before the executor runs, so a fault leaves the CPU at the
 /// instruction that faulted and the address in the error names it.
-pub fn step(memory: &mut GuestMemory, cpu: &mut Cpu) -> Result<Step> {
+///
+/// Inlined into whatever drives the step loop on purpose: the cache lookup and the
+/// counter go away entirely once they are in the caller's loop, and that is worth
+/// more than the code the copy costs, since the loop runs this tens of millions of
+/// times a second.
+#[inline(always)]
+pub fn step(memory: &mut GuestMemory, cpu: &mut Cpu, decodes: &mut Decodes) -> Result<Step> {
     let pc = cpu.regs.eip;
-    // Host stubs and object thunks both live above the last guest section, so a
-    // normal instruction pays one compare instead of two range scans.
-    if pc >= crate::thunks::THUNK_BASE {
+    // Host stubs, resolved names and object thunks all live above the last guest
+    // section, so a normal instruction pays one compare instead of three range
+    // scans.
+    if pc >= PROC_BASE {
+        if let Some(index) = proc_at(pc) {
+            // A name the guest resolved at run time and called through a register
+            // or a table of its own: the return address is on the stack, and so
+            // are the arguments.
+            let resume = memory.read_u32(cpu.regs.esp)?;
+            let args = cpu.regs.esp.wrapping_add(4);
+            cpu.regs.eip = resume;
+            // The pop is the binding's to declare, so the session does it when it
+            // knows which binding this is; nothing is popped here.
+            cpu.regs.esp = args;
+            return Ok(Step::HostCall(HostCall {
+                slot: 0,
+                thunk: None,
+                proc: Some(index),
+                iat_va: pc,
+                return_address: resume,
+                args,
+                esp: args,
+                arg_bytes: None,
+            }));
+        }
         if let Some(slot) = host_slot_at(pc, cpu.table) {
             // The guest reached a host stub indirectly (`call ebp` after loading
             // the slot), so the return address is already on the stack and the
@@ -737,6 +934,7 @@ pub fn step(memory: &mut GuestMemory, cpu: &mut Cpu) -> Result<Step> {
             return Ok(Step::HostCall(HostCall {
                 slot,
                 thunk: None,
+                proc: None,
                 iat_va: entry.iat_va,
                 return_address: resume,
                 args,
@@ -755,6 +953,7 @@ pub fn step(memory: &mut GuestMemory, cpu: &mut Cpu) -> Result<Step> {
             return Ok(Step::HostCall(HostCall {
                 slot: 0,
                 thunk: Some((kind, method)),
+                proc: None,
                 iat_va: pc,
                 return_address: resume,
                 args,
@@ -763,16 +962,44 @@ pub fn step(memory: &mut GuestMemory, cpu: &mut Cpu) -> Result<Step> {
             }));
         }
     }
-    let instruction = cpu.fetch(memory, pc)?;
+    let instruction = decodes.fetch(memory, pc)?;
     cpu.regs.eip = pc.wrapping_add(u32::from(instruction.len));
     cpu.instructions += 1;
-    execute(memory, cpu, &instruction)
+    execute(memory, cpu, instruction)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pe::IMAGE_BASE;
+
+    #[test]
+    fn a_resolved_name_is_a_host_call_with_no_import_slot() {
+        let mut memory = GuestMemory::empty(0x10000).expect("blank memory");
+        let mut cpu = Cpu::at(crate::pe::IMAGE_BASE);
+        let mut decodes = Decodes::new();
+        let stack = crate::pe::IMAGE_BASE + 0x8000;
+        cpu.regs.esp = stack;
+        memory.write_u32(stack, 0x0040_1234).unwrap();
+        // The third name the host resolved, called through the guest's own table.
+        cpu.regs.eip = PROC_BASE + 8;
+        match step(&mut memory, &mut cpu, &mut decodes).expect("a resolved name is a call") {
+            Step::HostCall(call) => {
+                assert_eq!(call.proc, Some(2));
+                assert_eq!(call.thunk, None);
+                assert_eq!(call.return_address, 0x0040_1234);
+                assert_eq!(call.args, stack + 4);
+                // Nothing is popped here: the pop belongs to the binding, which
+                // the session only knows once it has looked it up.
+                assert_eq!(call.esp, stack + 4);
+            }
+            other => panic!("a resolved name answered {other:?}"),
+        }
+        assert_eq!(cpu.regs.eip, 0x0040_1234, "the call returns to the guest");
+        // A word inside the range that is not an address, and one past the end.
+        assert_eq!(proc_at(PROC_BASE + 2), None);
+        assert_eq!(proc_at(PROC_BASE + PROC_LIMIT * 4), None);
+    }
 
     #[test]
     fn register_halves_read_and_write_independently() {
@@ -813,6 +1040,30 @@ mod tests {
         assert!(Flags::parity(0x00));
         assert!(!Flags::parity(0x01));
         assert!(Flags::parity(0xffff_ff03));
+    }
+
+    /// A float operation a shim names is applied here, because the shim cannot
+    /// reach the stack it answers on.
+    #[test]
+    fn the_float_stack_answers_pow_and_truncation() {
+        let mut fpu = Fpu::default();
+        // `_CIpow(base, exponent)`: base pushed first, so the exponent is on top.
+        fpu.push(2.0);
+        fpu.push(10.0);
+        assert_eq!(fpu.apply(FloatOp::Pow), (0, 0));
+        assert!((fpu.st(0) - 1024.0).abs() < 1e-9);
+        // Two values went in and one came out.
+        fpu.push(-3.75);
+        let (eax, edx) = fpu.apply(FloatOp::TruncateToInt);
+        assert_eq!(eax, (-3_i32) as u32, "toward zero, as `fistp` truncates");
+        assert_eq!(edx, 0xffff_ffff, "the high word is the sign");
+        assert!((fpu.st(0) - 1024.0).abs() < 1e-9, "the top was popped");
+
+        fpu.push(9.0);
+        assert_eq!(fpu.apply(FloatOp::Unary(Unary::Sqrt)), (0, 0));
+        assert!((fpu.st(0) - 3.0).abs() < 1e-12);
+        assert_eq!(fpu.apply(FloatOp::Push(1.5_f64.to_bits())), (0, 0));
+        assert_eq!(fpu.st(0), 1.5);
     }
 
     #[test]
@@ -857,9 +1108,10 @@ mod tests {
         let stack = IMAGE_BASE + 0x800;
         memory.write_u32(stack, 0x0040_1234).unwrap();
         let mut cpu = Cpu::with_table(stub, TABLE);
+        let mut decodes = Decodes::new();
         cpu.regs.esp = stack;
 
-        match step(&mut memory, &mut cpu).expect("host call") {
+        match step(&mut memory, &mut cpu, &mut decodes).expect("host call") {
             Step::HostCall(call) => {
                 assert_eq!(call.slot, slot);
                 assert_eq!(call.return_address, 0x0040_1234);
@@ -880,12 +1132,33 @@ mod tests {
             .write_bytes(IMAGE_BASE, &[0xb8, 7, 0, 0, 0, 0x40, 0xc3])
             .unwrap();
         let mut cpu = Cpu::at(IMAGE_BASE);
+        let mut decodes = Decodes::new();
 
-        assert_eq!(step(&mut memory, &mut cpu), Ok(Step::Continue));
+        assert_eq!(step(&mut memory, &mut cpu, &mut decodes), Ok(Step::Continue));
         assert_eq!(cpu.regs.eax, 7);
         assert_eq!(cpu.regs.eip, IMAGE_BASE + 5);
-        assert_eq!(step(&mut memory, &mut cpu), Ok(Step::Continue));
+        assert_eq!(step(&mut memory, &mut cpu, &mut decodes), Ok(Step::Continue));
         assert_eq!(cpu.regs.eax, 8);
         assert_eq!(cpu.instructions, 2);
+    }
+
+    /// The cache is direct-mapped, so two addresses can share a slot. Whichever
+    /// was decoded last must not answer for the other.
+    #[test]
+    fn a_colliding_address_is_decoded_again() {
+        let mut memory = GuestMemory::empty(0x10000).expect("blank memory");
+        // `mov eax, 7` and `mov eax, 9`, a cache slot apart: the slot is chosen
+        // by `pc >> 1`, so half the entries' worth of bytes lands on the same one.
+        let other = IMAGE_BASE + (DECODE_CACHE_ENTRIES as u32 * 2);
+        memory.write_bytes(IMAGE_BASE, &[0xb8, 7, 0, 0, 0]).unwrap();
+        memory.write_bytes(other, &[0xb8, 9, 0, 0, 0]).unwrap();
+        let mut cpu = Cpu::at(IMAGE_BASE);
+        let mut decodes = Decodes::new();
+
+        for expected in [7, 9, 7, 9] {
+            cpu.regs.eip = if expected == 7 { IMAGE_BASE } else { other };
+            assert_eq!(step(&mut memory, &mut cpu, &mut decodes), Ok(Step::Continue));
+            assert_eq!(cpu.regs.eax, expected, "the entry at {:#010x}", cpu.regs.eip - 5);
+        }
     }
 }

@@ -55,6 +55,7 @@ Five steps, in this order. Steps 2 and 3 are read *at* `wh_load`, not at
 | 3 | `wh_set_exe_name(ptr, len)` | what `GetModuleFileNameA` and `GetCommandLineA` answer; unset means `program.exe` |
 | 4 | `wh_load(ptr, len)` | parses and maps the image, and builds its import table from its own import directory |
 | 5 | `wh_provide_file(name, bytes)` × N | every other file the guest opens; `wh_provide_sized` stands in for one it only measures |
+| 6 | `wh_provide_saved(name, bytes)` × N | the files the guest wrote last time, from the loader's own storage |
 
 Two details that bite:
 
@@ -103,6 +104,15 @@ for (const [file, bytes] of gameFiles) {          // game/files.json, minus the 
   host.wh_provide_file(ptr, encoded.length, ptr + encoded.length, bytes.length);
 }
 
+for (const [file, bytes] of storedSaves) {        // whatever the page kept last time
+  const encoded = new TextEncoder().encode(file);
+  const ptr = host.wh_alloc(encoded.length + bytes.length);
+  const memory = new Uint8Array(host.memory.buffer);
+  memory.set(encoded, ptr);
+  memory.set(bytes, ptr + encoded.length);
+  host.wh_provide_saved(ptr, encoded.length, ptr + encoded.length, bytes.length);
+}
+
 let flips = host.wh_flips();                      // 0 = nothing presented yet
 function frame(now) {
   host.wh_set_time(now);                          // the guest's clock, in ms
@@ -129,13 +139,64 @@ with no answer, `3` fault, `-1` no session. Codes 2 and 3 never trap: the text i
 distinguishes a missing shim from a game bug. `wh_notice_next` drains the host's
 own notices: a stand-in file it could not satisfy, a device the browser lacks.
 
-To present: `wh_memory_ptr() + wh_framebuffer_offset()`, indexed bytes,
-`wh_framebuffer_width()` × `wh_framebuffer_height()` with `wh_framebuffer_pitch()`
-as the row stride, mapped through `wh_palette(i)` (`0x00RRGGBB`, which a canvas
-wants re-ordered) and `wh_palette_version()` to know when it changed. Presented
+To present: `wh_memory_ptr() + wh_framebuffer_offset()` — the offset is relative
+to the guest's image base, so the memory pointer is part of the address — indexed
+bytes, `wh_framebuffer_width()` × `wh_framebuffer_height()` with
+`wh_framebuffer_pitch()` as the row stride. `wh_framebuffer_depth()` says how to
+read them: **8** is a palette index, mapped through `wh_palette(i)`
+(`0x00RRGGBB`, which a canvas wants re-ordered) with `wh_palette_version()`
+saying when the palette changed; **16** is little-endian RGB565; **32** is
+little-endian BGRX. A library that owns its pixels (SDL's video surface) can hand
+the guest any of the three, and the depth comes from the surface it handed back. Presented
 frames also come with audio: `wh_audio_event_count` / `wh_audio_events_ptr` before
-`wh_audio_events_clear`, and PCM for a voice through `wh_audio_pcm_ptr` /
-`wh_audio_pcm_len`.
+`wh_audio_events_clear`. A `PLAY` event says which voice started and in what
+format; the samples are in `wh_audio_samples(voice)` + `wh_memory_ptr()`, for
+`wh_audio_samples_len(voice)` bytes, because that is the buffer the guest writes
+into and a copy taken at `Play` is whatever was there before. `wh_audio_pcm_ptr`
+/
+`wh_audio_pcm_len` keep the copy the host took, which is all a released voice has
+left. A screen the guest draws through `DirectDraw` is always
+palettised; one it draws through SDL can be truecolour.
+
+## Saving
+
+The payload is a folder, and a game writes in it: `Profile.dat`, `data\settings.dat`,
+its own archive. The guest's writes land in a copy of its own -- the bytes the
+page fetched are never touched -- so every name it can read is a name it can
+change, exactly as in an installed folder, and `DeleteFileA` hides a file for
+the session rather than destroying the payload. Writability is a property of the
+handle, so a read-only `CreateFileA` still cannot `WriteFile`.
+
+What outlives a session is that copy, and the loader owns it:
+
+- `wh_saved_count()` files exist, each named by `wh_saved_name(i)` -- which writes
+  into the message buffer and returns the name's length -- with bytes at
+  `wh_saved_ptr(i)` for `wh_saved_len(i)`. Copy them out: the pointers are only
+  good until the guest writes again.
+- `wh_saved_version()` moves on every write, so a frame loop compares it with the
+  value it last stored instead of diffing every file every frame.
+- `wh_provide_saved(name, bytes)` hands one back before the guest starts. It can
+  come before or after `wh_provide_file`: a saved file shadows the payload's copy
+  of the same name instead of replacing it, so the two can never lose each other.
+
+The reference page keeps them in `localStorage`, one key per game, base64-encoded
+(`win32-shim-kit:saves:<game>`), restores them between `wh_load` and the first
+`wh_run`, and stores again when the version moves -- at most once a second -- and
+once more on stop. Storage is best effort: a browser in private mode throws, and
+the game plays without saving rather than not at all.
+
+A game's listing can say what it saves:
+
+```json
+{ "slug": "cavestory", "title": "Cave Story", "saves": ["profile.dat", "290.rec"] }
+```
+
+Those are the files restored and stored; anything else the guest writes lasts the
+session and no longer. Naming nothing keeps everything, which is what a payload
+whose save file you do not know wants. Naming them is worth it: a game that
+rewrites a settings file with today's screen mode should not carry that over a
+payload update, and a page should not spend its storage on a file the game makes
+again on its own.
 
 ## Which executable runs
 

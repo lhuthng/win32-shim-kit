@@ -24,7 +24,15 @@ use Action::Return;
 
 const DINPUT: &str = "DINPUT.dll";
 
-/// `DIRECTINPUT_VERSION`, 5.0, which is what the guest asks for.
+/// `DIRECTINPUT_VERSION` 5.0, the newest interface this host models, and 3.0,
+/// which one target asks for.
+///
+/// DirectInput 3.0's `IDirectInput` and `IDirectInputDevice` carry the same first
+/// fourteen vtable entries as 5.0's -- `CreateDevice`, then `Acquire`,
+/// `GetDeviceState`, `SetDataFormat` and `SetCooperativeLevel` in the same
+/// slots -- so one table answers both. What 3.0 lacks (action mapping, effects)
+/// is above slot thirteen, and no caller of it here reaches that far.
+const DIRECTINPUT_VERSION_3: u32 = 0x0300;
 const DIRECTINPUT_VERSION_5: u32 = 0x0500;
 
 const E_NOINTERFACE: u32 = 0x8000_4002;
@@ -50,14 +58,18 @@ fn create(
     destination: u32,
     outer: u32,
 ) -> Result<Action> {
-    if version < DIRECTINPUT_VERSION_5 {
-        // The object exists, but the guest asked for an older interface than this
-        // host models; failing is better than handing back a vtable that does not
-        // match what it expects.
+    if version < DIRECTINPUT_VERSION_3 {
+        // Older than anything this host has a vtable for: failing is better than
+        // handing back a table the caller would index past.
         host.notice(format!(
-            "DirectInputCreateA: version {version:#06x} is older than 5.0, refused"
+            "DirectInputCreateA: version {version:#06x} is older than 3.0, refused"
         ));
         return Ok(Return(0x8000_4003)); // DIERR_OLDDIRECTINPUTVERSION
+    }
+    if version < DIRECTINPUT_VERSION_5 {
+        host.notice(format!(
+            "DirectInputCreateA: version {version:#06x} shares 5.0's first fourteen entries, accepted"
+        ));
     }
     if outer != 0 {
         // No aggregation: nothing in the image asks for it, and a lie here would
@@ -142,11 +154,30 @@ mod tests {
                 &mut host,
                 &mut memory,
                 "DirectInputCreateA",
-                &[0x0040_0000, 0x0300, STACK_BASE + 0xb200, 0]
+                &[0x0040_0000, 0x0200, STACK_BASE + 0xb200, 0]
             )
             .unwrap(),
             Return(0x8000_4003)
         );
+    }
+
+    #[test]
+    fn version_three_shares_the_five_dot_oh_table() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let destination = STACK_BASE + 0xb400;
+        assert_eq!(
+            call_shim(
+                &mut host,
+                &mut memory,
+                "DirectInputCreateA",
+                &[0x0040_0000, 0x0300, destination, 0]
+            )
+            .unwrap(),
+            Return(0)
+        );
+        assert_ne!(memory.read_u32(destination).unwrap(), 0);
     }
 
     #[test]

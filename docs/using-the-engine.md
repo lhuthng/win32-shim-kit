@@ -41,6 +41,12 @@ bun tools/shim-surface.ts /path/to/Game.exe --json     # what the generator eats
 bun tools/arity.ts /path/to/Game.exe --rust crates/port/src/dispatch.gen.rs
 ```
 
+Two conventions the tables have to respect: a DLL's exports are stdcall unless
+`shim::is_cdecl` says otherwise (SDL 1.2, and the variadic `wsprintfA`), in which
+case the shim reads its arguments but leaves them for the caller to pop; and a
+library that owns its pixels (SDL's video surface) publishes them through
+`ddraw.publish`, so the page reads the guest's own buffer instead of a copy.
+
 The table is *per executable*. If a folder holds several playable builds (an
 original plus localized split builds), measure each one and compare: identical
 import lists can share one table, and a different list needs its own, keyed by
@@ -65,6 +71,8 @@ pub static SHIMS: &[&[Binding]] = &[
     host::shim::ddraw::SHIMS,
     host::shim::dinput::SHIMS,
     host::shim::winmm::SHIMS,
+    host::shim::ole32::SHIMS,
+    host::shim::sdl::SHIMS,                         // SDL 1.2, for an SDL build
     OVERRIDES,                                      // last, so it wins
 ];
 
@@ -111,7 +119,8 @@ a table.
 
 Either link `host-wasm` — it exports the whole contract, including a table built
 from the image — or write the port's own exports over `host::session::Session`.
-Sizes to expect: the module is roughly 460 KB before compression, and the
+Sizes to expect: the module is roughly 900 KB before compression (under 300 KB
+once a server gzips it), and the
 interpreter runs at tens of millions of instructions per second natively, a few
 hundred thousand per frame in a browser.
 

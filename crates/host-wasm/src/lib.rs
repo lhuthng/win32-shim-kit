@@ -315,6 +315,117 @@ pub extern "C" fn wh_provide_sized(name: *const u8, name_len: u32, length: u32) 
     })
 }
 
+/// Hands the guest a file it saved in an earlier session. The layout is
+/// [`wh_provide_file`]'s -- name and bytes in one allocation -- and the order
+/// against `wh_provide_file` does not matter: a saved file shadows the payload's
+/// copy of the same name rather than being replaced by it.
+#[no_mangle]
+pub extern "C" fn wh_provide_saved(
+    name: *const u8,
+    name_len: u32,
+    data: *const u8,
+    data_len: u32,
+) -> i32 {
+    if name.is_null() || name_len == 0 {
+        set_message("a saved file needs a name");
+        return -1;
+    }
+    if data.is_null() && data_len != 0 {
+        set_message("the saved file's contents are missing");
+        return -1;
+    }
+    // Safety: both pointers are inside the module's memory, written by the page.
+    let name = unsafe { std::slice::from_raw_parts(name, name_len as usize) };
+    let path = String::from_utf8_lossy(name).into_owned();
+    let bytes = if data_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data, data_len as usize) }.to_vec()
+    };
+    SESSION.with(|cell| match cell.borrow_mut().as_mut() {
+        Some(session) => {
+            session.host.files.provide_saved(&path, bytes);
+            0
+        }
+        None => {
+            set_message("no executable loaded");
+            -1
+        }
+    })
+}
+
+/// How many files the guest has written, which is exactly what the page
+/// persists: a file it never wrote is the payload's and needs no storage.
+#[no_mangle]
+pub extern "C" fn wh_saved_count() -> u32 {
+    SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(0, |session| session.host.files.saved_files().len() as u32)
+    })
+}
+
+/// Writes the name of saved file `index` into the message buffer and returns its
+/// length, or 0 when there is no such file.
+#[no_mangle]
+pub extern "C" fn wh_saved_name(index: u32) -> u32 {
+    SESSION.with(|cell| {
+        let session = cell.borrow();
+        let Some(session) = session.as_ref() else {
+            return 0;
+        };
+        match session.host.files.saved_files().get(index as usize) {
+            Some((name, _)) => {
+                set_message(name);
+                name.len() as u32
+            }
+            None => 0,
+        }
+    })
+}
+
+/// Where saved file `index`'s bytes are in linear memory, and how many there
+/// are. Valid until the guest writes again: the page copies them out between
+/// frames, the same way it reads the framebuffer.
+#[no_mangle]
+pub extern "C" fn wh_saved_ptr(index: u32) -> u32 {
+    SESSION.with(|cell| {
+        let session = cell.borrow();
+        let Some(session) = session.as_ref() else {
+            return 0;
+        };
+        match session.host.files.saved_files().get(index as usize) {
+            Some((_, bytes)) => bytes.as_ptr() as u32,
+            None => 0,
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn wh_saved_len(index: u32) -> u32 {
+    SESSION.with(|cell| {
+        let session = cell.borrow();
+        let Some(session) = session.as_ref() else {
+            return 0;
+        };
+        match session.host.files.saved_files().get(index as usize) {
+            Some((_, bytes)) => bytes.len() as u32,
+            None => 0,
+        }
+    })
+}
+
+/// Bumped on every write to a file the guest owns, so the page knows there is
+/// something new to persist without being told what a save is.
+#[no_mangle]
+pub extern "C" fn wh_saved_version() -> u32 {
+    SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(0, |session| session.host.files.version() as u32)
+    })
+}
+
 /// The guest's clock in milliseconds, pushed before each chunk. Without it the
 /// host falls back to instruction counts, and the guest's timers follow how fast
 /// the interpreter happens to run instead of real time.
@@ -427,6 +538,19 @@ pub extern "C" fn wh_framebuffer_height() -> u32 {
     })
 }
 
+/// Bits per pixel of the presented surface: 8 when it is palettised (the page
+/// maps each byte through `wh_palette`), 16 or 32 when the guest draws
+/// truecolour and the bytes are already a colour. A library that owns its pixels
+/// -- SDL's video surface -- can hand the guest either.
+#[no_mangle]
+pub extern "C" fn wh_framebuffer_depth() -> u32 {
+    SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(8, |session| u32::from(session.host.ddraw.bits()))
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn wh_framebuffer_pitch() -> u32 {
     SESSION.with(|cell| {
@@ -443,6 +567,21 @@ pub extern "C" fn wh_flips() -> f64 {
         cell.borrow()
             .as_ref()
             .map_or(0.0, |session| session.host.ddraw.flips() as f64)
+    })
+}
+
+/// Writes to the presented surface that no `Flip` counted.
+///
+/// A guest that blits straight onto the primary surface never moves the flip
+/// counter, so a page that watched only `wh_flips` would keep the first frame.
+/// This counts those writes instead, and a page redraws when either number
+/// changes.
+#[no_mangle]
+pub extern "C" fn wh_frame_version() -> u32 {
+    SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(0, |session| session.host.ddraw.content_revision())
     })
 }
 
@@ -517,6 +656,44 @@ pub extern "C" fn wh_audio_pcm_len(voice: u32) -> u32 {
         cell.borrow()
             .as_ref()
             .map_or(0, |session| session.host.audio.pcm(voice).len() as u32)
+    })
+}
+
+/// Where a voice's samples live in linear memory, like
+/// `wh_framebuffer_offset`: an offset to add to `wh_memory_ptr()`, with the
+/// buffer's length in `wh_audio_samples_len`. Zero when the voice has no
+/// samples. A guest fills a DirectSound buffer after it calls `Play` and keeps
+/// writing while it plays, so this is where a mixer reads from.
+#[no_mangle]
+pub extern "C" fn wh_audio_samples(voice: u32) -> u32 {
+    SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|session| session.host.audio.samples(voice))
+            .map_or(0, |(address, _)| address.wrapping_sub(pe::IMAGE_BASE))
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn wh_audio_samples_len(voice: u32) -> u32 {
+    SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|session| session.host.audio.samples(voice))
+            .map_or(0, |(_, length)| length)
+    })
+}
+
+/// Whether the guest wants the system pointer shown. `ShowCursor` moves a counter
+/// that only goes negative when the guest asked for the pointer to be hidden --
+/// which a game that draws its own cursor does -- so a page hides its pointer
+/// over the canvas while this is 0. One cursor is then on screen: the guest's.
+#[no_mangle]
+pub extern "C" fn wh_cursor_visible() -> u32 {
+    SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(1, |session| u32::from(session.host.windows.cursor_shown()))
     })
 }
 

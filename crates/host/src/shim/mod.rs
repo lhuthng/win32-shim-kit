@@ -16,15 +16,37 @@
 //! the arguments exactly as a stdcall callee would. Guessing from the table is
 //! never done; a disagreement is an error, not a preference.
 
+/// Whether a debug switch is on, looked up once and remembered.
+///
+/// `std::env::var` searches the environment every time it is called, which is far
+/// too expensive for a path a guest reaches thousands of times a frame -- a
+/// DirectDraw blit, a GDI copy, a blend. Each switch gets a cell of its own; after
+/// the first call reading it is a relaxed load.
+pub fn switch(cell: &'static std::sync::OnceLock<bool>, name: &'static str) -> bool {
+    *cell.get_or_init(|| std::env::var(name).is_ok())
+}
+
 pub mod advapi32;
+pub mod comdlg32;
+pub mod crt;
 pub mod ddraw;
 pub mod dinput;
 pub mod dsound;
 pub mod files;
 pub mod gdi32;
+pub mod gdiplus;
 pub mod kernel32;
+pub mod msimg32;
+pub mod msvcp;
+pub mod ole32;
+pub mod quartz;
+pub mod sdl;
+pub mod shell32;
+pub mod shlwapi;
 pub mod user32;
+pub mod version;
 pub mod winmm;
+pub mod wsock32;
 
 /// Every implemented import, one table per DLL. `binding` searches them in
 /// order and the tests treat them as the whole surface.
@@ -40,8 +62,15 @@ use crate::Result;
 pub enum Action {
     /// The guest continues with this value in `eax`.
     Return(u32),
+    /// A 64-bit answer, which this calling convention returns in `edx:eax`.
+    /// [`_time64`](crate::shim::crt) is the one import here that returns one.
+    Return64(u64),
     /// The guest asked to terminate; the session stops as `Halted`.
     Exit(u32),
+    /// The answer is a `double`, or an integer derived from one: the shim cannot
+    /// reach the x87 stack, so it names the operation and the session applies it
+    /// (see [`crate::cpu::FloatOp`]).
+    Float(crate::cpu::FloatOp),
 }
 
 /// One implemented import. `arg_bytes` is the shim's own stdcall signature.
@@ -79,7 +108,32 @@ impl Call<'_> {
         self.memory.read_cstr(self.arg(index)?)
     }
 
+    /// The UTF-16 string at `address`, to its terminator: what the `...W` entry
+    /// points pass, where an id below `0x10000` is an integer and not a pointer.
+    pub fn wstr(&self, address: u32) -> Result<String> {
+        if address == 0 {
+            return Ok(String::new());
+        }
+        // The cap matches the ANSI reader's, so a missing terminator is a stop
+        // rather than a walk to the end of the arena.
+        let mut units = Vec::new();
+        for offset in 0..4096_u32 {
+            let unit = self.memory.read_u16(address + offset * 2)?;
+            if unit == 0 {
+                break;
+            }
+            units.push(unit);
+        }
+        Ok(String::from_utf16_lossy(&units))
+    }
+
     pub fn write(&mut self, va: u32, bytes: &[u8]) -> Result<()> {
+        // A zero-length copy touches no address, which is why Win32 accepts a
+        // null buffer with a zero count. Rejecting it made an end-of-file read
+        // look like a fault at address zero.
+        if bytes.is_empty() {
+            return Ok(());
+        }
         self.memory.write_bytes(va, bytes)
     }
 
@@ -124,6 +178,19 @@ pub struct GuestCall {
     pub entry: u32,
     /// Arguments, left to right, pushed by the session.
     pub args: [u32; 4],
+    /// What the import returns, when that is not the routine's own value.
+    ///
+    /// `LoadLibraryA` runs the library's `DllMain` and then has to answer with
+    /// the module handle, which `DllMain` knows nothing about.
+    pub answer: Option<u32>,
+    /// Whether the shim wants to run again when the routine returns.
+    ///
+    /// A table walk (`_initterm`) calls one entry per pass and needs the next, and
+    /// `exit` runs its handlers one at a time. The session re-enters the shim with
+    /// the import's own frame restored; a resumed shim reads its state from
+    /// [`Host`], never from its arguments, because the routine's frame was pushed
+    /// over them.
+    pub resume: bool,
 }
 
 /// What a `DirectInput` device is, which decides what `GetDeviceState` writes.
@@ -179,9 +246,17 @@ pub struct Host {
     pub ddraw: ddraw::DirectDraw,
     /// The audio device, its buffers and the events the page's mixer consumes.
     pub audio: dsound::DirectSound,
+    /// The SDL 1.2 surface `SDL.dll` games draw into, and the state the
+    /// functions around it keep (`sdl`).
+    pub sdl: sdl::Sdl,
+    /// Thread-local slots `TlsAlloc` hands out. This machine has one thread, so
+    /// the slots are session state rather than a real per-thread map.
+    pub tls: kernel32::ThreadLocals,
     /// Multimedia timers the guest set, which the session calls back into
     /// (`winmm`).
     pub timers: winmm::Timers,
+    /// Files open through `mmioOpenA`, with where each one is being read from.
+    pub mmio: winmm::Mmio,
     /// The guest's clock in milliseconds, when the embedder supplies one. The page
     /// sets it before every chunk, which is what makes a timer follow real time
     /// instead of how fast the interpreter happens to run.
@@ -208,6 +283,44 @@ pub struct Host {
     /// using buffered input, which this host does not deliver.
     pub device_state_reads: u64,
     pub device_data_reads: u64,
+    /// Resources the image carries, in the order its tree lists them. The handle
+    /// `FindResourceA` hands out is an index into this, so `LoadResource` and
+    /// `SizeofResource` need nothing else.
+    pub resources: Vec<crate::pe::Resource>,
+    /// The bitmaps, fonts and device contexts `gdi32` hands out.
+    pub gdi: gdi32::Gdi,
+    /// The images `gdiplus` decoded, and the locks open on them.
+    pub gdiplus: gdiplus::Gdiplus,
+    /// The `DirectShow` filter graph, when the guest created one (`quartz`).
+    pub quartz: quartz::Quartz,
+    /// The block `GetFileVersionInfoA` filled and `VerQueryValueA` reads: where it
+    /// is and how long it is (`version`).
+    pub version: Option<(u32, u32)>,
+    /// `argc`/`argv`, the `atexit` chain and the table walk `_initterm` is in the
+    /// middle of (`crt`).
+    pub crt: crt::Crt,
+    /// Whether the session is re-running the shim that asked for the guest routine
+    /// which just returned. A shim that asked to be resumed reads this to tell a
+    /// continuation from a fresh call by the same import.
+    pub resumed: bool,
+    /// What the last guest routine a shim asked for left in `eax`. A walk that
+    /// stops on an initialiser's failure reads it.
+    pub guest_result: u32,
+    /// The `ecx` the guest called the import through, which is where MSVC passes
+    /// `this` for a `__thiscall` member function. A C++ runtime shim reads it from
+    /// here; every other shim ignores it. The session sets it before running a
+    /// shim, so it describes the call in flight.
+    pub this: u32,
+    /// MSVC6's C++ runtime state: the shared empty string and the `npos` value
+    /// (`msvcp`).
+    pub msvcp: msvcp::Strings,
+    /// The bindings `GetProcAddress` has handed out, in the order it resolved
+    /// them: entry `n` lives at `PROC_BASE + n * 4`.
+    pub procs: Vec<&'static Binding>,
+    /// The module names `GetModuleHandleA` and `LoadLibraryA` have answered for,
+    /// so a handle stays the same number across calls. The handle is an index into
+    /// this, above `kernel32`'s module base.
+    pub modules: Vec<String>,
 }
 
 impl Default for Host {
@@ -242,7 +355,10 @@ impl Host {
             files: files::Files::default(),
             ddraw: ddraw::DirectDraw::with_screen(u32::from(width), u32::from(height), depth),
             audio: dsound::DirectSound::default(),
+            sdl: sdl::Sdl::default(),
+            tls: kernel32::ThreadLocals::default(),
             timers: winmm::Timers::default(),
+            mmio: winmm::Mmio::default(),
             clock_ms: None,
             vtables: [0; crate::thunks::KIND_LIMIT as usize],
             notices: Vec::new(),
@@ -251,13 +367,42 @@ impl Host {
             guest_call: None,
             device_state_reads: 0,
             device_data_reads: 0,
+            resources: Vec::new(),
+            gdi: gdi32::Gdi::default(),
+            gdiplus: gdiplus::Gdiplus::default(),
+            quartz: quartz::Quartz::default(),
+            version: None,
+            crt: crt::Crt::default(),
+            resumed: false,
+            guest_result: 0,
+            this: 0,
+            msvcp: msvcp::Strings::default(),
+            procs: Vec::new(),
+            modules: Vec::new(),
         }
     }
 
     /// Sets the guest's clock, in milliseconds. Monotonic, and only ever read as
     /// a difference, so any origin works: the page passes `performance.now()`.
+    ///
+    /// A clock that has run ahead -- because the guest slept, see
+    /// [`Host::advance_clock`] -- is not moved back: `GetTickCount` that goes
+    /// backwards makes every "is the next frame due yet" test wrong.
     pub fn set_clock(&mut self, milliseconds: u64) {
-        self.clock_ms = Some(milliseconds);
+        self.clock_ms = Some(milliseconds.max(self.clock_ms.unwrap_or(0)));
+    }
+
+    /// Moves the guest's clock forward, which is what a wait does.
+    ///
+    /// A program that waits for its next frame does it with `Sleep` in a loop
+    /// against `GetTickCount`. The page hands this host a clock once a frame, so
+    /// between two frames the time it reads never changes: the loop could only
+    /// end when the page came back, and it spent everything the page gave it
+    /// spinning. A sleep moves the clock, exactly as a sleeping thread's clock
+    /// moves, so the loop ends after the number of waits the program asked for.
+    pub fn advance_clock(&mut self, milliseconds: u64) {
+        let now = self.clock_ms.unwrap_or(0);
+        self.clock_ms = Some(now.saturating_add(milliseconds));
     }
 
     /// The guest's time in milliseconds: the embedder's clock when it supplied
@@ -504,10 +649,18 @@ impl Host {
     }
 
     /// The pointer moved to a client position.
+    ///
+    /// A DirectInput mouse reports movement, not a position, so the step the
+    /// guest gets is measured from the cursor the host is tracking -- what
+    /// `GetCursorPos` answers -- rather than from wherever the page's pointer was
+    /// last seen. A page that drives a game drawing its own cursor sends
+    /// movement instead, through [`Host::pointer_move`]; this is for a caller
+    /// that knows the position, such as a test or a shell.
     pub fn pointer(&mut self, x: i32, y: i32) {
         let hwnd = self.input_window();
+        let (cx, cy) = self.windows.cursor();
         self.windows.set_cursor(x, y);
-        self.input.pointer(x, y, hwnd);
+        self.input.move_by(x.saturating_sub(cx), y.saturating_sub(cy), x, y, hwnd);
     }
 
     /// The pointer moved by a delta, as a locked pointer reports it.
@@ -582,30 +735,160 @@ impl Host {
 
 /// Every table of implemented imports.
 pub const TABLES: &[&[Binding]] = &[
+    crt::SHIMS,
+    msvcp::SHIMS,
     kernel32::SHIMS,
     files::SHIMS,
+    comdlg32::SHIMS,
+    shell32::SHIMS,
     user32::SHIMS,
     gdi32::SHIMS,
+    gdiplus::SHIMS,
+    msimg32::SHIMS,
     advapi32::SHIMS,
     dsound::SHIMS,
     ddraw::SHIMS,
     dinput::SHIMS,
     winmm::SHIMS,
+    ole32::SHIMS,
+    shlwapi::SHIMS,
+    version::SHIMS,
+    sdl::SHIMS,
+    wsock32::SHIMS,
 ];
+
+/// Whether a DLL's exports use the cdecl convention, where the **caller** pops
+/// the arguments.
+///
+/// Win32's own DLLs are stdcall throughout; SDL 1.2 is the exception this kit
+/// runs into, because its headers declare `SDLCALL` as `__cdecl`, and
+/// `wsprintfA` is declared `WINAPIV` (cdecl) because it is variadic. A cdecl
+/// shim's declared bytes are still its read window -- it reads the same
+/// arguments -- but the import must not pop them, or the guest's own `add esp`
+/// would take another copy and its stack would drift by four bytes per call.
+pub fn is_cdecl(dll: &str, name: &str) -> bool {
+    // Every entry point the C runtime exports is `__cdecl`; its ancestors and
+    // descendants share the convention.
+    dll.eq_ignore_ascii_case("SDL.dll")
+        || name.eq_ignore_ascii_case("wsprintfA")
+        || is_c_runtime(dll)
+        // The C++ runtime's member functions are `__thiscall`, but the operators
+        // declared at namespace scope -- `std::operator+`, `operator==` and the
+        // rest -- are free functions and `__cdecl`. The mangling says which: a
+        // global function's name carries `@@YA`.
+        || (dll.eq_ignore_ascii_case(msvcp::MSVCP60) && name.contains("@@YA"))
+}
+
+/// Whether a DLL name is a C runtime in the `msvcrt` lineage: `msvcrt` itself,
+/// and the `msvcr60`-style private copies a Visual C++ program ships beside its
+/// executable.
+///
+/// They are one table here because the entry points are the same in all of them:
+/// a game built with VC6 calls `_initterm` and `malloc` with the signatures VC8's
+/// runtime has.
+pub fn is_c_runtime(dll: &str) -> bool {
+    // Case-insensitively, and without a copy: this runs for every host call a
+    // guest makes, so an allocation here is a heap round trip per import.
+    let stem = match dll.len().checked_sub(4) {
+        Some(cut) if dll.get(cut..).is_some_and(|end| end.eq_ignore_ascii_case(".dll")) => {
+            &dll[..cut]
+        }
+        _ => dll,
+    };
+    if stem.eq_ignore_ascii_case("msvcrt") {
+        return true;
+    }
+    match strip_prefix_ignoring_case(stem, "msvcr") {
+        Some(version) => !version.is_empty() && version.bytes().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
+/// `text.strip_prefix(prefix)`, matching ASCII case the way a file name does.
+fn strip_prefix_ignoring_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then(|| &text[prefix.len()..])
+}
 
 /// The binding for a dispatch slot, matched on DLL and function name.
 ///
 /// `tables` is the target's resolution order: the generic tables first, the
 /// port's own after them, and **later wins**, so a port overrides one function
 /// by registering it again instead of forking a table.
+/// The binding filed for `name`, optionally restricted to one DLL.
+///
+/// This is the lookup a program does for itself with `GetProcAddress`: unlike
+/// [`binding`], there is no import slot to start from, only a name -- and the DLL
+/// it is asked of may be one this host answers without ever loading it.
+pub fn named(
+    tables: &'static [&'static [Binding]],
+    dll: Option<&str>,
+    name: &str,
+) -> Option<&'static Binding> {
+    tables
+        .iter()
+        .rev()
+        .flat_map(|table| table.iter())
+        .find(|binding| {
+            (binding.name == name
+                || export_name(dll.unwrap_or(binding.dll), &binding.name) == name)
+                && dll.is_none_or(|dll| same_dll(binding.dll, dll))
+        })
+}
+
+/// Whether this host answers for a DLL of this name at all, which is what
+/// `LoadLibraryA` and `GetModuleHandleA` have to say before a program may resolve
+/// anything from it.
+pub fn module_known(tables: &'static [&'static [Binding]], dll: &str) -> bool {
+    tables
+        .iter()
+        .flat_map(|table| table.iter())
+        .any(|binding| same_dll(binding.dll, dll))
+}
+
 pub fn binding(tables: &'static [&'static [Binding]], slot: &Slot) -> Option<&'static Binding> {
     tables
         .iter()
         .rev()
         .flat_map(|table| table.iter())
         .find(|binding| {
-            binding.name == slot.name && binding.dll.eq_ignore_ascii_case(&slot.dll)
+            same_dll(binding.dll, &slot.dll)
+                && (binding.name == slot.name
+                    || binding.name == export_name(&slot.dll, &slot.name)
+                    // The other direction: a binding filed by ordinal answers an
+                    // image that imported the name. Cave Story imports
+                    // `DirectSoundCreate` by name; the shim is filed as `#1`.
+                    || slot.name == export_name(&slot.dll, binding.name))
         })
+}
+
+/// Whether a binding filed under one DLL name answers an import of another.
+///
+/// Names match case-insensitively, and a C runtime answers for every name in its
+/// family: `MSVCRT.dll!malloc` is the same import as `msvcr80.dll!malloc`.
+fn same_dll(filed: &str, imported: &str) -> bool {
+    filed.eq_ignore_ascii_case(imported) || (is_c_runtime(filed) && is_c_runtime(imported))
+}
+
+/// The name a binding is filed under, for a slot that may have been imported by
+/// ordinal.
+///
+/// An import table can name a function by number instead of by name, and the
+/// engine keeps what the image wrote. Two DLLs in this kit's targets are known
+/// to do it: `DSOUND.dll` exports exactly one function, `DirectSoundCreate`,
+/// which older linkers import as ordinal 1, and `DDRAW.dll`'s
+/// `DirectDrawCreate` is ordinal 1 as well.
+fn export_name<'a>(dll: &str, name: &'a str) -> &'a str {
+    if name != "#1" {
+        return name;
+    }
+    if dll.eq_ignore_ascii_case("DSOUND.dll") {
+        return "DirectSoundCreate";
+    }
+    if dll.eq_ignore_ascii_case("DDRAW.dll") {
+        return "DirectDrawCreate";
+    }
+    name
 }
 
 #[cfg(test)]
@@ -617,6 +900,18 @@ mod tests {
     /// Signature agreement against a real import surface is a property of the
     /// executable, so it lives with the table in the port that owns it. What can
     /// be checked here is that the tables are internally consistent.
+    #[test]
+    fn the_socket_ordinals_an_image_imports_are_answered() {
+        // NTSD Community imports WinSock by ordinal, and `#101` is the one that
+        // used to stop the run when its online menu was opened.
+        for ordinal in ["#101", "#115", "#116", "#23", "#2", "#4", "#19"] {
+            assert!(
+                named(TABLES, Some("WSOCK32.dll"), ordinal).is_some(),
+                "WSOCK32.dll!{ordinal} is not answered"
+            );
+        }
+    }
+
     #[test]
     fn every_table_entry_is_dword_aligned() {
         for binding in TABLES.iter().flat_map(|table| table.iter()) {
@@ -661,6 +956,40 @@ mod tests {
             args: 0,
             arg_bytes: 0,
         }).unwrap(), Action::Return(2));
+    }
+
+    /// A program that ships its own C runtime names it `msvcr80.dll` or
+    /// `msvcr100.dll`; the entry points are the ones `msvcrt.dll` has, so the one
+    /// table has to answer for every name in the family.
+    #[test]
+    fn one_table_answers_for_every_c_runtime_name() {
+        for name in ["MSVCRT.dll", "msvcrt.dll", "MSVCR60.dll", "msvcr71.dll", "MSVCR80.dll", "msvcr100.dll"] {
+            let slot = Slot {
+                dll: Box::leak(name.to_string().into_boxed_str()),
+                name: "malloc",
+                iat_va: 0x0040_1000,
+                args: Some(4),
+                sites: 2,
+                agreement: 2,
+                ambiguous: 0,
+            };
+            let found = binding(TABLES, &slot).unwrap_or_else(|| panic!("malloc is missing from {name}"));
+            assert_eq!(found.name, "malloc");
+        }
+        // A name that merely looks similar is not the runtime.
+        assert!(!is_c_runtime("msvcrt-old.dll"));
+        assert!(!is_c_runtime("msvcp60.dll"));
+    }
+
+    /// The C runtime exports `__cdecl` functions, so their import must leave the
+    /// arguments for the caller's own `add esp`.
+    #[test]
+    fn every_c_runtime_import_is_cdecl() {
+        for binding in TABLES.iter().flat_map(|table| table.iter()) {
+            if is_c_runtime(binding.dll) {
+                assert!(is_cdecl(binding.dll, binding.name), "{}!{}", binding.dll, binding.name);
+            }
+        }
     }
 
     /// Two tables must not claim the same slot: the first match wins, and a
@@ -779,6 +1108,7 @@ mod tests {
         let call = HostCall {
             slot: 0,
             thunk: None,
+            proc: None,
             iat_va: 0,
             return_address: 0,
             args: 0x00ff_ff00,

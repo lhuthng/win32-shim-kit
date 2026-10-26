@@ -86,6 +86,29 @@ server.
 payload holds, the order of the boot calls, and how a page chooses which
 executable to boot.
 
+## The demo
+
+`demo/` is a built, static site: a Svelte page plus one folder per baked payload.
+It is what GitHub Pages serves, and everything in it is generated — the site from
+`demo-site/`, the payloads from `tools/build-web.sh`:
+
+```bash
+tools/build-web.sh <install-dir> demo/payloads/<slug>   # a payload
+cd demo-site && bun install && bun run build            # the page -> demo/
+```
+
+`demo/payloads/index.json` is the list the page reads. Add an entry after a bake,
+and list a second demo the same way; the player boots whichever one is picked.
+
+```bash
+bun tools/demo-check.ts demo            # serves demo/ the way Pages does and boots every payload
+bun tools/demo-player-check.ts demo     # drives demo-site's own loader against the payload
+```
+
+The first demo is **Elimination III** (2000): a DirectDraw 640×480×8 arena
+shooter that also uses DirectSound through ordinal 1 and DirectInput 3.0. It
+runs from its own executable, unmodified, against the shims in this repository.
+
 ## Limits
 
 - **Coverage is per function, not per DLL.** Nothing here claims a DLL is
@@ -108,8 +131,15 @@ executable to boot.
   dropped when the session ends.
 - **One screen, and dialogs are reported, not drawn.** A message box the guest
   would have shown arrives as a notice the page can print.
-- **Audio is partial.** Sound effects play. A streamed music buffer arrives as a
-  `DATA` event and is logged, not mixed.
+- **Audio is partial.** Sound effects play, mixed from the voice's own memory so
+  a guest streaming into a buffer is heard. Music is not: a CD track (`open
+  cdaudio`) and a MIDI sequence have no device here, and an SDL game's device is
+  opened at the format it asks for and never mixed, so an SDL build runs
+  silently by design.
+- **SDL 1.2 is answered for the calls a game makes, not as a port of SDL.** The
+  video surface, the event queue, the clock and the audio configuration are
+  there; joysticks report none, and `SDL_WaitEvent` returns immediately instead
+  of blocking the frame.
 - **Known interfaces, not arbitrary COM.** A method with no shim reports that the
   object exists but the method does not.
 - **Inventory maps are records, not enforcement.** They say what a port did about

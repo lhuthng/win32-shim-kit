@@ -27,8 +27,10 @@
 //!   without it every sprite carries its own rectangle of key colour. A stretched
 //!   blit or an unimplemented raster op is refused with a fault so the log names
 //!   it rather than drawing something wrong.
-//! - `GetDC` has no GDI to hand out and faults; if the guest needs it, that is the
-//!   M3 text work, and the stop says so.
+//! - `GetDC` hands out a GDI device context that draws straight into the
+//!   surface's pixels, which is how a game copies a bitmap onto a surface. GDI
+//!   text is still absent: a guest that reaches `TextOutA` stops, and the stop
+//!   names it.
 
 use std::collections::HashMap;
 
@@ -61,6 +63,8 @@ const DDCKEY_SRCBLT: u32 = 0x0000_0008;
 const FILL_COLOR: u32 = 0x50;
 const E_NOINTERFACE: u32 = 0x8000_4002;
 const DDERR_INVALIDPARAMS: u32 = 0x8007_0057;
+/// `DDERR_INVALIDRECT`: the rectangle names no pixels at all.
+const DDERR_INVALIDRECT: u32 = 0x8876_0096;
 
 // DDSURFACEDESC offsets (DX5, 108 bytes).
 const DESC_SIZE: u32 = 108;
@@ -97,17 +101,22 @@ struct Surface {
     width: u32,
     height: u32,
     pitch: u32,
+    /// Bits per pixel: 8 for a palettised surface, 16 or 32 for truecolour. A
+    /// blit moves `bits / 8` bytes per pixel, and a page needs the same number
+    /// to read the pixels it is handed.
+    bits: u8,
     /// Guest address of the pixels, `pitch * height` bytes the host allocated.
     buffer: u32,
     caps: u32,
     /// Locked rectangles: the guest may lock and unlock in a nested order, and the
     /// pointer only has to stay stable, which a bump-allocated buffer gives us.
     locks: u32,
-    /// `DDCKEY_SRCBLT`: the palette indices, low to high, that are transparent
-    /// when this surface is the source of a keyed blit.
-    src_key: Option<(u8, u8)>,
+    /// `DDCKEY_SRCBLT`: the colour values, low to high, that are transparent
+    /// when this surface is the source of a keyed blit. The low 8, 16 or 24 bits
+    /// are the value, matching [`Surface::bits`].
+    src_key: Option<(u32, u32)>,
     /// `DDCKEY_DESTBLT`: destination pixels inside this range are left alone.
-    dest_key: Option<(u8, u8)>,
+    dest_key: Option<(u32, u32)>,
     /// Bytes the host allocated for `buffer`, so releasing can hand them back.
     size: u32,
     /// COM reference count. The last `Release` frees the pixels.
@@ -140,11 +149,36 @@ pub struct DirectDraw {
     backbuffer: Option<u32>,
     cooperative_level: u32,
     flips: u64,
+    /// Bumped every time the presented surface's pixels change without a flip.
+    content_revision: u32,
     /// Bumped every time an entry's colour actually changes. A fade is a palette
     /// written frame after frame *without* a flip, so a page that redraws only on
     /// `flips` would show the one frame it caught and nothing after it: the
     /// publisher logo flashing past black is this counter's absence.
     palette_revision: u32,
+    /// A surface the guest drew itself and the host was handed: `SDL_SetVideoMode`
+    /// owns its pixels, so there is no `Surface` object and nothing to copy on a
+    /// present. When set, this is what a page reads and how large it is.
+    presented: Option<Presented>,
+    /// The screen the host made for the window's context when the guest draws
+    /// with GDI and has no DirectDraw display of its own. A menu built in a DIB
+    /// and blitted through the window's context lands here, so it is what a page
+    /// shows until the guest creates a display of its own.
+    window_surface: Option<u32>,
+}
+
+/// The handle the host's own screen is recorded under. It is not a thunk object
+/// and the guest never sees it, so it only has to be a number no surface the
+/// guest creates can hold.
+const WINDOW_SURFACE_HANDLE: u32 = 0x00ee_0000;
+
+/// Pixels a non-DirectDraw library owns, in the shape a page reads them.
+struct Presented {
+    buffer: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    bits: u8,
 }
 
 impl Default for DirectDraw {
@@ -171,19 +205,120 @@ impl DirectDraw {
             backbuffer: None,
             cooperative_level: 0,
             flips: 0,
+            content_revision: 0,
             palette_revision: 0,
+            presented: None,
+            window_surface: None,
             depth,
         }
+    }
+
+    /// Gives the window's context a screen of its own.
+    ///
+    /// A program that draws its menus with GDI asks its window for a context and
+    /// blits through it; if it never creates a DirectDraw primary surface, those
+    /// pixels still have to land somewhere the page can show. This is that screen:
+    /// a surface the size of the guest's window whose pixels the page reads
+    /// exactly as it reads a primary surface's.
+    pub fn make_window_surface(
+        &mut self,
+        buffer: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        size: u32,
+        bits: u8,
+    ) {
+        self.surfaces.insert(
+            WINDOW_SURFACE_HANDLE,
+            Surface {
+                width,
+                height,
+                pitch,
+                bits,
+                buffer,
+                caps: 0,
+                locks: 0,
+                src_key: None,
+                dest_key: None,
+                size,
+                refs: 1,
+            },
+        );
+        self.window_surface = Some(WINDOW_SURFACE_HANDLE);
+    }
+
+    /// The screen the window's context draws into while the guest has no display
+    /// of its own.
+    pub fn window_surface(&self) -> Option<u32> {
+        self.window_surface
+    }
+
+    /// Gives the window's screen up, when the guest creates a display: from then
+    /// on the primary surface is what the page shows, and two screens would be
+    /// one too many.
+    pub fn retire_window_surface(&mut self) -> Option<u32> {
+        let handle = self.window_surface.take()?;
+        self.surfaces.remove(&handle).map(|surface| surface.buffer)
+    }
+
+    /// Adopts a buffer the guest allocated for itself (SDL's video surface) as
+    /// what a page presents. The host does not own it and never copies it: the
+    /// guest's own writes are the frame.
+    pub fn publish(&mut self, buffer: u32, width: u32, height: u32, pitch: u32, bits: u8) {
+        self.presented = Some(Presented {
+            buffer,
+            width,
+            height,
+            pitch,
+            bits,
+        });
+    }
+
+    /// Forgets an adopted buffer, when the guest gives its video mode up.
+    pub fn unpublish(&mut self) {
+        self.presented = None;
+    }
+
+    /// A frame the guest presented: the counter a page watches for change.
+    pub fn present(&mut self) {
+        self.flips += 1;
+    }
+
+    /// Bits per pixel of what is presented: 8 for a palettised surface, 16 or 32
+    /// for a truecolour one. A page needs this to read the pixels correctly.
+    pub fn bits(&self) -> u8 {
+        if let Some(presented) = self.presented.as_ref() {
+            return presented.bits;
+        }
+        // The window's screen stands in for a primary surface while the guest is
+        // drawing with GDI, so a page reads it with the same depth.
+        self.primary
+            .or(self.window_surface)
+            .and_then(|primary| self.surfaces.get(&primary))
+            .map_or(self.depth, |surface| surface.bits)
     }
 }
 
 impl DirectDraw {
     pub fn width(&self) -> u32 {
-        self.width
+        if let Some(presented) = self.presented.as_ref() {
+            return presented.width;
+        }
+        self.primary
+            .or(self.window_surface)
+            .and_then(|handle| self.surfaces.get(&handle))
+            .map_or(self.width, |surface| surface.width)
     }
 
     pub fn height(&self) -> u32 {
-        self.height
+        if let Some(presented) = self.presented.as_ref() {
+            return presented.height;
+        }
+        self.primary
+            .or(self.window_surface)
+            .and_then(|handle| self.surfaces.get(&handle))
+            .map_or(self.height, |surface| surface.height)
     }
 
     /// The 256-entry palette the guest set, RGB triples in index order.
@@ -225,21 +360,45 @@ impl DirectDraw {
 
     /// How many times the palette has changed, which is the other half of "has
     /// the picture changed": a fade writes entries without presenting a frame.
+    /// Bumped when the presented surface's pixels change without a `Flip`.
+    ///
+    /// A game that blits straight onto the primary surface -- Cave Story draws its
+    /// credits that way -- never touches the flip counter, so a page that watched
+    /// only `flips` would show the first frame forever.
+    pub fn content_revision(&self) -> u32 {
+        self.content_revision
+    }
+
+    /// Notes that a surface was written to, and counts it if it is the one the
+    /// page shows.
+    pub fn touch(&mut self, surface: u32) {
+        if self.primary == Some(surface) || self.window_surface == Some(surface) {
+            self.content_revision = self.content_revision.wrapping_add(1);
+        }
+    }
+
     pub fn palette_revision(&self) -> u32 {
         self.palette_revision
     }
 
-    /// The primary surface's pixels, which is what `Flip` presents.
+    /// The pixels a page presents: the adopted buffer when a library owns them,
+    /// otherwise the primary surface `Flip` draws onto.
     pub fn framebuffer(&self) -> Option<(u32, u32, u32)> {
-        let primary = self.primary?;
-        let surface = self.surfaces.get(&primary)?;
+        if let Some(presented) = self.presented.as_ref() {
+            return Some((presented.buffer, presented.width, presented.height));
+        }
+        let surface = self.surfaces.get(&self.primary.or(self.window_surface)?)?;
         Some((surface.buffer, surface.width, surface.height))
     }
 
     /// Bytes per row of the primary surface, which is its width for a
     /// linear 8-bit surface but is read from the surface rather than assumed.
     pub fn framebuffer_pitch(&self) -> u32 {
+        if let Some(presented) = self.presented.as_ref() {
+            return presented.pitch;
+        }
         self.primary
+            .or(self.window_surface)
             .and_then(|primary| self.surfaces.get(&primary))
             .map_or(0, |surface| surface.pitch)
     }
@@ -265,6 +424,7 @@ impl DirectDraw {
     /// These are guest addresses: what a page reads to show the guest's screen.
     pub fn primary_buffer(&self) -> Option<u32> {
         self.primary
+            .or(self.window_surface)
             .and_then(|handle| self.surfaces.get(&handle))
             .map(|surface| surface.buffer)
     }
@@ -273,6 +433,21 @@ impl DirectDraw {
         self.backbuffer
             .and_then(|handle| self.surfaces.get(&handle))
             .map(|surface| surface.buffer)
+    }
+
+    /// A surface's pixels and shape: `buffer`, `width`, `height`, `pitch` and
+    /// bits per pixel. A device context blits into one of these, so it asks the
+    /// surface rather than keeping a second copy of the geometry.
+    pub fn surface(&self, handle: u32) -> Option<(u32, u32, u32, u32, u8)> {
+        self.surfaces.get(&handle).map(|surface| {
+            (
+                surface.buffer,
+                surface.width,
+                surface.height,
+                surface.pitch,
+                surface.bits,
+            )
+        })
     }
 
     /// Every surface's buffer and how often the guest locked it, in creation
@@ -290,10 +465,21 @@ struct SurfaceDesc {
     width: u32,
     height: u32,
     pitch: u32,
+    bits: u8,
     caps: u32,
 }
 
-fn read_desc(call: &Call<'_>, address: u32, default: (u32, u32)) -> Result<SurfaceDesc> {
+/// Reads a `DDSURFACEDESC` the guest filled in.
+///
+/// `bits` is the display's depth, which decides the pitch when the guest leaves
+/// `lPitch` at zero -- the usual case, because DirectDraw computes it from the
+/// width and the pixel format.
+fn read_desc(
+    call: &Call<'_>,
+    address: u32,
+    default: (u32, u32),
+    bits: u8,
+) -> Result<SurfaceDesc> {
     if address == 0 {
         return Err("DirectDraw called without a surface descriptor".to_string());
     }
@@ -310,7 +496,12 @@ fn read_desc(call: &Call<'_>, address: u32, default: (u32, u32)) -> Result<Surfa
     Ok(SurfaceDesc {
         width,
         height,
-        pitch: if pitch == 0 { width } else { pitch },
+        pitch: if pitch == 0 {
+            width * u32::from(bits / 8)
+        } else {
+            pitch
+        },
+        bits,
         caps,
     })
 }
@@ -481,6 +672,9 @@ pub(crate) fn serve(
     kind: u8,
     name: &'static str,
 ) -> Result<Action> {
+    if std::env::var("SHIMKIT_LOG_DDRAW").is_ok() && host.notices.len() < 600 {
+        host.notice(format!("ddraw {name}"));
+    }
     match (kind, name) {
         // A surface is reference counted for real: the last `Release` frees its
         // pixels, which is what keeps a board session inside the heap. Every
@@ -500,13 +694,21 @@ pub(crate) fn serve(
             let width = call.arg(1)?;
             let height = call.arg(2)?;
             let depth = call.arg(3)?;
-            if depth != 8 {
+            // 8 is what a palettised game asks for; 16 and 32 are what a game
+            // with its own artwork asks for, and a surface of that depth is
+            // bytes the page reads directly. 15 and 24 are modes whose pixels
+            // are not laid out the way a page can read them.
+            let Ok(depth) = u8::try_from(depth) else {
+                return Err(format!("DirectDraw asked for {depth} bits per pixel"));
+            };
+            if !matches!(depth, 8 | 16 | 32) {
                 return Err(format!(
-                    "DirectDraw asked for {depth} bits per pixel; this host presents 8"
+                    "DirectDraw asked for {depth} bits per pixel; this host presents 8, 16 or 32"
                 ));
             }
             host.ddraw.width = width;
             host.ddraw.height = height;
+            host.ddraw.depth = depth;
             Ok(Return(DD_OK))
         }
         (thunks::DDRAW, "RestoreDisplayMode") | (thunks::DDRAW, "WaitForVerticalBlank") => {
@@ -546,7 +748,13 @@ pub(crate) fn serve(
             Ok(Return(DD_OK))
         }
         (thunks::DDRAW, "CreateSurface") => {
-            let desc = read_desc(call, call.arg(1)?, (host.ddraw.width, host.ddraw.height))?;
+            let depth = host.ddraw.depth;
+            let desc = read_desc(
+                call,
+                call.arg(1)?,
+                (host.ddraw.width, host.ddraw.height),
+                depth,
+            )?;
             if desc.caps & (DDSCAPS_PRIMARYSURFACE | DDSCAPS_OFFSCREENPLAIN | DDSCAPS_BACKBUFFER)
                 == 0
             {
@@ -567,6 +775,7 @@ pub(crate) fn serve(
                 width: desc.width,
                 height: desc.height,
                 pitch: desc.pitch,
+                bits: desc.bits,
                 buffer,
                 caps: desc.caps,
                 locks: 0,
@@ -581,6 +790,11 @@ pub(crate) fn serve(
             let object = thunks::new_object(call.memory, host, thunks::DDRAW_SURFACE)?;
             host.ddraw.surfaces.insert(object, surface);
             if is_primary {
+                // The guest has a display now, so the screen the window's context
+                // was given is no longer what a page should show.
+                if let Some(buffer) = host.ddraw.retire_window_surface() {
+                    host.release(buffer);
+                }
                 host.ddraw.primary = Some(object);
                 if complex && host.ddraw.backbuffer.is_none() {
                     // A complex or flipping primary owns one back buffer, which the
@@ -590,6 +804,7 @@ pub(crate) fn serve(
                         width: desc.width,
                         height: desc.height,
                         pitch: desc.pitch,
+                        bits: desc.bits,
                         buffer: host.allocate(size, 4)?,
                         caps: DDSCAPS_BACKBUFFER,
                         locks: 0,
@@ -624,7 +839,8 @@ pub(crate) fn serve(
                 let surface = Surface {
                     width: host.ddraw.width,
                     height: host.ddraw.height,
-                    pitch: host.ddraw.width,
+                    pitch: host.ddraw.width * u32::from(host.ddraw.depth / 8),
+                    bits: host.ddraw.depth,
                     buffer: 0,
                     caps: 0,
                     locks: 0,
@@ -651,11 +867,14 @@ pub(crate) fn serve(
         }
         (thunks::DDRAW_SURFACE, "Lock") => lock(host, call),
         (thunks::DDRAW_SURFACE, "Unlock") => {
+            let this = call.arg(0)?;
             if let Some(surface) = surface_of(host, call) {
                 if surface.locks > 0 {
                     surface.locks -= 1;
                 }
             }
+            // Pixels written through the locked pointer are on screen now.
+            host.ddraw.touch(this);
             Ok(Return(DD_OK))
         }
         (thunks::DDRAW_SURFACE, "Flip") => {
@@ -670,6 +889,7 @@ pub(crate) fn serve(
                     width: surface.width,
                     height: surface.height,
                     pitch: surface.pitch,
+                    bits: surface.bits,
                     buffer: surface.buffer,
                     caps: surface.caps,
                     locks: 0,
@@ -739,10 +959,28 @@ pub(crate) fn serve(
         | (thunks::DDRAW_SURFACE, "UpdateOverlay")
         | (thunks::DDRAW_SURFACE, "UpdateOverlayDisplay")
         | (thunks::DDRAW_SURFACE, "UpdateOverlayZOrder") => Ok(Return(DD_OK)),
-        (thunks::DDRAW_SURFACE, "Blt") | (thunks::DDRAW_SURFACE, "BltFast") => blit(host, call, name),
-        (thunks::DDRAW_SURFACE, "GetDC") | (thunks::DDRAW_SURFACE, "ReleaseDC") => {
-            Err("IDirectDrawSurface::GetDC needs GDI, which is the M3 text work".to_string())
+        (thunks::DDRAW_SURFACE, "Blt") | (thunks::DDRAW_SURFACE, "BltFast") => {
+            let this = call.arg(0)?;
+            let action = blit(host, call, name)?;
+            // A blit onto the surface the page shows is a presented frame, even
+            // though no `Flip` counted it.
+            host.ddraw.touch(this);
+            Ok(action)
         }
+        (thunks::DDRAW_SURFACE, "GetDC") => {
+            // GDI draws straight into the surface's pixels: the DC a guest gets
+            // back is the one `StretchBlt` and `BitBlt` write through. Like the
+            // rest of the interface, the answer comes through `lphdc` and the
+            // return value is the `HRESULT`.
+            let surface = call.arg(0)?;
+            let out = call.arg(1)?;
+            let dc = host.gdi.dc_for_surface(surface);
+            if out != 0 {
+                call.write_u32(out, dc)?;
+            }
+            Ok(Return(0))
+        }
+        (thunks::DDRAW_SURFACE, "ReleaseDC") => Ok(Return(0)),
 
         // ---- IDirectDrawPalette ------------------------------------------
         (thunks::DDRAW_PALETTE, "SetEntries") => {
@@ -839,7 +1077,11 @@ fn lock(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let (left, top, right, bottom) = bounds(call, rect, surface)?;
     let width = (right - left) as u32;
     let height = (bottom - top) as u32;
-    let offset = top as u32 * surface.pitch + left as u32;
+    // Columns are pixels, so the byte offset is the column times the pixel size:
+    // a 16-bit lock that added the column raw would hand back a pointer half a
+    // pixel per column off.
+    let bytes = u32::from(surface.bits / 8).max(1);
+    let offset = top as u32 * surface.pitch + left as u32 * bytes;
     let pointer = surface.buffer + offset;
     let pitch = surface.pitch;
     if let Some(surface) = host.ddraw.surfaces.get_mut(&this) {
@@ -882,7 +1124,7 @@ fn flip(host: &mut Host, call: &mut Call<'_>) -> Result<()> {
         ));
     }
     let rows = source.height as usize;
-    let row_bytes = source.width as usize;
+    let row_bytes = source.width as usize * usize::from(source.bits / 8);
     let from = source.buffer;
     let to = primary.buffer;
     let from_pitch = source.pitch;
@@ -912,8 +1154,8 @@ fn set_color_key(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let range = if key == 0 {
         None
     } else {
-        let low = call.memory.read_u32(key)? as u8;
-        let high = call.memory.read_u32(key + 4)? as u8;
+        let low = call.memory.read_u32(key)?;
+        let high = call.memory.read_u32(key + 4)?;
         Some((low.min(high), low.max(high)))
     };
     if let Some(surface) = host.ddraw.surfaces.get_mut(&this) {
@@ -945,8 +1187,8 @@ fn get_color_key(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         }
     });
     let (low, high) = range.unwrap_or((0, 0));
-    call.write_u32(destination, u32::from(low))?;
-    call.write_u32(destination + 4, u32::from(high))?;
+    call.write_u32(destination, low)?;
+    call.write_u32(destination + 4, high)?;
     Ok(Return(DD_OK))
 }
 
@@ -988,7 +1230,7 @@ fn blit(host: &mut Host, call: &mut Call<'_>, method: &'static str) -> Result<Ac
         let colour = if effects == 0 {
             0
         } else {
-            call.memory.read_u32(effects + FILL_COLOR)? as u8
+            call.memory.read_u32(effects + FILL_COLOR)?
         };
         return fill(host, call, this, rect, colour);
     }
@@ -1015,6 +1257,19 @@ fn blit(host: &mut Host, call: &mut Call<'_>, method: &'static str) -> Result<Ac
         )
     };
 
+    static LOGGING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let log = crate::shim::switch(&LOGGING, "SHIMKIT_LOG_BLITS");
+    if log {
+        let shape = host.ddraw.surfaces.get(&source).map(|surface| {
+            format!("{}x{}x{}", surface.width, surface.height, surface.bits)
+        });
+        let onto = host.ddraw.surfaces.get(&this).map(|surface| {
+            format!("{}x{}x{}", surface.width, surface.height, surface.bits)
+        });
+        host.notice(format!(
+            "{method} {shape:?} -> {onto:?} transfer {transfer:#x} source_rect {source_rect:#x}"
+        ));
+    }
     let Some(from) = host.ddraw.surfaces.get(&source) else {
         return Err(format!(
             "DirectDraw::{method} from {source:#010x}, which is not a surface this host created"
@@ -1027,33 +1282,41 @@ fn blit(host: &mut Host, call: &mut Call<'_>, method: &'static str) -> Result<Ac
     };
     // The source rectangle selects a window of the source surface; a null one is
     // the whole surface, which is what a sprite blit with no clipping means.
-    let (mut sx, mut sy, mut width, mut height) = if source_rect == 0 {
-        (0, 0, from.width, from.height)
+    //
+    // Windows clips that window to the surface and answers `DDERR_INVALIDRECT`
+    // when nothing is left of it, and this host does the same rather than
+    // refusing the call: a sprite whose clip rectangle has emptied asks for
+    // `862,112..0,0` -- Cave Story does it, then carries on with the frame -- so
+    // an empty window is an ordinary answer, not a stop, and a window hanging
+    // off the edge copies the part that exists instead of moving the sprite.
+    let (mut sx, mut sy, mut width, mut height, shift_x, shift_y) = if source_rect == 0 {
+        (0, 0, from.width, from.height, 0, 0)
     } else {
         let left = call.memory.read_u32(source_rect)? as i32;
         let top = call.memory.read_u32(source_rect + 4)? as i32;
         let right = call.memory.read_u32(source_rect + 8)? as i32;
         let bottom = call.memory.read_u32(source_rect + 12)? as i32;
-        if left < 0
-            || top < 0
-            || right < left
-            || bottom < top
-            || right > from.width as i32
-            || bottom > from.height as i32
-        {
-            return Err(format!(
-                "DirectDraw::{method}: source rectangle {left},{top}..{right},{bottom} is \
-                 outside a {}x{} surface",
-                from.width, from.height
-            ));
+        let surface_width = from.width as i32;
+        let surface_height = from.height as i32;
+        let clip_left = left.max(0);
+        let clip_top = top.max(0);
+        let clip_right = right.min(surface_width);
+        let clip_bottom = bottom.min(surface_height);
+        if clip_right <= clip_left || clip_bottom <= clip_top {
+            return Ok(Return(DDERR_INVALIDRECT));
         }
         (
-            left as u32,
-            top as u32,
-            (right - left) as u32,
-            (bottom - top) as u32,
+            clip_left as u32,
+            clip_top as u32,
+            (clip_right - clip_left) as u32,
+            (clip_bottom - clip_top) as u32,
+            // Cutting the window's left or top edge moves the copy with it, so
+            // the pixels that do land stay where the guest put them.
+            clip_left - left,
+            clip_top - top,
         )
     };
+    let (dx, dy) = (dx + shift_x, dy + shift_y);
 
     // Both blits clip the destination; a copy that runs off the edge is
     // truncated rather than refused. The game relies on it: its board sprites
@@ -1086,7 +1349,17 @@ fn blit(host: &mut Host, call: &mut Call<'_>, method: &'static str) -> Result<Ac
     width = width.min(to.width - left as u32);
     height = height.min(to.height - top as u32);
 
-    let row_bytes = width as usize;
+    let bytes = usize::from(from.bits / 8).max(1);
+    let row_bytes = width as usize * bytes;
+    // A colour key is one pixel wide, so a keyed blit compares whole pixels.
+    let pixel = |row: &[u8], column: usize| -> u32 {
+        let at = column * bytes;
+        let mut value = 0_u32;
+        for index in (0..bytes).rev() {
+            value = (value << 8) | u32::from(row[at + index]);
+        }
+        value
+    };
     let from_base = from.buffer;
     let from_pitch = from.pitch;
     let to_base = to.buffer;
@@ -1098,9 +1371,14 @@ fn blit(host: &mut Host, call: &mut Call<'_>, method: &'static str) -> Result<Ac
     // work per row for no reason.
     let mut row_buffer = std::mem::take(&mut host.ddraw.row);
     let mut composed = std::mem::take(&mut host.ddraw.composed);
+    // `sx` and `left` are pixel columns, and a truecolour surface holds more
+    // than one byte to a pixel: an address is the column times the pixel size.
+    // Cave Story draws at 640x480x16, so a column added raw lands half a sprite
+    // away, which reads as a scrambled screen rather than a misplaced one.
+    let pixel_bytes = bytes as u32;
     for row in 0..height {
-        let source_at = from_base + (sy + row) * from_pitch + sx;
-        let destination = to_base + (top as u32 + row) * to_pitch + left as u32;
+        let source_at = from_base + (sy + row) * from_pitch + sx * pixel_bytes;
+        let destination = to_base + (top as u32 + row) * to_pitch + left as u32 * pixel_bytes;
         if src_key.is_none() && dest_key.is_none() {
             call.memory.copy(source_at, destination, row_bytes)?;
             continue;
@@ -1111,18 +1389,20 @@ fn blit(host: &mut Host, call: &mut Call<'_>, method: &'static str) -> Result<Ac
         // row has to be read back and only the other pixels replaced.
         composed.clear();
         composed.extend_from_slice(call.memory.read_bytes(destination, row_bytes)?);
-        for (column, pixel) in row_buffer.iter().enumerate() {
+        for column in 0..width as usize {
+            let source_pixel = pixel(&row_buffer, column);
             if let Some((low, high)) = src_key {
-                if (low..=high).contains(pixel) {
+                if (low..=high).contains(&source_pixel) {
                     continue;
                 }
             }
             if let Some((low, high)) = dest_key {
-                if (low..=high).contains(&composed[column]) {
+                if (low..=high).contains(&pixel(&composed, column)) {
                     continue;
                 }
             }
-            composed[column] = *pixel;
+            let at = column * bytes;
+            composed[at..at + bytes].copy_from_slice(&row_buffer[at..at + bytes]);
         }
         call.memory.write_bytes(destination, &composed)?;
     }
@@ -1131,21 +1411,35 @@ fn blit(host: &mut Host, call: &mut Call<'_>, method: &'static str) -> Result<Ac
     Ok(Return(DD_OK))
 }
 
-/// Paints one palette index across a rectangle, which is `DDBLT_COLORFILL`.
+/// Paints one colour across a rectangle, which is `DDBLT_COLORFILL`.
+///
+/// The fill colour is a dword in `DDBLTFX`; on an 8-bit surface only its low
+/// byte is the palette index, and on a truecolour one the pixel is as many bytes
+/// as the surface holds.
 fn fill(
     host: &mut Host,
     call: &mut Call<'_>,
     this: u32,
     rect: u32,
-    colour: u8,
+    colour: u32,
 ) -> Result<Action> {
     let Some(surface) = host.ddraw.surfaces.get(&this) else {
         return Err(format!("DirectDraw: fill of {this:#010x}, which is not a surface"));
     };
     let (left, top, right, bottom) = bounds(call, rect, surface)?;
-    let row = vec![colour; (right - left) as usize];
+    let bytes = usize::from(surface.bits / 8).max(1);
+    let mut pixel = vec![0_u8; bytes];
+    for (index, byte) in colour.to_le_bytes().iter().take(bytes).enumerate() {
+        pixel[index] = *byte;
+    }
+    let row: Vec<u8> = pixel
+        .iter()
+        .copied()
+        .cycle()
+        .take((right - left) as usize * bytes)
+        .collect();
     for y in top as u32..bottom as u32 {
-        let at = surface.buffer + y * surface.pitch + left as u32;
+        let at = surface.buffer + y * surface.pitch + left as u32 * bytes as u32;
         call.memory.write_bytes(at, &row)?;
     }
     Ok(Return(DD_OK))
@@ -1539,6 +1833,148 @@ mod tests {
         assert_eq!(call.memory.read_u32(key + 4).unwrap(), 0);
     }
 
+    /// Writes the four fields of an `RECT` for a blit to name.
+    fn rectangle(at: u32, edges: (i32, i32, i32, i32), memory: &mut GuestMemory) {
+        memory.write_u32(at, edges.0 as u32).unwrap();
+        memory.write_u32(at + 4, edges.1 as u32).unwrap();
+        memory.write_u32(at + 8, edges.2 as u32).unwrap();
+        memory.write_u32(at + 12, edges.3 as u32).unwrap();
+    }
+
+    /// A sprite whose byte at row r, column c is `r * 8 + c`, so a copy that
+    /// lands in the wrong place is visible rather than merely wrong.
+    fn numbered_sprite(host: &mut Host, memory: &mut GuestMemory, surface: u32) {
+        let (buffer, pitch) = {
+            let surface = host.ddraw.surfaces.get(&surface).unwrap();
+            (surface.buffer, surface.pitch)
+        };
+        let mut pattern = vec![0_u8; (pitch * 4) as usize];
+        for row in 0..4_u32 {
+            for column in 0..8_u32 {
+                pattern[(row * pitch + column) as usize] = (row * 8 + column) as u8;
+            }
+        }
+        memory.write_bytes(buffer, &pattern).unwrap();
+    }
+
+    /// Paints the page colour 7, so what a blit left alone and what it drew are
+    /// both readable.
+    fn paint(host: &mut Host, memory: &mut GuestMemory, page: u32) {
+        let effects = STACK_BASE + 0xe700;
+        let args = STACK_BASE + 0xe400;
+        memory.write_u32(effects, 0x64).unwrap();
+        memory.write_u32(effects + FILL_COLOR, 7).unwrap();
+        memory.write_u32(args, page).unwrap();
+        memory.write_u32(args + 4, 0).unwrap();
+        memory.write_u32(args + 8, 0).unwrap();
+        memory.write_u32(args + 12, 0).unwrap();
+        memory.write_u32(args + 16, DDBLT_COLORFILL).unwrap();
+        memory.write_u32(args + 20, effects).unwrap();
+        let mut call = Call {
+            memory,
+            args,
+            arg_bytes: 24,
+        };
+        serve(host, &mut call, thunks::DDRAW_SURFACE, "Blt").unwrap();
+    }
+
+    /// `Blt(&dest, sprite, &source, 0, 0)` and the action it answered with.
+    fn blit(
+        host: &mut Host,
+        memory: &mut GuestMemory,
+        page: u32,
+        sprite: u32,
+        source_rect: u32,
+        at: (i32, i32),
+    ) -> Action {
+        let dest = STACK_BASE + 0xe800;
+        let args = STACK_BASE + 0xe400;
+        rectangle(dest, (at.0, at.1, 0, 0), memory);
+        memory.write_u32(args, page).unwrap();
+        memory.write_u32(args + 4, dest).unwrap();
+        memory.write_u32(args + 8, sprite).unwrap();
+        memory.write_u32(args + 12, source_rect).unwrap();
+        memory.write_u32(args + 16, 0).unwrap();
+        memory.write_u32(args + 20, 0).unwrap();
+        let mut call = Call {
+            memory,
+            args,
+            arg_bytes: 24,
+        };
+        serve(host, &mut call, thunks::DDRAW_SURFACE, "Blt").unwrap()
+    }
+
+    /// One row of the presented frame.
+    fn page_row(host: &Host, memory: &mut GuestMemory, row: u32) -> Vec<u8> {
+        let (buffer, width, _) = host.ddraw.framebuffer().unwrap();
+        let pitch = host.ddraw.framebuffer_pitch();
+        memory
+            .read_bytes(buffer + row * pitch, width as usize)
+            .unwrap()
+            .to_vec()
+    }
+
+    #[test]
+    fn a_blit_whose_source_rectangle_is_empty_draws_nothing() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let sprite = eight_by_four(&mut host, &mut memory, DDSCAPS_OFFSCREENPLAIN);
+        let page = eight_by_four(&mut host, &mut memory, DDSCAPS_PRIMARYSURFACE);
+        numbered_sprite(&mut host, &mut memory, sprite);
+        paint(&mut host, &mut memory, page);
+
+        // What a sprite entirely outside its clip window asks for: the right and
+        // bottom edges before the origin. Windows answers `DDERR_INVALIDRECT` and
+        // copies nothing; refusing the call would stop a game mid-frame.
+        let source = STACK_BASE + 0xe900;
+        rectangle(source, (5, 2, 0, 0), &mut memory);
+        assert_eq!(
+            blit(&mut host, &mut memory, page, sprite, source, (0, 0)),
+            Return(DDERR_INVALIDRECT)
+        );
+        for row in 0..4 {
+            assert!(
+                page_row(&host, &mut memory, row).iter().all(|&index| index == 7),
+                "row {row} is untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_rectangle_past_the_edge_copies_what_exists_at_the_right_place() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let sprite = eight_by_four(&mut host, &mut memory, DDSCAPS_OFFSCREENPLAIN);
+        let page = eight_by_four(&mut host, &mut memory, DDSCAPS_PRIMARYSURFACE);
+        numbered_sprite(&mut host, &mut memory, sprite);
+        let source = STACK_BASE + 0xe900;
+
+        // Hanging off the right and bottom: four columns by two rows exist.
+        paint(&mut host, &mut memory, page);
+        rectangle(source, (4, 2, 99, 99), &mut memory);
+        assert_eq!(
+            blit(&mut host, &mut memory, page, sprite, source, (0, 0)),
+            Return(DD_OK)
+        );
+        assert_eq!(page_row(&host, &mut memory, 0), &[4, 5, 6, 7, 7, 7, 7, 7]);
+        assert_eq!(page_row(&host, &mut memory, 1), &[12, 13, 14, 15, 7, 7, 7, 7]);
+        assert_eq!(page_row(&host, &mut memory, 2), &[7; 8]);
+
+        // Hanging off the left: the two columns that do exist land two pixels to
+        // the right of where the copy would have started, not at its start.
+        paint(&mut host, &mut memory, page);
+        rectangle(source, (-2, 0, 3, 2), &mut memory);
+        assert_eq!(
+            blit(&mut host, &mut memory, page, sprite, source, (0, 0)),
+            Return(DD_OK)
+        );
+        assert_eq!(page_row(&host, &mut memory, 0), &[7, 7, 0, 1, 2, 7, 7, 7]);
+        assert_eq!(page_row(&host, &mut memory, 1), &[7, 7, 8, 9, 10, 7, 7, 7]);
+        assert_eq!(page_row(&host, &mut memory, 2), &[7; 8]);
+    }
+
     #[test]
     fn set_entries_colours_the_palette() {
         let Some((mut host, mut memory)) = machine() else {
@@ -1683,17 +2119,171 @@ mod tests {
     }
 
     #[test]
-    fn a_depth_other_than_eight_is_refused() {
+    fn a_truecolour_mode_is_kept_and_a_mode_a_page_cannot_read_is_refused() {
         let Some((mut host, mut memory)) = machine() else {
             return;
         };
         let args = STACK_BASE + 0xcf00;
+        for depth in [16, 32] {
+            memory.write_u32(args, 0x1234).unwrap();
+            memory.write_u32(args + 4, 640).unwrap();
+            memory.write_u32(args + 8, 480).unwrap();
+            memory.write_u32(args + 12, depth).unwrap();
+            let mut call = Call { memory: &mut memory, args, arg_bytes: 16 };
+            assert_eq!(
+                serve(&mut host, &mut call, thunks::DDRAW, "SetDisplayMode").unwrap(),
+                Return(DD_OK),
+                "{depth} bits per pixel"
+            );
+            assert_eq!(host.ddraw.depth, depth as u8);
+        }
+        // 15 and 24 put a pixel in bytes a page cannot read as a colour.
+        for depth in [15, 24] {
+            memory.write_u32(args + 12, depth).unwrap();
+            let mut call = Call { memory: &mut memory, args, arg_bytes: 16 };
+            let error = serve(&mut host, &mut call, thunks::DDRAW, "SetDisplayMode").unwrap_err();
+            assert!(error.contains("bits per pixel"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_sixteen_bit_surface_takes_two_bytes_a_pixel() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let args = STACK_BASE + 0xdb00;
         memory.write_u32(args, 0x1234).unwrap();
-        memory.write_u32(args + 4, 640).unwrap();
-        memory.write_u32(args + 8, 480).unwrap();
+        memory.write_u32(args + 4, 8).unwrap();
+        memory.write_u32(args + 8, 4).unwrap();
         memory.write_u32(args + 12, 16).unwrap();
         let mut call = Call { memory: &mut memory, args, arg_bytes: 16 };
-        let error = serve(&mut host, &mut call, thunks::DDRAW, "SetDisplayMode").unwrap_err();
-        assert!(error.contains("16 bits per pixel"), "{error}");
+        serve(&mut host, &mut call, thunks::DDRAW, "SetDisplayMode").unwrap();
+
+        // A descriptor with no pitch of its own: DirectDraw computes it from the
+        // width and the pixel depth, and so does this host.
+        let draw = direct_draw(&mut host, &mut memory);
+        let create = STACK_BASE + 0xdc00;
+        let desc = STACK_BASE + 0xdd00;
+        let destination = STACK_BASE + 0xde00;
+        surface_args(desc, 8, 4, DDSCAPS_PRIMARYSURFACE, &mut memory);
+        memory.write_u32(create, draw).unwrap();
+        memory.write_u32(create + 4, desc).unwrap();
+        memory.write_u32(create + 8, destination).unwrap();
+        let mut call = Call { memory: &mut memory, args: create, arg_bytes: 16 };
+        serve(&mut host, &mut call, thunks::DDRAW, "CreateSurface").unwrap();
+        assert_eq!(host.ddraw.framebuffer_pitch(), 16, "8 pixels of two bytes");
+        assert_eq!(host.ddraw.bits(), 16);
+
+        // A colour fill writes a two-byte pixel across the whole row.
+        let effects = STACK_BASE + 0xdf00;
+        let primary = call.memory.read_u32(destination).unwrap();
+        memory.write_u32(effects, 0x64).unwrap();
+        memory.write_u32(effects + FILL_COLOR, 0x1234).unwrap();
+        memory.write_u32(create, primary).unwrap();
+        memory.write_u32(create + 4, 0).unwrap();
+        memory.write_u32(create + 8, 0).unwrap();
+        memory.write_u32(create + 12, 0).unwrap();
+        memory.write_u32(create + 16, DDBLT_COLORFILL | 0x0100_0000).unwrap();
+        memory.write_u32(create + 20, effects).unwrap();
+        let mut call = Call { memory: &mut memory, args: create, arg_bytes: 24 };
+        serve(&mut host, &mut call, thunks::DDRAW_SURFACE, "Blt").unwrap();
+        let (buffer, _, _) = host.ddraw.framebuffer().unwrap();
+        let pitch = host.ddraw.framebuffer_pitch();
+        let row = call.memory.read_bytes(buffer, pitch as usize).unwrap();
+        assert_eq!(&row[..4], &[0x34, 0x12, 0x34, 0x12], "the fill colour, twice");
+    }
+
+    #[test]
+    fn a_sixteen_bit_blit_and_fill_count_columns_in_pixels() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        // Cave Story runs at 640x480x16 and draws its artwork with `Blt`, so a
+        // column of that surface is two bytes. Counting it as one put every
+        // sprite half a picture away, which reads as a scrambled screen.
+        let args = STACK_BASE + 0xf000;
+        memory.write_u32(args, 0x1234).unwrap();
+        memory.write_u32(args + 4, 8).unwrap();
+        memory.write_u32(args + 8, 4).unwrap();
+        memory.write_u32(args + 12, 16).unwrap();
+        let mut call = Call { memory: &mut memory, args, arg_bytes: 16 };
+        serve(&mut host, &mut call, thunks::DDRAW, "SetDisplayMode").unwrap();
+
+        let sprite = eight_by_four(&mut host, &mut memory, DDSCAPS_OFFSCREENPLAIN);
+        let page = eight_by_four(&mut host, &mut memory, DDSCAPS_PRIMARYSURFACE);
+        let (sprite_buffer, sprite_pitch) = {
+            let surface = host.ddraw.surfaces.get(&sprite).unwrap();
+            (surface.buffer, surface.pitch)
+        };
+        assert_eq!(sprite_pitch, 16, "8 pixels of two bytes");
+        // Three pixels of colour on the sprite's second row, from column 1.
+        for (column, value) in [(1_u32, 0x0102_u16), (2, 0x0304), (3, 0x0506)] {
+            memory
+                .write_bytes(sprite_buffer + sprite_pitch + column * 2, &value.to_le_bytes())
+                .unwrap();
+        }
+
+        let blit = STACK_BASE + 0xf400;
+        let dest = STACK_BASE + 0xf500;
+        let source = STACK_BASE + 0xf600;
+        for (at, values) in [(dest, [2_u32, 1, 5, 2]), (source, [1, 1, 4, 2])] {
+            for (index, value) in values.iter().enumerate() {
+                memory.write_u32(at + index as u32 * 4, *value).unwrap();
+            }
+        }
+        memory.write_u32(blit, page).unwrap();
+        memory.write_u32(blit + 4, dest).unwrap();
+        memory.write_u32(blit + 8, sprite).unwrap();
+        memory.write_u32(blit + 12, source).unwrap();
+        memory.write_u32(blit + 16, 0).unwrap();
+        memory.write_u32(blit + 20, 0).unwrap();
+        let mut call = Call { memory: &mut memory, args: blit, arg_bytes: 24 };
+        assert_eq!(
+            serve(&mut host, &mut call, thunks::DDRAW_SURFACE, "Blt").unwrap(),
+            Return(DD_OK)
+        );
+        let (page_buffer, page_pitch) = {
+            let surface = host.ddraw.surfaces.get(&page).unwrap();
+            (surface.buffer, surface.pitch)
+        };
+        assert_eq!(
+            call.memory.read_bytes(page_buffer + page_pitch + 2 * 2, 2).unwrap(),
+            &0x0102_u16.to_le_bytes(),
+            "the sprite's column 1 landed on the page's column 2"
+        );
+        assert_eq!(
+            call.memory.read_bytes(page_buffer + page_pitch + 4 * 2, 2).unwrap(),
+            &0x0506_u16.to_le_bytes()
+        );
+
+        // A fill of a sub-rectangle starts at its own column too.
+        let effects = STACK_BASE + 0xf700;
+        let fill_rect = STACK_BASE + 0xf800;
+        for (index, value) in [6_u32, 2, 8, 3].iter().enumerate() {
+            memory.write_u32(fill_rect + index as u32 * 4, *value).unwrap();
+        }
+        memory.write_u32(effects, 0x64).unwrap();
+        memory.write_u32(effects + FILL_COLOR, 0x0a0b).unwrap();
+        memory.write_u32(blit, page).unwrap();
+        memory.write_u32(blit + 4, fill_rect).unwrap();
+        memory.write_u32(blit + 8, 0).unwrap();
+        memory.write_u32(blit + 12, 0).unwrap();
+        memory.write_u32(blit + 16, DDBLT_COLORFILL).unwrap();
+        memory.write_u32(blit + 20, effects).unwrap();
+        let mut call = Call { memory: &mut memory, args: blit, arg_bytes: 24 };
+        assert_eq!(
+            serve(&mut host, &mut call, thunks::DDRAW_SURFACE, "Blt").unwrap(),
+            Return(DD_OK)
+        );
+        assert_eq!(
+            call.memory.read_bytes(page_buffer + 2 * page_pitch + 6 * 2, 2).unwrap(),
+            &0x0a0b_u16.to_le_bytes(),
+            "column 6 of the filled row carries the fill colour"
+        );
+        assert_eq!(
+            call.memory.read_bytes(page_buffer + 2 * page_pitch + 5 * 2, 2).unwrap(),
+            &[0, 0],
+            "the column before it is untouched"
+        );
     }
 }

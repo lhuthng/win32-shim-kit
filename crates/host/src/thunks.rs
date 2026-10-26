@@ -51,6 +51,13 @@ pub const DDRAW_PALETTE: u8 = 4;
 pub const DDRAW_CLIPPER: u8 = 5;
 pub const DSOUND: u8 = 6;
 pub const DSOUND_BUFFER: u8 = 7;
+/// The DirectShow objects a graph hands out, one kind per interface.
+pub const QUARTZ_GRAPH: u8 = 8;
+pub const QUARTZ_CONTROL: u8 = 9;
+pub const QUARTZ_EVENT: u8 = 10;
+pub const QUARTZ_POSITION: u8 = 11;
+pub const QUARTZ_VIDEO_WINDOW: u8 = 12;
+pub const QUARTZ_BASIC_AUDIO: u8 = 13;
 
 const S_OK: u32 = 0;
 /// The object exists but does not implement the requested interface.
@@ -90,6 +97,13 @@ pub(crate) struct Method {
     pub(crate) pop: u32,
 }
 
+impl Method {
+    /// A table entry, for the tables that are not this module's.
+    pub(crate) const fn new(name: &'static str, pop: u32) -> Option<Method> {
+        Some(Method { name, pop })
+    }
+}
+
 /// Shorthand for a method table entry.
 #[allow(dead_code)]
 pub(crate) const fn m(name: &'static str, pop: u32) -> Option<Method> {
@@ -102,6 +116,9 @@ const DINPUT_METHODS: &[Option<Method>] = &[
     Some(Method { name: "AddRef", pop: 4 }),
     Some(Method { name: "Release", pop: 4 }),
     Some(Method { name: "CreateDevice", pop: 16 }),
+    // `EnumDevices(this, devType, callback, ref, flags)`: the slot Cave Story
+    // uses to look for a gamepad before it starts.
+    Some(Method { name: "EnumDevices", pop: 20 }),
 ];
 
 /// `IDirectInputDevice`, in vtable order. The offsets match the plan's table:
@@ -160,6 +177,12 @@ pub fn kind_name(kind: u8) -> &'static str {
         DDRAW_CLIPPER => "IDirectDrawClipper",
         DSOUND => "IDirectSound",
         DSOUND_BUFFER => "IDirectSoundBuffer",
+        QUARTZ_GRAPH => "IGraphBuilder",
+        QUARTZ_CONTROL => "IMediaControl",
+        QUARTZ_EVENT => "IMediaEvent",
+        QUARTZ_POSITION => "IMediaPosition",
+        QUARTZ_VIDEO_WINDOW => "IVideoWindow",
+        QUARTZ_BASIC_AUDIO => "IBasicAudio",
         _ => "unknown interface",
     }
 }
@@ -174,7 +197,7 @@ fn methods(kind: u8) -> Option<&'static [Option<Method>]> {
         DDRAW_CLIPPER => Some(crate::shim::ddraw::CLIPPER_METHODS),
         DSOUND => Some(crate::shim::dsound::SOUND_METHODS),
         DSOUND_BUFFER => Some(crate::shim::dsound::BUFFER_METHODS),
-        _ => None,
+        kind => crate::shim::quartz::methods(kind),
     }
 }
 
@@ -219,6 +242,15 @@ pub fn serve(host: &mut Host, call: &mut Call<'_>, kind: u8, slot: u8) -> Result
             crate::shim::dsound::serve(host, call, kind, name)
         }
 
+        // The filter graph owns its own reference counting and interface
+        // answering: `QueryInterface` on it hands back a different interface
+        // table, which the generic answers below cannot do.
+        (
+            QUARTZ_GRAPH | QUARTZ_CONTROL | QUARTZ_EVENT | QUARTZ_POSITION
+            | QUARTZ_VIDEO_WINDOW | QUARTZ_BASIC_AUDIO,
+            name,
+        ) => crate::shim::quartz::serve(host, call, kind, name),
+
         // Reference counting: on a host object that outlives its references, the
         // count only has to be non-zero and stable. Surfaces are the exception --
         // `ddraw::serve` owns their Release, because the last one frees pixels.
@@ -244,6 +276,15 @@ pub fn serve(host: &mut Host, call: &mut Call<'_>, kind: u8, slot: u8) -> Result
                 }
             ));
             call.write_u32(destination, device)?;
+            Ok(Return(S_OK))
+        }
+
+        (DINPUT, "EnumDevices") => {
+            // No device is attached that DirectInput enumerated: the keyboard and
+            // pointer the page supplies are read through the window, not as
+            // `IDirectInputDevice`s of their own. A game that asks finds none and
+            // falls back to the keys, which is what a machine with no gamepad
+            // does.
             Ok(Return(S_OK))
         }
 
@@ -319,6 +360,7 @@ pub fn serve(host: &mut Host, call: &mut Call<'_>, kind: u8, slot: u8) -> Result
                         state[0..4].copy_from_slice(&dx.to_le_bytes());
                         state[4..8].copy_from_slice(&dy.to_le_bytes());
                         state[12..16].copy_from_slice(&button_bytes(host.input.button_state()));
+
                         let count = (length as usize).min(DIMOUSESTATE_BYTES);
                         call.write(destination, &state[..count])?;
                     }

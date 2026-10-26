@@ -60,6 +60,7 @@ fn sign_extend(value: u32, size: Size) -> i32 {
     }
 }
 
+#[inline]
 fn address_of(cpu: &Cpu, memory: Mem) -> u32 {
     let mut address = memory.disp as u32;
     if let Some(base) = memory.base {
@@ -74,7 +75,31 @@ fn address_of(cpu: &Cpu, memory: Mem) -> u32 {
     address
 }
 
+/// Reads an operand.
+///
+/// The forms a compiled loop spends its time on -- a register, an immediate and
+/// a dword in memory -- are written out here so the caller can inline them; what
+/// is left is the rare ones (byte and word memory, `ah`-style halves) and goes
+/// through [`read_general`] as a call. The interpreter retires tens of millions of
+/// instructions a second, so a call per operand is a measurable share of it.
+#[inline(always)]
 fn read_operand(memory: &GuestMemory, cpu: &Cpu, operand: Operand, size: Size) -> Result<u32> {
+    match operand {
+        Operand::Reg(register) => Ok(cpu.regs.get(register)),
+        Operand::RegByte(register) => Ok(u32::from(cpu.regs.get_byte(register))),
+        Operand::Mem(target) if matches!(size, Size::Dword) => {
+            memory.read_u32(address_of(cpu, target))
+        }
+        // `83 /n` carries a signed byte that widens to the operation's width.
+        Operand::Imm8(value) if matches!(size, Size::Dword) => {
+            Ok(sign_extend(u32::from(value), Size::Byte) as u32)
+        }
+        Operand::Imm32(value) if matches!(size, Size::Dword) => Ok(value),
+        other => read_general(memory, cpu, other, size),
+    }
+}
+
+fn read_general(memory: &GuestMemory, cpu: &Cpu, operand: Operand, size: Size) -> Result<u32> {
     match operand {
         Operand::Reg(register) => Ok(cpu.regs.get(register)),
         Operand::Reg16(register) => Ok(u32::from(cpu.regs.get_word(register))),
@@ -106,7 +131,34 @@ fn read_operand(memory: &GuestMemory, cpu: &Cpu, operand: Operand, size: Size) -
     }
 }
 
+/// Writes an operand. The register and dword-memory forms are here for the same
+/// reason as in [`read_operand`]: everything else is a call.
+#[inline(always)]
 fn write_operand(
+    memory: &mut GuestMemory,
+    cpu: &mut Cpu,
+    operand: Operand,
+    size: Size,
+    value: u32,
+) -> Result<()> {
+    match operand {
+        Operand::Reg(register) => {
+            cpu.regs.set(register, value);
+            Ok(())
+        }
+        Operand::RegByte(register) => {
+            cpu.regs.set_byte(register, value as u8);
+            Ok(())
+        }
+        Operand::Mem(target) if matches!(size, Size::Dword) => {
+            let address = address_of(cpu, target);
+            memory.write_u32(address, value)
+        }
+        other => write_general(memory, cpu, other, size, value),
+    }
+}
+
+fn write_general(
     memory: &mut GuestMemory,
     cpu: &mut Cpu,
     operand: Operand,
@@ -971,6 +1023,18 @@ pub fn execute(
             write_operand(memory, cpu, instruction.operand(0), size, !value)?;
             Ok(Step::Continue)
         }
+        Mnemonic::Bswap => {
+            // No flags: `bswap` is a data movement, not an operation on a value.
+            let value = read_operand(memory, cpu, instruction.operand(0), Size::Dword)?;
+            write_operand(
+                memory,
+                cpu,
+                instruction.operand(0),
+                Size::Dword,
+                value.swap_bytes(),
+            )?;
+            Ok(Step::Continue)
+        }
         Mnemonic::Mul => {
             let value = read_operand(memory, cpu, instruction.operand(0), size)?;
             let left = cpu.regs.get(EAX) & mask_of(size);
@@ -1267,6 +1331,7 @@ pub fn execute(
                     return Ok(Step::HostCall(HostCall {
                         slot: index,
                         thunk: None,
+                        proc: None,
                         iat_va: address,
                         return_address,
                         args,

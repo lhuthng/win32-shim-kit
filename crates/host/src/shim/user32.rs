@@ -51,9 +51,19 @@ const USER32: &str = "USER32.dll";
 /// every other handle the host makes, so a log line reads at a glance.
 const DESKTOP_WINDOW: u32 = 0x0001_0000;
 const FIRST_WINDOW: u32 = 0x0001_0100;
-const FIRST_DC: u32 = 0x0001_0200;
 const ARROW_CURSOR: u32 = 0x0001_0300;
 const APPLICATION_ICON: u32 = 0x0001_0400;
+
+/// Handles for bitmaps loaded out of the image's resource tree.
+const FIRST_BITMAP: u32 = 0x0001_0500;
+
+/// `LoadImageA`'s types, and the resource type bitmap resources are filed under.
+const IMAGE_BITMAP: u32 = 0;
+const IMAGE_ICON: u32 = 1;
+const IMAGE_CURSOR: u32 = 2;
+const RT_BITMAP: u32 = 2;
+/// `LR_LOADFROMFILE`: the name is a path in the file table, not a resource.
+const LR_LOADFROMFILE: u32 = 0x0010;
 
 /// `IDC_ARROW` and `IDI_APPLICATION`: the first predefined cursor and icon.
 const FIRST_CURSOR_ID: u32 = 32512;
@@ -79,9 +89,14 @@ const PM_REMOVE: u32 = 1;
 /// `WM_NULL`: the message `GetMessageA` answers with when nothing is queued.
 const WM_NULL: u32 = 0x0000;
 
+/// `WS_VISIBLE`: a window created with it is on screen from the moment it
+/// exists, so creating it activates it without a separate `ShowWindow`.
+const WS_VISIBLE: u32 = 0x1000_0000;
+
 /// `WM_ACTIVATE` with `WA_ACTIVE`, `WM_SETFOCUS` and `WM_ACTIVATEAPP`: what a
 /// window receives when it becomes the one the user is looking at.
 const WM_SETFOCUS: u32 = 0x0007;
+const WM_PAINT: u32 = 0x000f;
 const WM_ACTIVATE: u32 = 0x0006;
 const WM_ACTIVATEAPP: u32 = 0x001c;
 const WA_ACTIVE: u32 = 1;
@@ -100,6 +115,8 @@ pub const SHIMS: &[Binding] = &[
     Binding { dll: USER32, name: "DefWindowProcA", arg_bytes: 16, shim: def_window_proc },
     Binding { dll: USER32, name: "DispatchMessageA", arg_bytes: 4, shim: dispatch_message },
     Binding { dll: USER32, name: "FindWindowA", arg_bytes: 8, shim: find_window },
+    Binding { dll: USER32, name: "FindWindowW", arg_bytes: 8, shim: find_window },
+    Binding { dll: USER32, name: "MessageBoxW", arg_bytes: 16, shim: message_box_w },
     Binding { dll: USER32, name: "GetAsyncKeyState", arg_bytes: 4, shim: get_async_key_state },
     Binding { dll: USER32, name: "GetCursorPos", arg_bytes: 4, shim: get_cursor_pos },
     Binding { dll: USER32, name: "GetDC", arg_bytes: 4, shim: get_dc },
@@ -109,6 +126,10 @@ pub const SHIMS: &[Binding] = &[
     Binding { dll: USER32, name: "GetWindowDC", arg_bytes: 4, shim: get_dc },
     Binding { dll: USER32, name: "GetWindowLongA", arg_bytes: 8, shim: get_window_long },
     Binding { dll: USER32, name: "GetWindowRect", arg_bytes: 8, shim: get_window_rect },
+    Binding { dll: USER32, name: "LoadImageA", arg_bytes: 24, shim: load_image },
+    Binding { dll: USER32, name: "LoadStringA", arg_bytes: 16, shim: load_string },
+    Binding { dll: USER32, name: "SetCapture", arg_bytes: 4, shim: set_capture },
+    Binding { dll: USER32, name: "ReleaseCapture", arg_bytes: 0, shim: release_capture },
     Binding { dll: USER32, name: "LoadCursorA", arg_bytes: 8, shim: load_cursor },
     Binding { dll: USER32, name: "LoadIconA", arg_bytes: 8, shim: load_icon },
     Binding { dll: USER32, name: "MessageBoxA", arg_bytes: 16, shim: message_box },
@@ -125,7 +146,245 @@ pub const SHIMS: &[Binding] = &[
     Binding { dll: USER32, name: "SystemParametersInfoA", arg_bytes: 16, shim: system_parameters_info },
     Binding { dll: USER32, name: "TranslateMessage", arg_bytes: 4, shim: translate_message },
     Binding { dll: USER32, name: "UpdateWindow", arg_bytes: 4, shim: update_window },
+    Binding { dll: USER32, name: "CloseClipboard", arg_bytes: 0, shim: close_clipboard },
+    Binding { dll: USER32, name: "CreateWindowExW", arg_bytes: 48, shim: create_window_ex_w },
+    Binding { dll: USER32, name: "DefWindowProcW", arg_bytes: 16, shim: def_window_proc },
+    Binding { dll: USER32, name: "RegisterClassW", arg_bytes: 4, shim: register_class_w },
+    Binding { dll: USER32, name: "GetClientRect", arg_bytes: 8, shim: get_client_rect },
+    Binding { dll: USER32, name: "ClientToScreen", arg_bytes: 8, shim: client_to_screen },
+    Binding { dll: USER32, name: "InvalidateRect", arg_bytes: 12, shim: invalidate_rect },
+    Binding { dll: USER32, name: "GetKeyState", arg_bytes: 4, shim: get_key_state },
+    Binding { dll: USER32, name: "SetCursor", arg_bytes: 4, shim: set_cursor },
+    Binding { dll: USER32, name: "DestroyWindow", arg_bytes: 4, shim: destroy_window },
+    Binding { dll: USER32, name: "GetClipboardData", arg_bytes: 4, shim: get_clipboard_data },
+    Binding { dll: USER32, name: "CharNextA", arg_bytes: 4, shim: char_next },
+    Binding { dll: USER32, name: "GetKeyboardType", arg_bytes: 4, shim: get_keyboard_type },
+    Binding { dll: USER32, name: "GetSystemMetrics", arg_bytes: 4, shim: get_system_metrics },
+    Binding { dll: USER32, name: "OpenClipboard", arg_bytes: 4, shim: open_clipboard },
+    Binding { dll: USER32, name: "PostMessageA", arg_bytes: 16, shim: post_message },
+    Binding { dll: USER32, name: "RegisterClassExA", arg_bytes: 4, shim: register_class_ex },
+    Binding { dll: USER32, name: "SetClipboardData", arg_bytes: 8, shim: set_clipboard_data },
+    Binding { dll: USER32, name: "SetWindowTextA", arg_bytes: 8, shim: set_window_text },
+    Binding { dll: USER32, name: "ValidateRect", arg_bytes: 8, shim: validate_rect },
+    // `wsprintfA` is variadic and declared `WINAPIV`, so it is cdecl: the shim's
+    // declared bytes are how far its arguments may extend, and the caller pops.
+    Binding { dll: USER32, name: "wsprintfA", arg_bytes: 52, shim: wsprintf_a },
 ];
+
+/// `WNDCLASSEXA`: the class name and procedure, four bytes further along than in
+/// the ANSI structure because of the leading `cbSize`.
+const WNDCLASSEX_PROC: u32 = 8;
+const WNDCLASSEX_NAME: u32 = 40;
+
+fn register_class_ex(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let class = call.arg(0)?;
+    if class == 0 {
+        return Err("RegisterClassExA without a WNDCLASSEXA".to_string());
+    }
+    let proc_address = call.memory.read_u32(class.wrapping_add(WNDCLASSEX_PROC))?;
+    let name = call
+        .memory
+        .read_cstr(call.memory.read_u32(class.wrapping_add(WNDCLASSEX_NAME))?)?;
+    Ok(Return(host.windows.register(name, proc_address)))
+}
+
+fn destroy_window(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    // The page owns the one window the guest sees; destroying it does not make
+    // the machine invisible, and the guest uses the answer only to check success.
+    Ok(Return(1))
+}
+
+/// `GetSystemMetrics(index)`: the screen the target presents for the two sizes,
+/// and a zero for everything the browser does not model (caption height, border
+/// width, and the rest) -- the same zeroes a bare display reports.
+fn get_system_metrics(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let (width, height) = host.windows.screen();
+    if std::env::var("SHIMKIT_LOG_USER").is_ok() && host.notices.len() < 600 {
+        host.notice(format!(
+            "GetSystemMetrics({}) with a screen of {width}x{height}",
+            call.arg(0)?
+        ));
+    }
+    // The metrics a windowed guest measures itself with. A zero is never a real
+    // answer to any of them: a program that asks how tall a caption is and is
+    // told zero lays its client area out as if the window had no frame.
+    Ok(Return(match call.arg(0)? {
+        0 => width as u32,                                        // SM_CXSCREEN
+        1 => height as u32,                                       // SM_CYSCREEN
+        2 => 17,                                                  // SM_CXVSCROLL
+        3 => 17,                                                  // SM_CYHSCROLL
+        4 => 19,                                                  // SM_CYCAPTION
+        5 | 6 => 1,                                               // SM_CXBORDER, SM_CYBORDER
+        7 | 8 => 4,                                               // SM_CXDLGFRAME, SM_CYDLGFRAME
+        11 | 12 => 32,                                            // SM_CXICON, SM_CYICON
+        13 | 14 => 32,                                            // SM_CXCURSOR, SM_CYCURSOR
+        15 => 1,                                                  // SM_CYMENU
+        16 => (width - 8).max(0) as u32,                          // SM_CXFULLSCREEN
+        17 => (height - 27).max(0) as u32,                        // SM_CYFULLSCREEN
+        32 | 33 => 4,                                             // SM_CXFRAME, SM_CYFRAME
+        36 | 37 => 4,                                             // SM_CXDOUBLECLK, SM_CYDOUBLECLK
+        43 => 3,                                                  // SM_CMOUSEBUTTONS
+        68 | 69 => 4,                                             // SM_CXDRAG, SM_CYDRAG
+        80 => 1,                                                  // SM_CMONITORS
+        _ => 0,
+    }))
+}
+
+/// `CharNextA(text)`: the next character, which in the single-byte codepage this
+/// host reports is one byte on. A lead byte would be two, and nothing here
+/// claims a DBCS codepage.
+fn char_next(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let text = call.arg(0)?;
+    if text == 0 || call.memory.read_u8(text)? == 0 {
+        return Ok(Return(text));
+    }
+    Ok(Return(text + 1))
+}
+
+/// `GetKeyboardType(flag)`: an enhanced 101-key PC, which is the keyboard every
+/// browser reports. The three flags ask for the type, the subtype and the number
+/// of function keys, and those are the three answers.
+fn get_keyboard_type(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(match call.arg(0)? {
+        0 => 1,
+        1 => 4,
+        _ => 12,
+    }))
+}
+
+fn post_message(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    host.input.post(call.arg(0)?, call.arg(1)?, call.arg(2)?, call.arg(3)?);
+    Ok(Return(1))
+}
+
+fn set_window_text(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(1))
+}
+
+fn validate_rect(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    // Nothing paints the guest's window through GDI, so there is no invalid
+    // region to clear; the guest's own drawing is the display.
+    Ok(Return(1))
+}
+
+fn open_clipboard(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(1))
+}
+
+fn close_clipboard(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(1))
+}
+
+fn set_clipboard_data(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    // The data handle is handed straight back, which is what a successful
+    // `SetClipboardData` returns. The browser's clipboard could hold it, but a
+    // game copying a score is not the user's clipboard to overwrite.
+    Ok(Return(call.arg(1)?))
+}
+
+fn get_clipboard_data(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(0))
+}
+
+/// `wsprintfA(buffer, format, ...)`: the CRT's small formatter, used for window
+/// titles and scores.
+///
+/// The arguments are read straight from the guest stack, which is why this shim
+/// declares a window rather than a signature: how many there are is written in
+/// the format itself. Widths and the integer/signed/string conversions are
+/// supported; floating point is not, and a `%f` leaves the value unread rather
+/// than guessing at a guest's stack layout.
+fn wsprintf_a(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let destination = call.arg(0)?;
+    let format = call.cstr(1)?;
+    let mut output: Vec<u8> = Vec::new();
+    let mut argument = 2_u32;
+    let mut characters = format.chars().peekable();
+
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            let mut encoded = [0_u8; 4];
+            output.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+            continue;
+        }
+        if characters.peek() == Some(&'%') {
+            characters.next();
+            output.push(b'%');
+            continue;
+        }
+        let mut left = false;
+        let mut zero = false;
+        let mut width = 0_usize;
+        loop {
+            match characters.peek().copied() {
+                Some('-') => {
+                    left = true;
+                    characters.next();
+                }
+                Some('0') => {
+                    zero = true;
+                    characters.next();
+                }
+                Some('#') | Some('+') | Some(' ') => {
+                    characters.next();
+                }
+                Some(digit) if digit.is_ascii_digit() => {
+                    width = width * 10 + digit.to_digit(10).unwrap_or(0) as usize;
+                    characters.next();
+                }
+                _ => break,
+            }
+        }
+        if characters.peek() == Some(&'.') {
+            characters.next();
+            while characters.peek().is_some_and(|digit| digit.is_ascii_digit()) {
+                characters.next();
+            }
+        }
+        while characters
+            .peek()
+            .is_some_and(|modifier| matches!(modifier, 'l' | 'h' | 'L' | 'w' | 'I' | '6' | '4'))
+        {
+            characters.next();
+        }
+        let Some(specifier) = characters.next() else {
+            break;
+        };
+        let value = call.arg(argument)?;
+        argument += 1;
+        let text = match specifier {
+            'd' | 'i' => (value as i32).to_string(),
+            'u' => value.to_string(),
+            'x' => format!("{value:x}"),
+            'X' => format!("{value:X}"),
+            'c' => char::from_u32(value & 0xff).unwrap_or('?').to_string(),
+            's' => {
+                // A null string formats as the empty string, as the CRT does.
+                if value == 0 {
+                    String::new()
+                } else {
+                    call.memory.read_cstr(value)?
+                }
+            }
+            _ => continue,
+        };
+        if text.len() >= width {
+            output.extend_from_slice(text.as_bytes());
+        } else if left {
+            output.extend_from_slice(text.as_bytes());
+            output.extend(std::iter::repeat_n(b' ', width - text.len()));
+        } else {
+            output.extend(std::iter::repeat_n(if zero { b'0' } else { b' ' }, width - text.len()));
+            output.extend_from_slice(text.as_bytes());
+        }
+    }
+
+    if destination != 0 {
+        call.write(destination, &output)?;
+        call.write(destination.wrapping_add(output.len() as u32), &[0])?;
+    }
+    Ok(Return(output.len() as u32))
+}
 
 /// A window the guest created.
 struct Window {
@@ -153,12 +412,19 @@ pub struct Windows {
     /// selector. `GWL_STYLE` is answered from the window itself.
     extra: HashMap<(u32, i32), u32>,
     next_window: u32,
-    next_dc: u32,
     cursor: (i32, i32),
     cursor_visible: i32,
+    /// The cursor handle the guest last selected with `SetCursor`, which is what
+    /// the next call answers with as the previous one.
+    pub cursor_image: u32,
     /// The screen the port presents, when it named one. `None` means the
     /// conventional VGA mode this emulation assumes.
     screen: Option<(i32, i32)>,
+    /// The window holding the mouse capture. A game captures the pointer so that
+    /// movement outside its window still arrives, which on this machine it always
+    /// does; the value exists so `SetCapture` and `ReleaseCapture` can answer with
+    /// the previous holder.
+    capture: u32,
 }
 
 impl Windows {
@@ -214,6 +480,14 @@ impl Windows {
         self.cursor
     }
 
+    /// Whether the guest wants the system pointer shown: Windows' display
+    /// counter, which `ShowCursor` moves and only goes negative when the guest
+    /// asked for it to be hidden. A game that draws its own cursor has asked,
+    /// and the page hides its pointer over the canvas to match.
+    pub fn cursor_shown(&self) -> bool {
+        self.cursor_visible >= 0
+    }
+
     /// The window procedure the guest registered for a window, if it has one.
     pub fn proc_address(&self, handle: u32) -> Option<u32> {
         self.windows
@@ -241,10 +515,14 @@ impl Windows {
         self.windows.get(&handle).map(|window| window.style)
     }
 
-    fn next_dc(&mut self) -> u32 {
-        let handle = FIRST_DC + self.next_dc * 4;
-        self.next_dc += 1;
-        handle
+    /// The size of a window's client area, which is what a context drawing into
+    /// it covers.
+    pub fn size(&self, handle: u32) -> Option<(i32, i32)> {
+        let window = self.windows.get(&handle)?;
+        Some((
+            window.rect[2] - window.rect[0],
+            window.rect[3] - window.rect[1],
+        ))
     }
 
     /// One line about a window, for the diagnostics log. It reads every field a
@@ -267,14 +545,26 @@ impl Windows {
 // ---- window classes and windows ------------------------------------------
 
 fn register_class(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    register(host, call, false)
+}
+
+/// `RegisterClassW`: the same `WNDCLASSW`, whose name is UTF-16.
+fn register_class_w(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    register(host, call, true)
+}
+
+fn register(host: &mut Host, call: &mut Call<'_>, wide: bool) -> Result<Action> {
     let class = call.arg(0)?;
     if class == 0 {
-        return Err("RegisterClassA without a WNDCLASSA".to_string());
+        return Err("RegisterClass without a WNDCLASS".to_string());
     }
     let proc_address = call.memory.read_u32(class.wrapping_add(WNDCLASS_PROC))?;
-    let name = call
-        .memory
-        .read_cstr(call.memory.read_u32(class.wrapping_add(WNDCLASS_NAME))?)?;
+    let name = call.memory.read_u32(class.wrapping_add(WNDCLASS_NAME))?;
+    let name = if wide {
+        call.wstr(name)?
+    } else {
+        call.memory.read_cstr(name)?
+    };
     // The atom is not a real atom; it only has to be non-zero and stable.
     Ok(Return(host.windows.register(name, proc_address)))
 }
@@ -282,6 +572,17 @@ fn register_class(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
 fn create_window_ex(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let class = optional_cstr(call, 1)?;
     let title = optional_cstr(call, 2)?;
+    create(host, call, class, title)
+}
+
+/// `CreateWindowExW`: the same window, with a UTF-16 class name and title.
+fn create_window_ex_w(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let class = optional_wide(call, 1)?;
+    let title = optional_wide(call, 2)?;
+    create(host, call, class, title)
+}
+
+fn create(host: &mut Host, call: &mut Call<'_>, class: String, title: String) -> Result<Action> {
     let style = call.arg(3)?;
     // The game asks for `CW_USEDEFAULT` in every coordinate, so the window the
     // host reports is the surface itself; a zero size would be a window nobody
@@ -314,7 +615,26 @@ fn create_window_ex(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     if !title.is_empty() {
         host.notice(format!("window title \"{title}\""));
     }
+    // A `WS_VISIBLE` window is on screen as soon as it exists, and Windows
+    // activates it then. A game that creates its window that way -- Cave Story
+    // does -- never calls `ShowWindow`, and its message loop waits for exactly
+    // these messages before it runs a frame.
+    if style & WS_VISIBLE != 0 {
+        activate(host, handle);
+    }
     Ok(Return(handle))
+}
+
+/// Queues the messages a window receives when it becomes the one the user is
+/// looking at, once per session.
+fn activate(host: &mut Host, handle: u32) {
+    if host.windows.activated || handle == 0 {
+        return;
+    }
+    host.windows.activated = true;
+    host.input.post(handle, WM_ACTIVATE, WA_ACTIVE, 0);
+    host.input.post(handle, WM_SETFOCUS, 0, 0);
+    host.input.post(handle, WM_ACTIVATEAPP, 1, 0);
 }
 
 /// There is one guest in this host, so the answer is always "no other copy".
@@ -328,16 +648,17 @@ fn show_window(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     // Windows follows that with the activation messages, and the guest's window
     // procedure reads them: it is how a game learns it has the user's attention.
     let handle = call.arg(0)?;
-    if !host.windows.activated && handle != 0 {
-        host.windows.activated = true;
-        host.input.post(handle, WM_ACTIVATE, WA_ACTIVE, 0);
-        host.input.post(handle, WM_SETFOCUS, 0, 0);
-        host.input.post(handle, WM_ACTIVATEAPP, 1, 0);
-    }
+    activate(host, handle);
     Ok(Return(1))
 }
 
-fn update_window(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+fn update_window(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    // Windows paints the window now: `UpdateWindow` sends `WM_PAINT` before it
+    // returns, which is where a guest that draws on demand does its first frame.
+    let handle = call.arg(0)?;
+    if handle != 0 {
+        host.input.post(handle, WM_PAINT, 0, 0);
+    }
     Ok(Return(1))
 }
 
@@ -422,6 +743,11 @@ fn dispatch_message(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let message = call.memory.read_u32(address + 4)?;
     let wparam = call.memory.read_u32(address + 8)?;
     let lparam = call.memory.read_u32(address + 12)?;
+    if std::env::var("SHIMKIT_LOG_USER").is_ok() && host.notices.len() < 600 {
+        host.notice(format!(
+            "DispatchMessage {message:#06x} to {window:#x} wparam {wparam:#x} lparam {lparam:#x}"
+        ));
+    }
     if window == 0 {
         // `WM_QUIT` from a thread queue: there is no window and no procedure.
         return Ok(Return(0));
@@ -431,6 +757,10 @@ fn dispatch_message(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
             host.guest_call = Some(GuestCall {
                 entry,
                 args: [window, message, wparam, lparam],
+                // The procedure's return value finishes the import; nothing else
+                // of this shim is left to do.
+                answer: None,
+                resume: false,
             });
             Ok(Return(0))
         }
@@ -495,6 +825,10 @@ fn optional_cstr(call: &Call<'_>, index: u32) -> Result<String> {
         return Ok(String::new());
     }
     call.cstr(index)
+}
+
+fn optional_wide(call: &Call<'_>, index: u32) -> Result<String> {
+    call.wstr(call.arg(index)?)
 }
 
 fn adjust_window_rect(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
@@ -567,13 +901,91 @@ fn get_menu(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
 }
 
 fn def_window_proc(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    // Nothing here has a title bar, border or menu for the default procedure to
+    // draw or answer for; the guest's own drawing is the window.
     Ok(Return(0))
+}
+
+/// `GetClientRect(hwnd, &rect)`: the window's own area, from the origin.
+///
+/// There is no border and no caption, so the client area is the window's size.
+fn get_client_rect(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let handle = call.arg(0)?;
+    let destination = call.arg(1)?;
+    let Some(rect) = host.windows.rect(handle) else {
+        return Ok(Return(0));
+    };
+    if destination != 0 {
+        write_rect_at(
+            call,
+            destination,
+            [0, 0, rect[2] - rect[0], rect[3] - rect[1]],
+        )?;
+    }
+    Ok(Return(1))
+}
+
+/// `ClientToScreen(hwnd, &point)`: the client's origin added to the point.
+fn client_to_screen(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let handle = call.arg(0)?;
+    let point = call.arg(1)?;
+    let Some(rect) = host.windows.rect(handle) else {
+        return Ok(Return(0));
+    };
+    if point == 0 {
+        return Ok(Return(0));
+    }
+    let x = call.memory.read_u32(point)? as i32 + rect[0];
+    let y = call.memory.read_u32(point.wrapping_add(4))? as i32 + rect[1];
+    call.write_u32(point, x as u32)?;
+    call.write_u32(point.wrapping_add(4), y as u32)?;
+    Ok(Return(1))
+}
+
+/// `InvalidateRect(hwnd, &rect, erase)`: nothing paints the guest's window
+/// through GDI, so there is no region to mark and the call succeeds.
+fn invalidate_rect(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let _ = host;
+    let _ = call.arg(0)?;
+    Ok(Return(1))
+}
+
+/// `GetKeyState(vk)`: the key's state as the queue sees it.
+///
+/// Bit 15 is down, the toggle bit is never set because this host does not track
+/// one, and -- unlike `GetAsyncKeyState` -- the reading does not consume the
+/// press edge, which is the difference the two functions exist for.
+fn get_key_state(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let key = call.arg(0)? as u8;
+    Ok(Return(u32::from(host.input.keyboard_state(key))))
+}
+
+/// `SetCursor(cursor)`: the cursor that was set before it.
+///
+/// The page keeps the pointer the visitor sees, so this records the guest's
+/// choice and nothing on screen changes; what a game reads back is the previous
+/// handle, as on Windows.
+fn set_cursor(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let cursor = call.arg(0)?;
+    Ok(Return(std::mem::replace(
+        &mut host.windows.cursor_image,
+        cursor,
+    )))
 }
 
 // ---- device contexts, cursor and input -----------------------------------
 
+/// `GetDC(hwnd)` and `GetWindowDC(hwnd)`: the context that draws on the screen.
+///
+/// It is GDI's own context, not a number of its own, so the guest can select a
+/// font or a brush into it and `BitBlt` a finished menu through it -- and what
+/// lands is the primary surface the page shows.
 fn get_dc(host: &mut Host, _: &mut Call<'_>) -> Result<Action> {
-    Ok(Return(host.windows.next_dc()))
+    // A guest that draws its menus with GDI has no DirectDraw surface behind them,
+    // so the screen is made here: the first `GetDC` is the first moment anything
+    // knows how large the guest's window is.
+    crate::shim::gdi32::ensure_window_screen(host)?;
+    Ok(Return(host.gdi.window_dc()))
 }
 
 fn release_dc(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
@@ -585,7 +997,23 @@ fn show_cursor(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     // arithmetic here means a `ShowCursor(FALSE)` from the game hides the page's
     // own pointer too once input is wired to it.
     let show = call.arg(0)?;
+    let before = host.windows.cursor_shown();
     host.windows.cursor_visible += if show != 0 { 1 } else { -1 };
+    // The page keeps the real pointer, so this only tells the loader what the
+    // guest decided: one counter, one cursor, as on Windows. Worth saying once
+    // per change -- a game that hides the pointer draws its own, and a page that
+    // keeps showing one leaves two cursors for one click.
+    if before != host.windows.cursor_shown() {
+        host.notice(format!(
+            "ShowCursor({}) -> {}",
+            show,
+            if host.windows.cursor_shown() {
+                "shown"
+            } else {
+                "hidden; the guest draws its own"
+            }
+        ));
+    }
     Ok(Return(host.windows.cursor_visible as u32))
 }
 
@@ -625,6 +1053,150 @@ fn load_icon(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     Ok(Return(predefined(call.arg(1)?, FIRST_ICON_ID, APPLICATION_ICON)))
 }
 
+/// `LoadImageA(instance, name, type, cx, cy, flags)`.
+///
+/// Icons and cursors answer like `LoadIconA` and `LoadCursorA`: this machine has
+/// the predefined ones and nothing else. A bitmap comes either from the image's
+/// own resource tree -- `RT_BITMAP` is type 2 -- or, under `LR_LOADFROMFILE`,
+/// from a file in the file table; the name is a path in that case, and an image
+/// that has neither answers 0, which is what Windows does for a name it cannot
+/// find.
+///
+/// Cave Story loads every `data/*.pbm` this way: they are ordinary `.bmp` files
+/// with a different extension, and it hands the handle to `GetObjectA` and then
+/// to a `StretchBlt` that puts it on a DirectDraw surface.
+fn load_image(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let name = call.arg(1)?;
+    let kind = call.arg(2)?;
+    let flags = call.arg(5)?;
+    if std::env::var("SHIMKIT_LOG_IMAGES").is_ok() && host.notices.len() < 400 {
+        let path = call.memory.read_cstr(name).unwrap_or_default();
+        host.notice(format!("LoadImageA name {path:?} type {kind} flags {flags:#x}"));
+    }
+    match kind {
+        IMAGE_ICON => Ok(Return(predefined(name, FIRST_ICON_ID, APPLICATION_ICON))),
+        IMAGE_CURSOR => Ok(Return(predefined(name, FIRST_CURSOR_ID, ARROW_CURSOR))),
+        IMAGE_BITMAP if flags & LR_LOADFROMFILE != 0 => {
+            let path = call.memory.read_cstr(name)?;
+            let log = std::env::var("SHIMKIT_LOG_IMAGES").is_ok() && host.notices.len() < 400;
+            let Some(bytes) = host.files.contents(&path).map(<[u8]>::to_vec) else {
+                // The file table is the only filesystem here, and the missing
+                // name is the answer a caller that has a fallback already
+                // handles -- Cave Story treats it as a failed load.
+                if log {
+                    host.notice(format!("LoadImageA: missing {path}"));
+                }
+                return Ok(Return(0));
+            };
+            if log {
+                host.notice(format!("LoadImageA: {path} ({} bytes)", bytes.len()));
+            }
+            let base = host.allocate(bytes.len() as u32, 4)?;
+            call.memory.write_bytes(base, &bytes)?;
+            Ok(Return(host.gdi.add_bmp(call.memory, base)?))
+        }
+        IMAGE_BITMAP => {
+            let key = if name < 0x1_0000 {
+                crate::pe::ResourceKey::Id(name)
+            } else {
+                crate::pe::ResourceKey::Name(call.memory.read_cstr(name)?)
+            };
+            let found = host.resources.iter().position(|resource| {
+                resource.kind == crate::pe::ResourceKey::Id(RT_BITMAP)
+                    && resource.name == key
+            });
+            let Some(index) = found else {
+                return Ok(Return(0));
+            };
+            let handle = FIRST_BITMAP + index as u32 * 4;
+            // The handle is also the GDI object: a guest selects it into a DC
+            // and reads its size back with `GetObjectA`.
+            let rva = host.resources[index].rva;
+            host.gdi
+                .add_bitmap(call.memory, handle, crate::pe::IMAGE_BASE.wrapping_add(rva))?;
+            Ok(Return(handle))
+        }
+        _ => Ok(Return(0)),
+    }
+}
+
+/// `SetCapture(window)`: takes the mouse capture and answers its previous holder.
+fn set_capture(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let window = call.arg(0)?;
+    let previous = host.windows.capture;
+    host.windows.capture = window;
+    Ok(Return(previous))
+}
+
+/// `ReleaseCapture()`: gives the capture up.
+fn release_capture(host: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    let previous = host.windows.capture;
+    host.windows.capture = 0;
+    Ok(Return(previous))
+}
+
+/// `RT_STRING`, the resource type Windows files text under.
+const RT_STRING: u32 = 6;
+
+/// `LoadStringA(instance, id, buffer, max)`.
+///
+/// A string resource is not one resource per string. Windows files them in blocks
+/// of sixteen, under the resource name `(id >> 4) + 1`, each string preceded by a
+/// 16-bit count of UTF-16 code units. So this reads the block and walks it, and a
+/// block or entry that is not there is an empty string -- which is what a program
+/// that falls back to a default already handles.
+fn load_string(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let id = call.arg(1)?;
+    let buffer = call.arg(2)?;
+    let limit = call.arg(3)?;
+    if buffer == 0 {
+        return Ok(Return(0));
+    }
+    let block = crate::pe::ResourceKey::Id((id >> 4) + 1);
+    let found = host.resources.iter().find(|resource| {
+        resource.kind == crate::pe::ResourceKey::Id(RT_STRING) && resource.name == block
+    });
+    let Some(resource) = found else {
+        call.write(buffer, &[0])?;
+        return Ok(Return(0));
+    };
+    let at = crate::pe::IMAGE_BASE.wrapping_add(resource.rva);
+    let bytes = call.memory.read_bytes(at, resource.size as usize)?.to_vec();
+
+    let mut offset = 0_usize;
+    let mut index = 0_u32;
+    while offset + 2 <= bytes.len() {
+        let length = usize::from(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]));
+        let start = offset + 2;
+        let end = start + length * 2;
+        if end > bytes.len() {
+            break;
+        }
+        if index == id & 0xf {
+            // `LoadStringA` answers in the ANSI code page. These are the image's
+            // own strings: one byte each covers what they carry, and anything
+            // wider becomes `?` rather than a byte of the wrong character.
+            let mut text: Vec<u8> = bytes[start..end]
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .map(|unit| u8::try_from(unit).unwrap_or(b'?'))
+                .collect();
+            // A zero limit asks for the length only, and the buffer keeps its
+            // slot for the terminator.
+            let room = (limit as usize).saturating_sub(1);
+            text.truncate(room);
+            let copied = text.len() as u32;
+            text.push(0);
+            call.write(buffer, &text)?;
+            return Ok(Return(copied));
+        }
+        offset = end;
+        index += 1;
+    }
+    call.write(buffer, &[0])?;
+    Ok(Return(0))
+}
+
 /// A predefined resource id resolves to a handle; a named resource does not,
 /// because the image has no resource section to load it from.
 fn predefined(id: u32, first_id: u32, base: u32) -> u32 {
@@ -660,6 +1232,18 @@ fn message_box(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let text = call.cstr(1)?;
     let caption = call.cstr(2)?;
     host.notice(format!("MessageBoxA \"{caption}\": {text}"));
+    Ok(Return(IDOK))
+}
+
+/// `MessageBoxW(owner, text, caption, type)`: the same notice, with UTF-16 text.
+///
+/// A box does not block here, so the answer is the button the guest would have
+/// got from a player who pressed it: the first one, which is what a program that
+/// only reports a failure does with the result.
+fn message_box_w(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let text = call.wstr(call.arg(1)?)?;
+    let caption = call.wstr(call.arg(2)?)?;
+    host.notice(format!("MessageBoxW \"{caption}\": {text}"));
     Ok(Return(IDOK))
 }
 
@@ -734,6 +1318,39 @@ mod tests {
         host.pointer_move(-40, 0);
         assert_eq!(host.windows.cursor(), (280, 240));
         assert_eq!(host.input.mouse, (280, 240));
+    }
+
+    #[test]
+    fn the_keyboard_and_the_character_walk_are_the_ones_a_pc_reports() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "GetKeyboardType", &[0]).unwrap(),
+            Return(1),
+            "an enhanced 101-key PC"
+        );
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "GetKeyboardType", &[2]).unwrap(),
+            Return(12),
+            "twelve function keys"
+        );
+
+        let text = STACK_BASE + 0x2600;
+        memory.write_bytes(text, b"ab\0").unwrap();
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "CharNextA", &[text]).unwrap(),
+            Return(text + 1)
+        );
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "CharNextA", &[text + 1]).unwrap(),
+            Return(text + 2)
+        );
+        // At the terminator the walk stops rather than stepping past the string.
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "CharNextA", &[text + 2]).unwrap(),
+            Return(text + 2)
+        );
     }
 
     #[test]
@@ -1184,6 +1801,8 @@ mod tests {
             Some(GuestCall {
                 entry: 0x0045_7da3,
                 args: [window, input::WM_KEYDOWN, u32::from(b'A'), 0x001e_0001],
+                answer: None,
+                resume: false,
             })
         );
     }
@@ -1210,17 +1829,40 @@ mod tests {
         let Some((mut host, mut memory)) = machine() else {
             return;
         };
+        assert!(host.windows.cursor_shown(), "a machine starts with a pointer");
         assert_eq!(
             call_shim(&mut host, &mut memory, "ShowCursor", &[0]).unwrap(),
             Return((-1_i32) as u32)
         );
+        // The guest asked, so the page hides its pointer: the guest draws one.
+        assert!(!host.windows.cursor_shown());
         assert_eq!(
             call_shim(&mut host, &mut memory, "ShowCursor", &[1]).unwrap(),
             Return(0)
         );
+        assert!(host.windows.cursor_shown());
         assert_eq!(
             call_shim(&mut host, &mut memory, "ShowCursor", &[1]).unwrap(),
             Return(1)
         );
+        assert!(host.windows.cursor_shown());
     }
+
+    #[test]
+    fn a_pointer_placed_on_the_screen_reports_that_position() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let _ = &mut memory;
+        host.pointer(219, 351);
+        assert_eq!(host.windows.cursor(), (219, 351));
+        // The guest gets the step from the cursor it is tracking, so asking for
+        // the same place twice is not another 219 pixels of movement.
+        let _ = host.input.take_mouse_motion();
+        host.pointer(219, 351);
+        assert_eq!(host.input.take_mouse_motion(), (0, 0));
+        host.pointer(120, 40);
+        assert_eq!(host.input.take_mouse_motion(), (-99, -311));
+    }
+
 }

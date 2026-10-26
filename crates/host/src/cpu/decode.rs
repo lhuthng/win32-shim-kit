@@ -352,6 +352,25 @@ fn two_byte(
                 [decoded.operand, Operand::None, Operand::None],
             ))
         }
+        // `bswap r32`: the register is in the opcode's low three bits, with no
+        // ModRM byte. A 16-bit form is undefined on the hardware, so it is not
+        // decoded rather than guessed at.
+        0xc8..=0xcf => {
+            if width == Size::Word {
+                return Err(unsupported(pc, "16-bit bswap"));
+            }
+            Ok(Instruction::new(
+                pc,
+                cursor.len(),
+                Mnemonic::Bswap,
+                Size::Dword,
+                [
+                    Operand::Reg(opcode & 7),
+                    Operand::None,
+                    Operand::None,
+                ],
+            ))
+        }
         0xa3 | 0xab | 0xb3 | 0xbb => {
             let decoded = modrm(cursor, width, segment)?;
             Ok(Instruction::new(
@@ -568,6 +587,10 @@ fn x87(cursor: &mut Cursor, pc: u32, opcode: u8) -> Result<Instruction> {
             (0xda, 1) => Ok(float_int(Mnemonic::Fmul, Size::Dword)),
             (0xda, 2) => Ok(float_int(Mnemonic::Fcom, Size::Dword)),
             (0xda, 3) => Ok(float_int(Mnemonic::Fcomp, Size::Dword)),
+            (0xda, 4) => Ok(float_int(Mnemonic::Fsub, Size::Dword)),
+            (0xda, 5) => Ok(float_int(Mnemonic::Fsubr, Size::Dword)),
+            (0xda, 6) => Ok(float_int(Mnemonic::Fdiv, Size::Dword)),
+            (0xda, 7) => Ok(float_int(Mnemonic::Fdivr, Size::Dword)),
             // `de /n`: a 16-bit integer in memory.
             (0xde, 0) => Ok(float_int(Mnemonic::Fadd, Size::Word)),
             (0xde, 1) => Ok(float_int(Mnemonic::Fmul, Size::Word)),
@@ -683,6 +706,9 @@ fn x87(cursor: &mut Cursor, pc: u32, opcode: u8) -> Result<Instruction> {
         },
         (0xdb, 4) if index == 2 => Ok(stack(Mnemonic::Fnclex, [Operand::None; 3])),
         (0xdb, 4) if index == 3 => Ok(stack(Mnemonic::Fninit, [Operand::None; 3])),
+        // `da e9` is FUCOMPP: the two-operand unsigned compare-and-pop, which is
+        // how a `fcompp / fnstsw ax` sequence cleans up its stack.
+        (0xda, 5) if index == 1 => Ok(stack(Mnemonic::Fcompp, [Operand::None; 3])),
         (0xdd, 4) => Ok(stack(Mnemonic::Fucom, [Operand::Imm8(index), Operand::None, Operand::None])),
         (0xdd, 5) => Ok(stack(Mnemonic::Fucomp, [Operand::Imm8(index), Operand::None, Operand::None])),
         (0xdf, 4) if index == 0 => Ok(stack(

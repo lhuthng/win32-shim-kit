@@ -1,0 +1,32 @@
+{
+  "default": "elim3b.exe",
+  "executables": [
+    {
+      "bytes": 108544,
+      "entry": 4278543,
+      "entry_hex": "0x0041490f",
+      "image_bytes": 131072,
+      "imports": 89,
+      "name": "elim3b.exe"
+    }
+  ],
+  "format": 2,
+  "game": {
+    "bytes": 872246,
+    "files": 13,
+    "root": "game"
+  },
+  "kit": {
+    "abi": 1,
+    "version": "0.1.0"
+  },
+  "module": {
+    "bytes": 945937,
+    "name": "host_wasm.wasm"
+  },
+  "screen": {
+    "depth": 8,
+    "height": 480,
+    "width": 640
+  }
+}

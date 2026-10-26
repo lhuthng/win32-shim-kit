@@ -1,0 +1,32 @@
+{
+  "default": "Doukutsu.exe",
+  "executables": [
+    {
+      "bytes": 1478656,
+      "entry": 4726055,
+      "entry_hex": "0x00481d27",
+      "image_bytes": 1630208,
+      "imports": 143,
+      "name": "Doukutsu.exe"
+    }
+  ],
+  "format": 2,
+  "game": {
+    "bytes": 3597016,
+    "files": 401,
+    "root": "game"
+  },
+  "kit": {
+    "abi": 1,
+    "version": "0.1.0"
+  },
+  "module": {
+    "bytes": 945937,
+    "name": "host_wasm.wasm"
+  },
+  "screen": {
+    "depth": 8,
+    "height": 480,
+    "width": 640
+  }
+}

@@ -622,7 +622,7 @@ mod tests {
         let esp = enter(session, dst);
         let mut steps = 0;
         loop {
-            match crate::cpu::step(&mut session.memory, &mut session.cpu) {
+            match crate::cpu::step(&mut session.memory, &mut session.cpu, &mut session.decodes) {
                 Ok(crate::cpu::Step::Continue) => steps += 1,
                 Ok(crate::cpu::Step::Halt) => break,
                 other => panic!("the guest decoder did not return: {other:?}"),
@@ -838,7 +838,7 @@ mod tests {
         let esp = enter_blit(session, case);
         let mut steps = 0;
         while session.cpu.regs.eip != BLIT_STOP {
-            match crate::cpu::step(&mut session.memory, &mut session.cpu) {
+            match crate::cpu::step(&mut session.memory, &mut session.cpu, &mut session.decodes) {
                 Ok(crate::cpu::Step::Continue) => {}
                 Ok(crate::cpu::Step::Halt) => break,
                 other => panic!("the guest blitter did not return: {other:?}"),

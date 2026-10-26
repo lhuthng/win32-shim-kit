@@ -1,0 +1,1606 @@
+[
+  {
+    "bytes": 148,
+    "name": "Config.dat"
+  },
+  {
+    "bytes": 1478656,
+    "name": "Doukutsu.exe"
+  },
+  {
+    "bytes": 32126,
+    "name": "data/Arms.pbm"
+  },
+  {
+    "bytes": 2174,
+    "name": "data/ArmsImage.pbm"
+  },
+  {
+    "bytes": 9305,
+    "name": "data/ArmsItem.tsc"
+  },
+  {
+    "bytes": 28286,
+    "name": "data/Bullet.pbm"
+  },
+  {
+    "bytes": 38526,
+    "name": "data/Caret.pbm"
+  },
+  {
+    "bytes": 7571,
+    "name": "data/Credit.tsc"
+  },
+  {
+    "bytes": 70206,
+    "name": "data/Face.pbm"
+  },
+  {
+    "bytes": 1094,
+    "name": "data/Fade.pbm"
+  },
+  {
+    "bytes": 1461,
+    "name": "data/Head.tsc"
+  },
+  {
+    "bytes": 16510,
+    "name": "data/ItemImage.pbm"
+  },
+  {
+    "bytes": 134,
+    "name": "data/Loading.pbm"
+  },
+  {
+    "bytes": 6526,
+    "name": "data/MyChar.pbm"
+  },
+  {
+    "bytes": 638,
+    "name": "data/Npc/Npc0.pbm"
+  },
+  {
+    "bytes": 38526,
+    "name": "data/Npc/NpcAlmo1.pbm"
+  },
+  {
+    "bytes": 38526,
+    "name": "data/Npc/NpcAlmo2.pbm"
+  },
+  {
+    "bytes": 38526,
+    "name": "data/Npc/NpcBallos.pbm"
+  },
+  {
+    "bytes": 15486,
+    "name": "data/Npc/NpcBllg.pbm"
+  },
+  {
+    "bytes": 18046,
+    "name": "data/Npc/NpcCemet.pbm"
+  },
+  {
+    "bytes": 30846,
+    "name": "data/Npc/NpcCent.pbm"
+  },
+  {
+    "bytes": 10366,
+    "name": "data/Npc/NpcCurly.pbm"
+  },
+  {
+    "bytes": 5246,
+    "name": "data/Npc/NpcDark.pbm"
+  },
+  {
+    "bytes": 38526,
+    "name": "data/Npc/NpcDr.pbm"
+  },
+  {
+    "bytes": 18046,
+    "name": "data/Npc/NpcEggs1.pbm"
+  },
+  {
+    "bytes": 20606,
+    "name": "data/Npc/NpcEggs2.pbm"
+  },
+  {
+    "bytes": 38526,
+    "name": "data/Npc/NpcFrog.pbm"
+  },
+  {
+    "bytes": 59966,
+    "name": "data/Npc/NpcGuest.pbm"
+  },
+  {
+    "bytes": 25726,
+    "name": "data/Npc/NpcHell.pbm"
+  },
+  {
+    "bytes": 20606,
+    "name": "data/Npc/NpcHeri.pbm"
+  },
+  {
+    "bytes": 11646,
+    "name": "data/Npc/NpcIronH.pbm"
+  },
+  {
+    "bytes": 12926,
+    "name": "data/Npc/NpcIsland.pbm"
+  },
+  {
+    "bytes": 2430,
+    "name": "data/Npc/NpcKings.pbm"
+  },
+  {
+    "bytes": 30846,
+    "name": "data/Npc/NpcMaze.pbm"
+  },
+  {
+    "bytes": 38526,
+    "name": "data/Npc/NpcMiza.pbm"
+  },
+  {
+    "bytes": 20606,
+    "name": "data/Npc/NpcMoon.pbm"
+  },
+  {
+    "bytes": 19326,
+    "name": "data/Npc/NpcOmg.pbm"
+  },
+  {
+    "bytes": 7806,
+    "name": "data/Npc/NpcPlant.pbm"
+  },
+  {
+    "bytes": 38526,
+    "name": "data/Npc/NpcPress.pbm"
+  },
+  {
+    "bytes": 38526,
+    "name": "data/Npc/NpcPriest.pbm"
+  },
+  {
+    "bytes": 27006,
+    "name": "data/Npc/NpcRavil.pbm"
+  },
+  {
+    "bytes": 23166,
+    "name": "data/Npc/NpcRed.pbm"
+  },
+  {
+    "bytes": 77886,
+    "name": "data/Npc/NpcRegu.pbm"
+  },
+  {
+    "bytes": 28286,
+    "name": "data/Npc/NpcSand.pbm"
+  },
+  {
+    "bytes": 1150,
+    "name": "data/Npc/NpcStream.pbm"
+  },
+  {
+    "bytes": 38526,
+    "name": "data/Npc/NpcSym.pbm"
+  },
+  {
+    "bytes": 23162,
+    "name": "data/Npc/NpcToro.pbm"
+  },
+  {
+    "bytes": 23166,
+    "name": "data/Npc/NpcTwinD.pbm"
+  },
+  {
+    "bytes": 38526,
+    "name": "data/Npc/NpcWeed.pbm"
+  },
+  {
+    "bytes": 38526,
+    "name": "data/Npc/NpcX.pbm"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/0.pxa"
+  },
+  {
+    "bytes": 200,
+    "name": "data/Stage/0.pxe"
+  },
+  {
+    "bytes": 428,
+    "name": "data/Stage/0.pxm"
+  },
+  {
+    "bytes": 2768,
+    "name": "data/Stage/0.tsc"
+  },
+  {
+    "bytes": 8,
+    "name": "data/Stage/555.pxe"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Almond.pxa"
+  },
+  {
+    "bytes": 452,
+    "name": "data/Stage/Almond.pxe"
+  },
+  {
+    "bytes": 2408,
+    "name": "data/Stage/Almond.pxm"
+  },
+  {
+    "bytes": 6388,
+    "name": "data/Stage/Almond.tsc"
+  },
+  {
+    "bytes": 176,
+    "name": "data/Stage/Ballo1.pxe"
+  },
+  {
+    "bytes": 1128,
+    "name": "data/Stage/Ballo1.pxm"
+  },
+  {
+    "bytes": 1570,
+    "name": "data/Stage/Ballo1.tsc"
+  },
+  {
+    "bytes": 92,
+    "name": "data/Stage/Ballo2.pxe"
+  },
+  {
+    "bytes": 1604,
+    "name": "data/Stage/Ballo2.pxm"
+  },
+  {
+    "bytes": 1706,
+    "name": "data/Stage/Ballo2.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Barr.pxa"
+  },
+  {
+    "bytes": 164,
+    "name": "data/Stage/Barr.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Barr.pxm"
+  },
+  {
+    "bytes": 3272,
+    "name": "data/Stage/Barr.tsc"
+  },
+  {
+    "bytes": 536,
+    "name": "data/Stage/Blcny1.pxe"
+  },
+  {
+    "bytes": 9608,
+    "name": "data/Stage/Blcny1.pxm"
+  },
+  {
+    "bytes": 1070,
+    "name": "data/Stage/Blcny1.tsc"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Blcny2.pxe"
+  },
+  {
+    "bytes": 9608,
+    "name": "data/Stage/Blcny2.pxm"
+  },
+  {
+    "bytes": 2890,
+    "name": "data/Stage/Blcny2.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Cave.pxa"
+  },
+  {
+    "bytes": 1064,
+    "name": "data/Stage/Cave.pxe"
+  },
+  {
+    "bytes": 2708,
+    "name": "data/Stage/Cave.pxm"
+  },
+  {
+    "bytes": 788,
+    "name": "data/Stage/Cave.tsc"
+  },
+  {
+    "bytes": 272,
+    "name": "data/Stage/Cemet.pxe"
+  },
+  {
+    "bytes": 808,
+    "name": "data/Stage/Cemet.pxm"
+  },
+  {
+    "bytes": 847,
+    "name": "data/Stage/Cemet.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Cent.pxa"
+  },
+  {
+    "bytes": 1748,
+    "name": "data/Stage/Cent.pxe"
+  },
+  {
+    "bytes": 14408,
+    "name": "data/Stage/Cent.pxm"
+  },
+  {
+    "bytes": 9748,
+    "name": "data/Stage/Cent.tsc"
+  },
+  {
+    "bytes": 152,
+    "name": "data/Stage/CentW.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/CentW.pxm"
+  },
+  {
+    "bytes": 967,
+    "name": "data/Stage/CentW.tsc"
+  },
+  {
+    "bytes": 116,
+    "name": "data/Stage/Chako.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Chako.pxm"
+  },
+  {
+    "bytes": 1723,
+    "name": "data/Stage/Chako.tsc"
+  },
+  {
+    "bytes": 56,
+    "name": "data/Stage/Clock.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Clock.pxm"
+  },
+  {
+    "bytes": 595,
+    "name": "data/Stage/Clock.tsc"
+  },
+  {
+    "bytes": 152,
+    "name": "data/Stage/Comu.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Comu.pxm"
+  },
+  {
+    "bytes": 2052,
+    "name": "data/Stage/Comu.tsc"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Cook.pxm"
+  },
+  {
+    "bytes": 116,
+    "name": "data/Stage/Cthu.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Cthu.pxm"
+  },
+  {
+    "bytes": 579,
+    "name": "data/Stage/Cthu.tsc"
+  },
+  {
+    "bytes": 212,
+    "name": "data/Stage/Cthu2.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Cthu2.pxm"
+  },
+  {
+    "bytes": 259,
+    "name": "data/Stage/Cthu2.tsc"
+  },
+  {
+    "bytes": 248,
+    "name": "data/Stage/Curly.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Curly.pxm"
+  },
+  {
+    "bytes": 4763,
+    "name": "data/Stage/Curly.tsc"
+  },
+  {
+    "bytes": 116,
+    "name": "data/Stage/CurlyS.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/CurlyS.pxm"
+  },
+  {
+    "bytes": 616,
+    "name": "data/Stage/CurlyS.tsc"
+  },
+  {
+    "bytes": 116,
+    "name": "data/Stage/Dark.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Dark.pxm"
+  },
+  {
+    "bytes": 520,
+    "name": "data/Stage/Dark.tsc"
+  },
+  {
+    "bytes": 188,
+    "name": "data/Stage/Drain.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Drain.pxm"
+  },
+  {
+    "bytes": 1313,
+    "name": "data/Stage/Drain.tsc"
+  },
+  {
+    "bytes": 104,
+    "name": "data/Stage/EgEnd1.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/EgEnd1.pxm"
+  },
+  {
+    "bytes": 226,
+    "name": "data/Stage/EgEnd1.tsc"
+  },
+  {
+    "bytes": 104,
+    "name": "data/Stage/EgEnd2.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/EgEnd2.pxm"
+  },
+  {
+    "bytes": 226,
+    "name": "data/Stage/EgEnd2.tsc"
+  },
+  {
+    "bytes": 44,
+    "name": "data/Stage/Egg1.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Egg1.pxm"
+  },
+  {
+    "bytes": 458,
+    "name": "data/Stage/Egg1.tsc"
+  },
+  {
+    "bytes": 56,
+    "name": "data/Stage/Egg6.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Egg6.pxm"
+  },
+  {
+    "bytes": 381,
+    "name": "data/Stage/Egg6.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/EggIn.pxa"
+  },
+  {
+    "bytes": 392,
+    "name": "data/Stage/EggR.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/EggR.pxm"
+  },
+  {
+    "bytes": 1767,
+    "name": "data/Stage/EggR.tsc"
+  },
+  {
+    "bytes": 200,
+    "name": "data/Stage/EggR2.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/EggR2.pxm"
+  },
+  {
+    "bytes": 792,
+    "name": "data/Stage/EggR2.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/EggX.pxa"
+  },
+  {
+    "bytes": 128,
+    "name": "data/Stage/EggX.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/EggX.pxm"
+  },
+  {
+    "bytes": 2500,
+    "name": "data/Stage/EggX.tsc"
+  },
+  {
+    "bytes": 140,
+    "name": "data/Stage/EggX2.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/EggX2.pxm"
+  },
+  {
+    "bytes": 2722,
+    "name": "data/Stage/EggX2.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Eggs.pxa"
+  },
+  {
+    "bytes": 1280,
+    "name": "data/Stage/Eggs.pxe"
+  },
+  {
+    "bytes": 4808,
+    "name": "data/Stage/Eggs.pxm"
+  },
+  {
+    "bytes": 3040,
+    "name": "data/Stage/Eggs.tsc"
+  },
+  {
+    "bytes": 1232,
+    "name": "data/Stage/Eggs2.pxe"
+  },
+  {
+    "bytes": 4808,
+    "name": "data/Stage/Eggs2.pxm"
+  },
+  {
+    "bytes": 1341,
+    "name": "data/Stage/Eggs2.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Fall.pxa"
+  },
+  {
+    "bytes": 80,
+    "name": "data/Stage/Fall.pxe"
+  },
+  {
+    "bytes": 1208,
+    "name": "data/Stage/Fall.pxm"
+  },
+  {
+    "bytes": 2703,
+    "name": "data/Stage/Fall.tsc"
+  },
+  {
+    "bytes": 152,
+    "name": "data/Stage/Frog.pxe"
+  },
+  {
+    "bytes": 428,
+    "name": "data/Stage/Frog.pxm"
+  },
+  {
+    "bytes": 1525,
+    "name": "data/Stage/Frog.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Gard.pxa"
+  },
+  {
+    "bytes": 200,
+    "name": "data/Stage/Gard.pxe"
+  },
+  {
+    "bytes": 488,
+    "name": "data/Stage/Gard.pxm"
+  },
+  {
+    "bytes": 3611,
+    "name": "data/Stage/Gard.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Hell.pxa"
+  },
+  {
+    "bytes": 644,
+    "name": "data/Stage/Hell1.pxe"
+  },
+  {
+    "bytes": 2108,
+    "name": "data/Stage/Hell1.pxm"
+  },
+  {
+    "bytes": 1394,
+    "name": "data/Stage/Hell1.tsc"
+  },
+  {
+    "bytes": 536,
+    "name": "data/Stage/Hell2.pxe"
+  },
+  {
+    "bytes": 2568,
+    "name": "data/Stage/Hell2.pxm"
+  },
+  {
+    "bytes": 907,
+    "name": "data/Stage/Hell2.tsc"
+  },
+  {
+    "bytes": 1460,
+    "name": "data/Stage/Hell3.pxe"
+  },
+  {
+    "bytes": 2568,
+    "name": "data/Stage/Hell3.pxm"
+  },
+  {
+    "bytes": 2643,
+    "name": "data/Stage/Hell3.tsc"
+  },
+  {
+    "bytes": 92,
+    "name": "data/Stage/Hell4.pxe"
+  },
+  {
+    "bytes": 680,
+    "name": "data/Stage/Hell4.pxm"
+  },
+  {
+    "bytes": 459,
+    "name": "data/Stage/Hell4.tsc"
+  },
+  {
+    "bytes": 104,
+    "name": "data/Stage/Hell42.pxe"
+  },
+  {
+    "bytes": 680,
+    "name": "data/Stage/Hell42.pxm"
+  },
+  {
+    "bytes": 1881,
+    "name": "data/Stage/Hell42.tsc"
+  },
+  {
+    "bytes": 8,
+    "name": "data/Stage/Island.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Island.pxm"
+  },
+  {
+    "bytes": 124,
+    "name": "data/Stage/Island.tsc"
+  },
+  {
+    "bytes": 116,
+    "name": "data/Stage/Itoh.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Itoh.pxm"
+  },
+  {
+    "bytes": 2014,
+    "name": "data/Stage/Itoh.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Jail.pxa"
+  },
+  {
+    "bytes": 152,
+    "name": "data/Stage/Jail1.pxe"
+  },
+  {
+    "bytes": 608,
+    "name": "data/Stage/Jail1.pxm"
+  },
+  {
+    "bytes": 1442,
+    "name": "data/Stage/Jail1.tsc"
+  },
+  {
+    "bytes": 200,
+    "name": "data/Stage/Jail2.pxe"
+  },
+  {
+    "bytes": 520,
+    "name": "data/Stage/Jail2.pxm"
+  },
+  {
+    "bytes": 1106,
+    "name": "data/Stage/Jail2.tsc"
+  },
+  {
+    "bytes": 260,
+    "name": "data/Stage/Jenka1.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Jenka1.pxm"
+  },
+  {
+    "bytes": 5130,
+    "name": "data/Stage/Jenka1.tsc"
+  },
+  {
+    "bytes": 176,
+    "name": "data/Stage/Jenka2.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Jenka2.pxm"
+  },
+  {
+    "bytes": 1726,
+    "name": "data/Stage/Jenka2.tsc"
+  },
+  {
+    "bytes": 56,
+    "name": "data/Stage/Kings.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Kings.pxm"
+  },
+  {
+    "bytes": 359,
+    "name": "data/Stage/Kings.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Labo.pxa"
+  },
+  {
+    "bytes": 116,
+    "name": "data/Stage/Little.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Little.pxm"
+  },
+  {
+    "bytes": 1251,
+    "name": "data/Stage/Little.tsc"
+  },
+  {
+    "bytes": 200,
+    "name": "data/Stage/Lounge.pxe"
+  },
+  {
+    "bytes": 488,
+    "name": "data/Stage/Lounge.pxm"
+  },
+  {
+    "bytes": 2053,
+    "name": "data/Stage/Lounge.tsc"
+  },
+  {
+    "bytes": 140,
+    "name": "data/Stage/Malco.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Malco.pxm"
+  },
+  {
+    "bytes": 3896,
+    "name": "data/Stage/Malco.tsc"
+  },
+  {
+    "bytes": 140,
+    "name": "data/Stage/Mapi.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Mapi.pxm"
+  },
+  {
+    "bytes": 1823,
+    "name": "data/Stage/Mapi.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Maze.pxa"
+  },
+  {
+    "bytes": 212,
+    "name": "data/Stage/MazeA.pxe"
+  },
+  {
+    "bytes": 520,
+    "name": "data/Stage/MazeA.pxm"
+  },
+  {
+    "bytes": 3131,
+    "name": "data/Stage/MazeA.tsc"
+  },
+  {
+    "bytes": 200,
+    "name": "data/Stage/MazeB.pxe"
+  },
+  {
+    "bytes": 806,
+    "name": "data/Stage/MazeB.pxm"
+  },
+  {
+    "bytes": 2268,
+    "name": "data/Stage/MazeB.tsc"
+  },
+  {
+    "bytes": 80,
+    "name": "data/Stage/MazeD.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/MazeD.pxm"
+  },
+  {
+    "bytes": 592,
+    "name": "data/Stage/MazeD.tsc"
+  },
+  {
+    "bytes": 116,
+    "name": "data/Stage/MazeH.pxe"
+  },
+  {
+    "bytes": 648,
+    "name": "data/Stage/MazeH.pxm"
+  },
+  {
+    "bytes": 320,
+    "name": "data/Stage/MazeH.tsc"
+  },
+  {
+    "bytes": 464,
+    "name": "data/Stage/MazeI.pxe"
+  },
+  {
+    "bytes": 1758,
+    "name": "data/Stage/MazeI.pxm"
+  },
+  {
+    "bytes": 1507,
+    "name": "data/Stage/MazeI.tsc"
+  },
+  {
+    "bytes": 1148,
+    "name": "data/Stage/MazeM.pxe"
+  },
+  {
+    "bytes": 10728,
+    "name": "data/Stage/MazeM.pxm"
+  },
+  {
+    "bytes": 1121,
+    "name": "data/Stage/MazeM.tsc"
+  },
+  {
+    "bytes": 188,
+    "name": "data/Stage/MazeO.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/MazeO.pxm"
+  },
+  {
+    "bytes": 3098,
+    "name": "data/Stage/MazeO.tsc"
+  },
+  {
+    "bytes": 224,
+    "name": "data/Stage/MazeS.pxe"
+  },
+  {
+    "bytes": 449,
+    "name": "data/Stage/MazeS.pxm"
+  },
+  {
+    "bytes": 4354,
+    "name": "data/Stage/MazeS.tsc"
+  },
+  {
+    "bytes": 1016,
+    "name": "data/Stage/MazeW.pxe"
+  },
+  {
+    "bytes": 4008,
+    "name": "data/Stage/MazeW.pxm"
+  },
+  {
+    "bytes": 1121,
+    "name": "data/Stage/MazeW.tsc"
+  },
+  {
+    "bytes": 68,
+    "name": "data/Stage/MiBox.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/MiBox.pxm"
+  },
+  {
+    "bytes": 175,
+    "name": "data/Stage/MiBox.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Mimi.pxa"
+  },
+  {
+    "bytes": 476,
+    "name": "data/Stage/Mimi.pxe"
+  },
+  {
+    "bytes": 3608,
+    "name": "data/Stage/Mimi.pxm"
+  },
+  {
+    "bytes": 7106,
+    "name": "data/Stage/Mimi.tsc"
+  },
+  {
+    "bytes": 164,
+    "name": "data/Stage/Momo.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Momo.pxm"
+  },
+  {
+    "bytes": 4953,
+    "name": "data/Stage/Momo.tsc"
+  },
+  {
+    "bytes": 416,
+    "name": "data/Stage/New.pxe"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Oside.pxa"
+  },
+  {
+    "bytes": 608,
+    "name": "data/Stage/Oside.pxe"
+  },
+  {
+    "bytes": 18008,
+    "name": "data/Stage/Oside.pxm"
+  },
+  {
+    "bytes": 1885,
+    "name": "data/Stage/Oside.tsc"
+  },
+  {
+    "bytes": 116,
+    "name": "data/Stage/Ostep.pxe"
+  },
+  {
+    "bytes": 968,
+    "name": "data/Stage/Ostep.pxm"
+  },
+  {
+    "bytes": 609,
+    "name": "data/Stage/Ostep.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Pens.pxa"
+  },
+  {
+    "bytes": 416,
+    "name": "data/Stage/Pens1.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Pens1.pxm"
+  },
+  {
+    "bytes": 8790,
+    "name": "data/Stage/Pens1.tsc"
+  },
+  {
+    "bytes": 248,
+    "name": "data/Stage/Pens2.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Pens2.pxm"
+  },
+  {
+    "bytes": 1764,
+    "name": "data/Stage/Pens2.tsc"
+  },
+  {
+    "bytes": 140,
+    "name": "data/Stage/Pixel.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Pixel.pxm"
+  },
+  {
+    "bytes": 2794,
+    "name": "data/Stage/Pixel.tsc"
+  },
+  {
+    "bytes": 284,
+    "name": "data/Stage/Plant.pxe"
+  },
+  {
+    "bytes": 648,
+    "name": "data/Stage/Plant.pxm"
+  },
+  {
+    "bytes": 1323,
+    "name": "data/Stage/Plant.tsc"
+  },
+  {
+    "bytes": 104,
+    "name": "data/Stage/Pole.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Pole.pxm"
+  },
+  {
+    "bytes": 2540,
+    "name": "data/Stage/Pole.tsc"
+  },
+  {
+    "bytes": 200,
+    "name": "data/Stage/Pool.pxe"
+  },
+  {
+    "bytes": 808,
+    "name": "data/Stage/Pool.pxm"
+  },
+  {
+    "bytes": 1323,
+    "name": "data/Stage/Pool.tsc"
+  },
+  {
+    "bytes": 56,
+    "name": "data/Stage/Prefa1.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Prefa1.pxm"
+  },
+  {
+    "bytes": 1005,
+    "name": "data/Stage/Prefa1.tsc"
+  },
+  {
+    "bytes": 80,
+    "name": "data/Stage/Prefa2.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Prefa2.pxm"
+  },
+  {
+    "bytes": 603,
+    "name": "data/Stage/Prefa2.tsc"
+  },
+  {
+    "bytes": 1112,
+    "name": "data/Stage/Priso1.pxe"
+  },
+  {
+    "bytes": 6008,
+    "name": "data/Stage/Priso1.pxm"
+  },
+  {
+    "bytes": 417,
+    "name": "data/Stage/Priso1.tsc"
+  },
+  {
+    "bytes": 1232,
+    "name": "data/Stage/Priso2.pxe"
+  },
+  {
+    "bytes": 6008,
+    "name": "data/Stage/Priso2.pxm"
+  },
+  {
+    "bytes": 945,
+    "name": "data/Stage/Priso2.tsc"
+  },
+  {
+    "bytes": 198,
+    "name": "data/Stage/Prt0.pbm"
+  },
+  {
+    "bytes": 12414,
+    "name": "data/Stage/PrtAlmond.pbm"
+  },
+  {
+    "bytes": 11390,
+    "name": "data/Stage/PrtBarr.pbm"
+  },
+  {
+    "bytes": 10366,
+    "name": "data/Stage/PrtCave.pbm"
+  },
+  {
+    "bytes": 16510,
+    "name": "data/Stage/PrtCent.pbm"
+  },
+  {
+    "bytes": 10366,
+    "name": "data/Stage/PrtEggIn.pbm"
+  },
+  {
+    "bytes": 30846,
+    "name": "data/Stage/PrtEggX.pbm"
+  },
+  {
+    "bytes": 30846,
+    "name": "data/Stage/PrtEggs.pbm"
+  },
+  {
+    "bytes": 16510,
+    "name": "data/Stage/PrtFall.pbm"
+  },
+  {
+    "bytes": 12542,
+    "name": "data/Stage/PrtGard.pbm"
+  },
+  {
+    "bytes": 30846,
+    "name": "data/Stage/PrtHell.pbm"
+  },
+  {
+    "bytes": 16510,
+    "name": "data/Stage/PrtJail.pbm"
+  },
+  {
+    "bytes": 4222,
+    "name": "data/Stage/PrtLabo.pbm"
+  },
+  {
+    "bytes": 20606,
+    "name": "data/Stage/PrtMaze.pbm"
+  },
+  {
+    "bytes": 20606,
+    "name": "data/Stage/PrtMimi.pbm"
+  },
+  {
+    "bytes": 8318,
+    "name": "data/Stage/PrtOside.pbm"
+  },
+  {
+    "bytes": 8318,
+    "name": "data/Stage/PrtPens.pbm"
+  },
+  {
+    "bytes": 12414,
+    "name": "data/Stage/PrtRiver.pbm"
+  },
+  {
+    "bytes": 14462,
+    "name": "data/Stage/PrtSand.pbm"
+  },
+  {
+    "bytes": 14462,
+    "name": "data/Stage/PrtStore.pbm"
+  },
+  {
+    "bytes": 16510,
+    "name": "data/Stage/PrtWeed.pbm"
+  },
+  {
+    "bytes": 30846,
+    "name": "data/Stage/PrtWhite.pbm"
+  },
+  {
+    "bytes": 116,
+    "name": "data/Stage/Ring1.pxe"
+  },
+  {
+    "bytes": 648,
+    "name": "data/Stage/Ring1.pxm"
+  },
+  {
+    "bytes": 2505,
+    "name": "data/Stage/Ring1.tsc"
+  },
+  {
+    "bytes": 380,
+    "name": "data/Stage/Ring2.pxe"
+  },
+  {
+    "bytes": 648,
+    "name": "data/Stage/Ring2.pxm"
+  },
+  {
+    "bytes": 4113,
+    "name": "data/Stage/Ring2.tsc"
+  },
+  {
+    "bytes": 200,
+    "name": "data/Stage/Ring3.pxe"
+  },
+  {
+    "bytes": 648,
+    "name": "data/Stage/Ring3.pxm"
+  },
+  {
+    "bytes": 3925,
+    "name": "data/Stage/Ring3.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/River.pxa"
+  },
+  {
+    "bytes": 1208,
+    "name": "data/Stage/River.pxe"
+  },
+  {
+    "bytes": 7208,
+    "name": "data/Stage/River.pxm"
+  },
+  {
+    "bytes": 719,
+    "name": "data/Stage/River.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Sand.pxa"
+  },
+  {
+    "bytes": 1952,
+    "name": "data/Stage/Sand.pxe"
+  },
+  {
+    "bytes": 12008,
+    "name": "data/Stage/Sand.pxm"
+  },
+  {
+    "bytes": 4029,
+    "name": "data/Stage/Sand.tsc"
+  },
+  {
+    "bytes": 68,
+    "name": "data/Stage/SandE.pxe"
+  },
+  {
+    "bytes": 1352,
+    "name": "data/Stage/SandE.pxm"
+  },
+  {
+    "bytes": 1187,
+    "name": "data/Stage/SandE.tsc"
+  },
+  {
+    "bytes": 140,
+    "name": "data/Stage/Santa.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Santa.pxm"
+  },
+  {
+    "bytes": 1634,
+    "name": "data/Stage/Santa.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Shelt.pxa"
+  },
+  {
+    "bytes": 260,
+    "name": "data/Stage/Shelt.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Shelt.pxm"
+  },
+  {
+    "bytes": 5151,
+    "name": "data/Stage/Shelt.tsc"
+  },
+  {
+    "bytes": 92,
+    "name": "data/Stage/Start.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Start.pxm"
+  },
+  {
+    "bytes": 380,
+    "name": "data/Stage/Start.tsc"
+  },
+  {
+    "bytes": 164,
+    "name": "data/Stage/Statue.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/Statue.pxm"
+  },
+  {
+    "bytes": 989,
+    "name": "data/Stage/Statue.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Store.pxa"
+  },
+  {
+    "bytes": 380,
+    "name": "data/Stage/Stream.pxe"
+  },
+  {
+    "bytes": 1928,
+    "name": "data/Stage/Stream.pxm"
+  },
+  {
+    "bytes": 690,
+    "name": "data/Stage/Stream.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/Weed.pxa"
+  },
+  {
+    "bytes": 2036,
+    "name": "data/Stage/Weed.pxe"
+  },
+  {
+    "bytes": 6448,
+    "name": "data/Stage/Weed.pxm"
+  },
+  {
+    "bytes": 6550,
+    "name": "data/Stage/Weed.tsc"
+  },
+  {
+    "bytes": 116,
+    "name": "data/Stage/WeedB.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/WeedB.pxm"
+  },
+  {
+    "bytes": 639,
+    "name": "data/Stage/WeedB.tsc"
+  },
+  {
+    "bytes": 68,
+    "name": "data/Stage/WeedD.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/WeedD.pxm"
+  },
+  {
+    "bytes": 367,
+    "name": "data/Stage/WeedD.tsc"
+  },
+  {
+    "bytes": 44,
+    "name": "data/Stage/WeedS.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/WeedS.pxm"
+  },
+  {
+    "bytes": 231,
+    "name": "data/Stage/WeedS.tsc"
+  },
+  {
+    "bytes": 256,
+    "name": "data/Stage/White.pxa"
+  },
+  {
+    "bytes": 20,
+    "name": "data/Stage/e_Blcn.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/e_Blcn.pxm"
+  },
+  {
+    "bytes": 272,
+    "name": "data/Stage/e_Blcn.tsc"
+  },
+  {
+    "bytes": 164,
+    "name": "data/Stage/e_Ceme.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/e_Ceme.pxm"
+  },
+  {
+    "bytes": 233,
+    "name": "data/Stage/e_Ceme.tsc"
+  },
+  {
+    "bytes": 116,
+    "name": "data/Stage/e_Jenk.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/e_Jenk.pxm"
+  },
+  {
+    "bytes": 388,
+    "name": "data/Stage/e_Jenk.tsc"
+  },
+  {
+    "bytes": 116,
+    "name": "data/Stage/e_Labo.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/e_Labo.pxm"
+  },
+  {
+    "bytes": 235,
+    "name": "data/Stage/e_Labo.tsc"
+  },
+  {
+    "bytes": 92,
+    "name": "data/Stage/e_Malc.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/e_Malc.pxm"
+  },
+  {
+    "bytes": 377,
+    "name": "data/Stage/e_Malc.tsc"
+  },
+  {
+    "bytes": 152,
+    "name": "data/Stage/e_Maze.pxe"
+  },
+  {
+    "bytes": 344,
+    "name": "data/Stage/e_Maze.pxm"
+  },
+  {
+    "bytes": 409,
+    "name": "data/Stage/e_Maze.tsc"
+  },
+  {
+    "bytes": 44,
+    "name": "data/Stage/e_Sky.pxe"
+  },
+  {
+    "bytes": 488,
+    "name": "data/Stage/e_Sky.pxm"
+  },
+  {
+    "bytes": 452,
+    "name": "data/Stage/e_Sky.tsc"
+  },
+  {
+    "bytes": 2174,
+    "name": "data/StageImage.pbm"
+  },
+  {
+    "bytes": 275,
+    "name": "data/StageSelect.tsc"
+  },
+  {
+    "bytes": 17982,
+    "name": "data/TextBox.pbm"
+  },
+  {
+    "bytes": 7806,
+    "name": "data/Title.pbm"
+  },
+  {
+    "bytes": 582,
+    "name": "data/bk0.pbm"
+  },
+  {
+    "bytes": 582,
+    "name": "data/bkBlack.pbm"
+  },
+  {
+    "bytes": 2174,
+    "name": "data/bkBlue.pbm"
+  },
+  {
+    "bytes": 582,
+    "name": "data/bkFall.pbm"
+  },
+  {
+    "bytes": 38526,
+    "name": "data/bkFog.pbm"
+  },
+  {
+    "bytes": 1662,
+    "name": "data/bkGard.pbm"
+  },
+  {
+    "bytes": 2174,
+    "name": "data/bkGray.pbm"
+  },
+  {
+    "bytes": 2174,
+    "name": "data/bkGreen.pbm"
+  },
+  {
+    "bytes": 2174,
+    "name": "data/bkMaze.pbm"
+  },
+  {
+    "bytes": 38526,
+    "name": "data/bkMoon.pbm"
+  },
+  {
+    "bytes": 638,
+    "name": "data/bkRed.pbm"
+  },
+  {
+    "bytes": 894,
+    "name": "data/bkWater.pbm"
+  },
+  {
+    "bytes": 77886,
+    "name": "data/casts.pbm"
+  },
+  {
+    "bytes": 8664,
+    "name": "data/npc.tbl"
+  }
+]

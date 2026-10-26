@@ -13,6 +13,7 @@
 pub mod cpu;
 pub mod dispatch;
 pub mod hle;
+pub mod image;
 pub mod input;
 pub mod memory;
 pub mod pe;

@@ -11,20 +11,26 @@
 //! value that has no meaning in a browser (`C:\Games\sfx.dat`) while the
 //! bundle is flat.
 //!
-//! # Two kinds of file
+//! # A folder the guest owns
 //!
-//! The bundle is the installer's output and is read-only: a guest that asks to
-//! write one of those files gets `ERROR_ACCESS_DENIED` rather than a handle onto
-//! bytes it cannot change.
+//! The payload is a directory, and on Windows a game's directory is writable:
+//! the game rewrites `data\settings.dat` on start and drops `save0001.dat`
+//! beside its executable. So every name here is writable. What the guest writes
+//! lands in [`Files::saved`] and the payload's bytes stay as delivered in
+//! [`Files::install`]; a read prefers the guest's copy, which is what makes the
+//! install behave like the folder it stands in for. Nothing the guest does can
+//! reach the bytes the page fetched, so a reload starts from the payload exactly
+//! as it was installed.
 //!
-//! Anything else the guest opens for writing is a **saved file** -- the game's
-//! own `save0001.dat` and friends. It lives in the same table, it is writable,
-//! and it is the only thing here that outlives a session: the page copies the
-//! changed files out through the `wh_saved_*` exports and keeps them in browser
-//! storage, then hands them back with [`Files::provide_saved`] before the guest
-//! starts. No path is opened on the machine, so a page served over the network
-//! writes nothing anywhere but its own storage.
-
+//! Two things separate this from a folder on a disk. Writability belongs to the
+//! **handle**, not the file: a read-only `CreateFileA` cannot `WriteFile`, even
+//! while another handle has the same file open for writing. And the guest's copy
+//! is the only thing that outlives a session: the page copies
+//! [`Files::saved_files`] out through the `wh_saved_*` exports, keeps it in
+//! browser storage, and hands it back with [`Files::provide_saved`] before the
+//! guest starts -- in either order, because a save shadows the install file
+//! instead of replacing it. No path is opened on the machine, so a page served
+//! over the network writes nothing anywhere but its own storage.
 use std::collections::{BTreeSet, HashMap};
 
 use crate::shim::{Action, Binding, Call, Host};
@@ -39,6 +45,7 @@ const INVALID_SET_FILE_POINTER: u32 = 0xffff_ffff;
 
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_ACCESS_DENIED: u32 = 5;
+const ERROR_FILE_EXISTS: u32 = 80;
 const ERROR_INVALID_HANDLE: u32 = 6;
 
 const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -66,13 +73,32 @@ const FIRST_SEARCH: u32 = 0x0007_0000;
 /// `WIN32_FIND_DATAA`.
 const FIND_DATA_SIZE: u32 = 0x140;
 
-/// A file the guest has open: which entry, and where its cursor is.
+/// `WIN32_FIND_DATAW`: the same 44-byte header, then 520 bytes of UTF-16 name and
+/// 28 of the short name.
+const FIND_DATA_W_SIZE: u32 = 0x250;
+
+/// A file the guest has open: which table its bytes are in, and its cursor.
 struct Open {
     key: String,
+    /// The payload's table, or the guest's own.
+    table: Where,
+    /// Whether *this handle* may write. Windows puts the right on the handle,
+    /// not on the file, so a read-only open stays read-only even while another
+    /// handle has the same file open for writing.
+    writable: bool,
     position: u32,
 }
 
-/// One provided file.
+/// Which table a resolved name lives in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Where {
+    /// The payload as delivered. Never written.
+    Install,
+    /// The guest's own copy, which shadows the install file of the same name.
+    Saved,
+}
+
+/// One file's bytes.
 ///
 /// A **synthetic** entry has a length and no bytes: every read returns zeroes.
 /// It exists for the one file the guest only ever measures -- the CD's
@@ -82,24 +108,42 @@ struct Open {
 struct Entry {
     bytes: Vec<u8>,
     length: u32,
-    /// Whether the guest may write it. The bundle is not; a save is.
-    writable: bool,
 }
 
-/// Every byte the guest can read, and the handles open on it.
+impl Entry {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            length: bytes.len() as u32,
+            bytes,
+        }
+    }
+}
+
+/// Every byte the guest can read, every byte it has written, and the handles
+/// open on either.
 #[derive(Default)]
 pub struct Files {
-    /// Lowercased full path as provided.
-    entries: HashMap<String, Entry>,
-    /// Basename, lowercased, to the entry key. The guest builds its own paths.
-    by_name: HashMap<String, String>,
+    /// The payload as delivered, by lowercased path.
+    install: HashMap<String, Entry>,
+    /// Basename, lowercased, to the install key. The guest builds its own paths.
+    install_by_name: HashMap<String, String>,
+    /// What the guest has written, which is the folder it owns: a name it opens
+    /// for writing lands here, bytes and all, and every later read of that name
+    /// finds this copy first.
+    saved: HashMap<String, Entry>,
+    saved_by_name: HashMap<String, String>,
+    /// Basenames the guest deleted, so a payload file it removed does not come
+    /// back through the install table on the next read.
+    removed: BTreeSet<String>,
     open: HashMap<u32, Open>,
     next_handle: u32,
     /// Handles `FindFirstFileA` handed out, so `FindClose` has something to
-    /// close. The find data is written at call time, so a handle is only a token.
+    /// close, and the pattern and cursor behind each one so `FindNextFileA` can
+    /// continue where the previous call stopped.
     searches: BTreeSet<u32>,
-    /// Bumped whenever a writable file changes, which is how the page knows the
-    /// guest saved something without being told what a save is.
+    search_at: HashMap<u32, (String, usize)>,
+    /// Bumped whenever a file the guest owns changes, which is how the page
+    /// knows there is something to persist without being told what a save is.
     version: u64,
     /// Bytes this table has handed to the guest, which is how a session test can
     /// tell "the guest opened a file" from "the guest read one".
@@ -110,51 +154,34 @@ pub struct Files {
 }
 
 impl Files {
-    /// Adds a file the guest may open. `path` may be a plain name or a path; the
-    /// basename is what a lookup uses.
+    /// Adds the payload's copy of a file. It is what the guest reads until the
+    /// guest writes that name, and it is never written itself.
     pub fn provide(&mut self, path: &str, bytes: Vec<u8>) {
         let key = normalize(path);
-        let length = bytes.len() as u32;
         let base = basename(&key);
-        self.by_name.insert(base, key.clone());
-        self.entries.insert(
-            key,
-            Entry {
-                bytes,
-                length,
-                writable: false,
-            },
-        );
+        self.install_by_name.insert(base, key.clone());
+        self.install.insert(key, Entry::new(bytes));
     }
 
-    /// Adds a file the guest saved in an earlier session. It is writable, so the
-    /// guest can overwrite it and the change is what the page persists next.
+    /// Adds a file the guest saved in an earlier session, which reads back as
+    /// the guest's own from the moment it is here.
     pub fn provide_saved(&mut self, path: &str, bytes: Vec<u8>) {
         let key = normalize(path);
         let base = basename(&key);
-        let length = bytes.len() as u32;
-        self.by_name.insert(base, key.clone());
-        self.entries.insert(
-            key,
-            Entry {
-                bytes,
-                length,
-                writable: true,
-            },
-        );
+        self.saved_by_name.insert(base, key.clone());
+        self.saved.insert(key, Entry::new(bytes));
     }
 
     /// Provides a file of `length` zero bytes that costs nothing to hold.
     pub fn provide_sized(&mut self, path: &str, length: u32) {
         let key = normalize(path);
         let base = basename(&key);
-        self.by_name.insert(base, key.clone());
-        self.entries.insert(
+        self.install_by_name.insert(base, key.clone());
+        self.install.insert(
             key,
             Entry {
                 bytes: Vec::new(),
                 length,
-                writable: false,
             },
         );
     }
@@ -163,51 +190,123 @@ impl Files {
     /// to show a marker is a marker.
     pub fn synthetic(&self, path: &str) -> bool {
         self.resolve(path)
-            .and_then(|key| self.entries.get(&key))
+            .and_then(|(table, key)| self.entry(table, &key))
             .is_some_and(|entry| entry.bytes.is_empty() && entry.length > 0)
     }
 
     pub fn count(&self) -> usize {
-        self.entries.len()
+        self.install.len() + self.saved.len()
     }
 
     pub fn total_bytes(&self) -> usize {
-        self.entries.values().map(|entry| entry.bytes.len()).sum()
+        self.install
+            .values()
+            .chain(self.saved.values())
+            .map(|entry| entry.bytes.len())
+            .sum()
     }
 
     /// Bytes the guest could read if it wanted it all.
     pub fn total_length(&self) -> u64 {
-        self.entries.values().map(|entry| u64::from(entry.length)).sum()
+        self.install
+            .values()
+            .chain(self.saved.values())
+            .map(|entry| u64::from(entry.length))
+            .sum()
     }
 
     /// Every provided name, in the order a directory listing would want them.
     pub fn names(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = self.entries.keys().map(String::as_str).collect();
+        let mut names: Vec<&str> = self
+            .install
+            .keys()
+            .chain(self.saved.keys())
+            .filter(|key| !self.removed.contains(&basename(key)))
+            .map(String::as_str)
+            .collect();
         names.sort_unstable();
+        names.dedup();
         names
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.install.is_empty() && self.saved.is_empty()
     }
 
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read
     }
 
-    fn resolve(&self, path: &str) -> Option<String> {
+    /// Where a name reads from: the guest's own copy if it has one, otherwise
+    /// the payload's, and nothing at all if the guest deleted it.
+    fn resolve(&self, path: &str) -> Option<(Where, String)> {
         let key = normalize(path);
-        if self.entries.contains_key(&key) {
-            return Some(key);
+        let base = basename(&key);
+        if self.removed.contains(&base) {
+            return None;
         }
-        self.by_name.get(&basename(&key)).cloned()
+        if self.saved.contains_key(&key) {
+            return Some((Where::Saved, key));
+        }
+        if let Some(saved) = self.saved_by_name.get(&base) {
+            return Some((Where::Saved, saved.clone()));
+        }
+        if self.install.contains_key(&key) {
+            return Some((Where::Install, key));
+        }
+        self.install_by_name
+            .get(&base)
+            .cloned()
+            .map(|key| (Where::Install, key))
     }
 
-    fn open(&mut self, path: &str) -> Option<u32> {
-        let key = self.resolve(path)?;
+    fn entry(&self, table: Where, key: &str) -> Option<&Entry> {
+        match table {
+            Where::Install => self.install.get(key),
+            Where::Saved => self.saved.get(key),
+        }
+    }
+
+    /// The whole contents of a file.
+    ///
+    /// A loader that takes a *path* rather than a handle -- `LoadImageA` with
+    /// `LR_LOADFROMFILE` -- has no cursor to advance, so it wants the bytes in
+    /// one piece instead of a handle.
+    pub fn contents(&self, path: &str) -> Option<&[u8]> {
+        let (table, key) = self.resolve(path)?;
+        self.entry(table, &key).map(|entry| entry.bytes.as_slice())
+    }
+
+    /// Reads up to `count` bytes at the cursor and advances it, which is what a
+    /// `FILE` stream reads through. A supplied marker -- a name with a length and
+    /// no bytes -- reads as zeroes, exactly as `ReadFile` answers it.
+    pub fn read(&mut self, handle: u32, count: u32) -> Option<Vec<u8>> {
+        let (entry, position) = self.file(handle)?;
+        let take = count.min(entry.length.saturating_sub(position));
+        let bytes = if entry.bytes.is_empty() {
+            vec![0; take as usize]
+        } else {
+            entry.bytes[position as usize..(position + take) as usize].to_vec()
+        };
+        self.seek(handle, position.saturating_add(take));
+        self.bytes_read += u64::from(take);
+        Some(bytes)
+    }
+
+    /// Opens a file for reading and returns its handle.
+    pub fn open(&mut self, path: &str) -> Option<u32> {
+        let (table, key) = self.resolve(path)?;
         let handle = FIRST_FILE + self.next_handle * 4;
         self.next_handle += 1;
-        self.open.insert(handle, Open { key, position: 0 });
+        self.open.insert(
+            handle,
+            Open {
+                key,
+                table,
+                writable: false,
+                position: 0,
+            },
+        );
         Some(handle)
     }
 
@@ -218,18 +317,27 @@ impl Files {
     /// The handle's file, or `None` if the guest never opened it.
     fn file(&self, handle: u32) -> Option<(&Entry, u32)> {
         let open = self.open.get(&handle)?;
-        let entry = self.entries.get(&open.key)?;
-        Some((entry, open.position))
+        Some((self.entry(open.table, &open.key)?, open.position))
     }
 
-    fn seek(&mut self, handle: u32, position: u32) {
+    pub fn seek(&mut self, handle: u32, position: u32) {
         if let Some(open) = self.open.get_mut(&handle) {
             open.position = position;
         }
     }
 
-    /// Whether the table holds `path` at all, whether the guest may write it or
-    /// not, which separates "denied" from "not found".
+    /// The open file's cursor, which `SetFilePointerEx` reports back.
+    pub fn position(&self, handle: u32) -> Option<u32> {
+        self.open.get(&handle).map(|open| open.position)
+    }
+
+    /// The open file's length, which is where `FILE_END` resolves from.
+    pub fn length(&self, handle: u32) -> Option<u32> {
+        self.file(handle).map(|(entry, _)| entry.length)
+    }
+
+    /// Whether the table holds `path` at all, which separates "denied" from
+    /// "not found".
     pub fn exists(&self, path: &str) -> bool {
         self.resolve(path).is_some()
     }
@@ -239,18 +347,16 @@ impl Files {
         self.open.contains_key(&handle)
     }
 
-    /// Whether the entry behind `path` is one the guest wrote, so a delete or an
-    /// overwrite may touch it.
+    /// Whether the guest has its own copy of `path`, which is what the page
+    /// persists.
     pub fn saved(&self, path: &str) -> bool {
-        self.resolve(path)
-            .and_then(|key| self.entries.get(&key))
-            .is_some_and(|entry| entry.writable)
+        matches!(self.resolve(path), Some((Where::Saved, _)))
     }
 
     /// Opens `path` for writing, creating or truncating it as `creation` asks.
     /// Returns `None` when the request contradicts what the table holds -- a
-    /// bundle file the guest wants to overwrite, or a save it wants to read that
-    /// is not there -- so the caller can answer with the right Win32 error.
+    /// `CREATE_NEW` on a name that is already there, or an open of a file that
+    /// is not -- so the caller can answer with the right Win32 error.
     pub fn create(&mut self, path: &str, creation: u32) -> Option<u32> {
         const CREATE_NEW: u32 = 1;
         const CREATE_ALWAYS: u32 = 2;
@@ -258,35 +364,44 @@ impl Files {
         const TRUNCATE_EXISTING: u32 = 5;
 
         let wanted = normalize(path);
+        let base = basename(&wanted);
+        if creation == CREATE_NEW && self.resolve(path).is_some() {
+            // The file is already there, and `CREATE_NEW` asked for a new one --
+            // whether the payload supplied it or the guest wrote it.
+            return None;
+        }
         let key = match self.resolve(path) {
-            Some(existing) => {
-                if !self.entries.get(&existing)?.writable {
-                    // Nothing may replace a file the bundle supplied.
-                    return None;
-                }
-                if creation == CREATE_NEW {
-                    return None;
-                }
-                existing
+            Some((Where::Saved, key)) => key,
+            Some((Where::Install, key)) => {
+                // The payload's copy stays as delivered: the guest's writes go
+                // into a copy of it, which shadows it for every read. That is
+                // what makes the install a folder the guest owns rather than one
+                // it can only look at.
+                let entry = self.install.get(&key)?;
+                let copy = Entry {
+                    bytes: entry.bytes.clone(),
+                    length: entry.length,
+                };
+                self.saved_by_name.insert(base.clone(), wanted.clone());
+                self.saved.insert(wanted.clone(), copy);
+                self.version += 1;
+                wanted
             }
             None => {
                 if matches!(creation, OPEN_EXISTING | TRUNCATE_EXISTING) {
                     return None;
                 }
-                self.by_name.insert(basename(&wanted), wanted.clone());
-                self.entries.insert(
-                    wanted.clone(),
-                    Entry {
-                        bytes: Vec::new(),
-                        length: 0,
-                        writable: true,
-                    },
-                );
+                self.saved_by_name.insert(base.clone(), wanted.clone());
+                self.saved.insert(wanted.clone(), Entry::new(Vec::new()));
+                self.version += 1;
                 wanted
             }
         };
+        // A file that is being created is there again, so a delete of that name
+        // is over.
+        self.removed.remove(&base);
         if matches!(creation, CREATE_ALWAYS | TRUNCATE_EXISTING) {
-            if let Some(entry) = self.entries.get_mut(&key) {
+            if let Some(entry) = self.saved.get_mut(&key) {
                 entry.bytes.clear();
                 entry.length = 0;
                 self.version += 1;
@@ -294,19 +409,27 @@ impl Files {
         }
         let handle = FIRST_FILE + self.next_handle * 4;
         self.next_handle += 1;
-        self.open.insert(handle, Open { key, position: 0 });
+        self.open.insert(
+            handle,
+            Open {
+                key,
+                table: Where::Saved,
+                writable: true,
+                position: 0,
+            },
+        );
         Some(handle)
     }
 
     /// Writes at the open file's cursor and advances it, growing the file as a
-    /// real one grows. `None` when the handle is not open for writing.
+    /// real one grows. `None` when the handle was not opened for writing.
     pub fn write(&mut self, handle: u32, bytes: &[u8]) -> Option<u32> {
-        let Self { open, entries, .. } = self;
+        let Self { open, saved, .. } = self;
         let open = open.get_mut(&handle)?;
-        let entry = entries.get_mut(&open.key)?;
-        if !entry.writable {
+        if !open.writable {
             return None;
         }
+        let entry = saved.get_mut(&open.key)?;
         let start = open.position as usize;
         let end = start.checked_add(bytes.len())?;
         if entry.bytes.len() < end {
@@ -322,86 +445,107 @@ impl Files {
     /// `SetEndOfFile`: the file becomes as long as the cursor, discarding
     /// anything past it.
     pub fn end_of_file(&mut self, handle: u32) -> bool {
-        let Some(open) = self.open.get(&handle) else {
+        let Self { open, saved, .. } = self;
+        let Some(open) = open.get(&handle) else {
             return false;
         };
-        let position = open.position as usize;
-        let Some(entry) = self.entries.get_mut(&open.key) else {
-            return false;
-        };
-        if !entry.writable {
+        if !open.writable {
             return false;
         }
+        let position = open.position as usize;
+        let Some(entry) = saved.get_mut(&open.key) else {
+            return false;
+        };
         entry.bytes.resize(position, 0);
         entry.length = position as u32;
         self.version += 1;
         true
     }
 
-    /// `DeleteFileA`. Only a saved file can be deleted; the bundle is not the
-    /// guest's to remove.
+    /// `DeleteFileA`. The payload's files are the guest's to remove too: a folder
+    /// it can write is a folder it can delete from. The install bytes stay for
+    /// the next session, so a delete here hides a file rather than destroying it.
     pub fn delete(&mut self, path: &str) -> bool {
-        let key = normalize(path);
-        if !self.saved(&key) {
-            return false;
-        }
-        let Some(key) = self.resolve(&key) else {
+        let Some((table, key)) = self.resolve(path) else {
             return false;
         };
-        self.entries.remove(&key);
-        self.by_name.retain(|_, entry| *entry != key);
+        self.removed.insert(basename(&key));
+        if table == Where::Saved {
+            self.saved.remove(&key);
+            self.saved_by_name.retain(|_, entry| *entry != key);
+        }
         self.open.retain(|_, open| open.key != key);
         self.version += 1;
         true
     }
 
-    /// The saved files, by name, which is what the page persists.
+    /// The files the guest wrote, by name, which is what the page persists.
     pub fn saved_files(&self) -> Vec<(&str, &[u8])> {
         let mut saved: Vec<(&str, &[u8])> = self
-            .entries
+            .saved
             .iter()
-            .filter(|(_, entry)| entry.writable)
             .map(|(name, entry)| (name.as_str(), entry.bytes.as_slice()))
             .collect();
         saved.sort_unstable_by_key(|(name, _)| *name);
         saved
     }
 
-    /// Changes to saved files so far. The page compares it with the last value it
-    /// persisted, which is cheaper than diffing every save on every chunk.
+    /// Changes to the guest's files so far. The page compares it with the last
+    /// value it persisted, which is cheaper than diffing every save on every
+    /// chunk.
     pub fn version(&self) -> u64 {
         self.version
     }
 
-    /// The first file matching a `FindFirstFileA` pattern, with its length.
-    pub fn find(&self, pattern: &str) -> Option<(String, u32)> {
+    /// Every file matching a `FindFirstFileA` pattern, in the order Windows
+    /// enumerates a directory: by name.
+    fn matches(&self, pattern: &str) -> Vec<(String, u32)> {
         let pattern = basename(&normalize(pattern));
-        let mut names: Vec<&String> = self.entries.keys().collect();
-        names.sort_unstable();
-        names.into_iter().find_map(|key| {
+        // A name the guest wrote wins over the payload's copy, length and all.
+        let mut found: HashMap<String, u32> = HashMap::new();
+        for (key, entry) in self.install.iter().chain(self.saved.iter()) {
             let name = basename(key);
-            if wildcard(&pattern, &name) {
-                let length = self.entries.get(key).map_or(0, |entry| entry.length);
-                Some((name, length))
-            } else {
-                None
+            if self.removed.contains(&name) {
+                continue;
             }
-        })
+            if wildcard(&pattern, &name) {
+                found.insert(name, entry.length);
+            }
+        }
+        let mut found: Vec<(String, u32)> = found.into_iter().collect();
+        found.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        found
     }
 
-    /// A token for `FindClose`, so the guest's close has something to close.
-    pub fn open_search(&mut self) -> u32 {
-        let handle = FIRST_SEARCH + self.searches.len() as u32 * 4;
-        // A handle is only a token here, but it must be unique while it is open.
-        let mut handle = handle;
+    /// The first file matching a `FindFirstFileA` pattern, with its length.
+    pub fn find(&self, pattern: &str) -> Option<(String, u32)> {
+        self.matches(pattern).into_iter().next()
+    }
+
+    /// A token for `FindClose`, remembering the pattern and the position after
+    /// the match `FindFirstFileA` already returned.
+    pub fn open_search(&mut self, pattern: &str) -> u32 {
+        let mut handle = FIRST_SEARCH + self.searches.len() as u32 * 4;
         while self.searches.contains(&handle) {
             handle += 4;
         }
         self.searches.insert(handle);
+        self.search_at
+            .insert(handle, (normalize(pattern), 1));
         handle
     }
 
+    /// The next match after this search's cursor, advancing it.
+    pub fn find_next(&mut self, handle: u32) -> Option<(String, u32)> {
+        let (pattern, index) = self.search_at.get(&handle).cloned()?;
+        let matches = self.matches(&pattern);
+        let next = matches.get(index).cloned()?;
+        self.search_at.insert(handle, (pattern, index + 1));
+        Some(next)
+    }
+
     pub fn close_search(&mut self, handle: u32) -> bool {
+        self.search_at.remove(&handle);
         self.searches.remove(&handle)
     }
 }
@@ -450,44 +594,53 @@ pub const SHIMS: &[Binding] = &[
     Binding { dll: KERNEL32, name: "FlushFileBuffers", arg_bytes: 4, shim: flush_file_buffers },
     Binding { dll: KERNEL32, name: "DeleteFileA", arg_bytes: 4, shim: delete_file },
     Binding { dll: KERNEL32, name: "FindFirstFileA", arg_bytes: 8, shim: find_first_file },
+    Binding { dll: KERNEL32, name: "FindFirstFileW", arg_bytes: 8, shim: find_first_file_w },
     Binding { dll: KERNEL32, name: "FindClose", arg_bytes: 4, shim: find_close },
 ];
 
 fn create_file(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let path = call.cstr(0)?;
-    let access = call.arg(1)?;
-    let creation = call.arg(4)?;
+    Ok(Return(open_path(host, &path, call.arg(1)?, call.arg(4)?)))
+}
 
+/// The open `CreateFileA` and `CreateFileW` share, once their name has been
+/// decoded. Every name in the folder is writable; `access` decides what *this
+/// handle* may do with it, which is what `WriteFile` checks.
+pub(crate) fn open_path(host: &mut Host, path: &str, access: u32, creation: u32) -> u32 {
     let wants_write = access & (GENERIC_WRITE | FILE_WRITE_DATA) != 0;
     let wants_truncate = matches!(creation, CREATE_NEW | CREATE_ALWAYS | TRUNCATE_EXISTING);
 
     if wants_write || wants_truncate {
-        // A writable open is a save: a new file of the guest's own, or one it
-        // wrote in an earlier session. The bundle stays read-only, and asking to
-        // overwrite it is refused rather than silently redirected.
-        if let Some(handle) = host.files.create(&path, creation) {
-            return Ok(Return(handle));
+        if let Some(handle) = host.files.create(path, creation) {
+            return handle;
         }
-        if host.files.saved(&path) || !host.files.exists(&path) {
-            host.last_error = 87; // ERROR_INVALID_PARAMETER
+        // The only contradictions left: `CREATE_NEW` on a file that is already
+        // there, or a writable open of a file that does not exist.
+        host.last_error = if host.files.exists(path) {
+            ERROR_FILE_EXISTS
         } else {
-            host.last_error = ERROR_ACCESS_DENIED;
-            host.notice(format!(
-                "CreateFileA {path}: denied, the game files are read-only"
-            ));
-        }
-        return Ok(Return(INVALID_HANDLE_VALUE));
+            ERROR_FILE_NOT_FOUND
+        };
+        return INVALID_HANDLE_VALUE;
     }
     if creation != OPEN_EXISTING && creation != OPEN_ALWAYS {
         host.last_error = 87; // ERROR_INVALID_PARAMETER
-        return Ok(Return(INVALID_HANDLE_VALUE));
+        return INVALID_HANDLE_VALUE;
     }
 
-    match host.files.open(&path) {
-        Some(handle) => Ok(Return(handle)),
+    match host.files.open(path) {
+        Some(handle) => {
+            if std::env::var("SHIMKIT_LOG_FILES").is_ok() && host.notices.len() < 600 {
+                host.notice(format!("opened {path}"));
+            }
+            handle
+        }
         None => {
             host.last_error = ERROR_FILE_NOT_FOUND;
-            Ok(Return(INVALID_HANDLE_VALUE))
+            if std::env::var("SHIMKIT_LOG_FILES").is_ok() && host.notices.len() < 400 {
+                host.notice(format!("missing {path}"));
+            }
+            INVALID_HANDLE_VALUE
         }
     }
 }
@@ -567,7 +720,18 @@ fn find_first_file(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         return Ok(Return(INVALID_HANDLE_VALUE));
     };
     call.zero(destination, FIND_DATA_SIZE)?;
-    // FILE_ATTRIBUTE_NORMAL, a fixed 2020-01-01 timestamp, and the file size.
+    write_find_data(call, destination, &name, length)?;
+    Ok(Return(host.files.open_search(&pattern)))
+}
+
+/// `WIN32_FIND_DATAA`, which both find calls write: attributes, a fixed
+/// timestamp, the size, and the name in `cFileName`.
+fn write_find_data(
+    call: &mut Call<'_>,
+    destination: u32,
+    name: &str,
+    length: u32,
+) -> Result<()> {
     call.write_u32(destination, 0x80)?;
     for offset in [4, 12, 20] {
         call.write_u32(destination + offset, 0xD2B0_9E00)?;
@@ -576,7 +740,119 @@ fn find_first_file(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     call.write_u32(destination + 28, 0)?;
     call.write_u32(destination + 32, length)?;
     call.write(destination + 44, name.as_bytes())?;
-    Ok(Return(host.files.open_search()))
+    Ok(())
+}
+
+/// `FindFirstFileW(pattern, &find_data)`: the same search, with a wide pattern
+/// and a wide `WIN32_FIND_DATAW`.
+fn find_first_file_w(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let pattern = call.wstr(0)?;
+    let destination = call.arg(1)?;
+    if destination == 0 {
+        host.last_error = 87;
+        return Ok(Return(INVALID_HANDLE_VALUE));
+    }
+    let Some((name, length)) = host.files.find(&pattern) else {
+        host.last_error = ERROR_FILE_NOT_FOUND;
+        return Ok(Return(INVALID_HANDLE_VALUE));
+    };
+    call.zero(destination, FIND_DATA_W_SIZE)?;
+    write_find_data_w(call, destination, &name, length)?;
+    Ok(Return(host.files.open_search(&pattern)))
+}
+
+/// `WIN32_FIND_DATAW`: the same header as the ANSI structure, with the name
+/// stored as UTF-16.
+fn write_find_data_w(
+    call: &mut Call<'_>,
+    destination: u32,
+    name: &str,
+    length: u32,
+) -> Result<()> {
+    call.write_u32(destination, 0x80)?;
+    for offset in [4, 12, 20] {
+        call.write_u32(destination + offset, 0xD2B0_9E00)?;
+        call.write_u32(destination + offset + 4, 0x01D5_CC00)?;
+    }
+    call.write_u32(destination + 28, 0)?;
+    call.write_u32(destination + 32, length)?;
+    for (index, unit) in name.encode_utf16().take(259).enumerate() {
+        call.write_u16(destination + 44 + index as u32 * 2, unit)?;
+    }
+    Ok(())
+}
+
+/// `FindNextFileW`: continue a wide enumeration.
+pub(crate) fn find_next_file_w(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let handle = call.arg(0)?;
+    let destination = call.arg(1)?;
+    if destination == 0 {
+        host.last_error = 87;
+        return Ok(Return(0));
+    }
+    let Some((name, length)) = host.files.find_next(handle) else {
+        host.last_error = 18; // ERROR_NO_MORE_FILES
+        return Ok(Return(0));
+    };
+    call.zero(destination, FIND_DATA_W_SIZE)?;
+    write_find_data_w(call, destination, &name, length)?;
+    Ok(Return(1))
+}
+
+/// `FindNextFileA`: continue the enumeration `FindFirstFileA` started.
+pub(crate) fn find_next_file(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let handle = call.arg(0)?;
+    let destination = call.arg(1)?;
+    if destination == 0 {
+        host.last_error = 87;
+        return Ok(Return(0));
+    }
+    let Some((name, length)) = host.files.find_next(handle) else {
+        host.last_error = 18; // ERROR_NO_MORE_FILES
+        return Ok(Return(0));
+    };
+    call.zero(destination, FIND_DATA_SIZE)?;
+    write_find_data(call, destination, &name, length)?;
+    Ok(Return(1))
+}
+
+/// `SetFilePointerEx(handle, distance, &new, method)`: the same cursor
+/// `SetFilePointer` moves, with the 64-bit distance passed by value.
+pub(crate) fn set_file_pointer_ex(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let handle = call.arg(0)?;
+    let distance = call.arg(1)? as i32 as i64;
+    let high = call.arg(2)?;
+    let destination = call.arg(3)?;
+    let method = call.arg(4)?;
+    if high != 0 {
+        host.last_error = 87; // ERROR_INVALID_PARAMETER
+        return Ok(Return(0));
+    }
+    let Some(position) = host.files.position(handle) else {
+        host.last_error = ERROR_INVALID_HANDLE;
+        return Ok(Return(0));
+    };
+    let length = host.files.length(handle).unwrap_or(0);
+    let base = match method {
+        FILE_BEGIN => 0_i64,
+        FILE_CURRENT => i64::from(position),
+        FILE_END => i64::from(length),
+        _ => {
+            host.last_error = 87;
+            return Ok(Return(0));
+        }
+    };
+    let moved = base + distance;
+    if moved < 0 || moved > i64::from(u32::MAX) {
+        host.last_error = 87;
+        return Ok(Return(0));
+    }
+    host.files.seek(handle, moved as u32);
+    if destination != 0 {
+        call.write_u32(destination, moved as u32)?;
+        call.write_u32(destination + 4, 0)?;
+    }
+    Ok(Return(1))
 }
 
 fn find_close(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
@@ -862,26 +1138,85 @@ mod tests {
     }
 
     #[test]
-    fn a_bundle_file_cannot_be_overwritten() {
+    fn a_game_file_is_written_to_a_copy_and_the_payload_stays_as_delivered() {
         let Some((mut host, mut memory)) = machine() else {
             return;
         };
-        host.files.provide("save.dat", vec![0; 4]);
+        // What a game does on start: open its own settings file and rewrite it.
+        host.files.provide("data\\settings.dat", vec![1, 2, 3, 4]);
         let name = STACK_BASE + 0x9600;
-        memory.write_bytes(name, b"save.dat\0").unwrap();
+        memory.write_bytes(name, b"data\\settings.dat\0").unwrap();
+        let action = call_shim(
+            &mut host,
+            &mut memory,
+            "CreateFileA",
+            &[name, 0x4000_0000, 0, 0, CREATE_ALWAYS, 0x80, 0]
+        )
+        .unwrap();
+        let Return(handle) = action else {
+            panic!("CreateFileA returned {action:?}");
+        };
+        assert_ne!(handle, INVALID_HANDLE_VALUE, "the folder is the guest's to write");
+        assert_eq!(host.last_error, 0);
+
+        // The write lands in the copy, and the guest reads it back.
+        let buffer = STACK_BASE + 0x9600 + 0x200;
+        let written = STACK_BASE + 0x9600 + 0x300;
+        memory.write_bytes(buffer, b"new settings").unwrap();
         assert_eq!(
             call_shim(
                 &mut host,
                 &mut memory,
+                "WriteFile",
+                &[handle, buffer, 12, written, 0]
+            )
+            .unwrap(),
+            Return(1)
+        );
+        assert_eq!(host.files.saved_files(), vec![("data\\settings.dat", &b"new settings"[..])]);
+        // The bytes the page handed over are not the bytes the guest changed:
+        // a reload reads the payload exactly as it was installed.
+        assert_eq!(
+            host.files.install.get("data\\settings.dat").unwrap().bytes,
+            vec![1, 2, 3, 4]
+        );
+
+        // Opening it again is the same copy, not a second one.
+        assert_ne!(
+            call_shim(
+                &mut host,
+                &mut memory,
                 "CreateFileA",
-                &[name, 0x4000_0000, 0, 0, CREATE_ALWAYS, 0x80, 0]
+                &[name, 0x4000_0000, 0, 0, OPEN_EXISTING, 0x80, 0]
             )
             .unwrap(),
             Return(INVALID_HANDLE_VALUE)
         );
-        assert_eq!(host.last_error, ERROR_ACCESS_DENIED);
-        assert_eq!(host.notices.len(), 1);
-        assert!(host.notices[0].contains("read-only"));
+        assert_eq!(host.files.saved_files().len(), 1);
+        assert!(host.notices.is_empty(), "writing a game file is not worth a notice");
+    }
+
+    #[test]
+    fn a_copy_of_a_game_file_starts_as_the_bytes_provided() {
+        let mut files = Files::default();
+        files.provide("settings.dat", vec![7, 8, 9]);
+        let handle = files
+            .create("data\\settings.dat", OPEN_EXISTING)
+            .expect("a provided file may be written");
+        assert_eq!(files.length(handle), Some(3), "the copy starts as the file");
+        assert!(files.saved("settings.dat"), "the page has something to persist");
+        // `CREATE_NEW` still refuses a name that is there, copy or not.
+        assert_eq!(files.create("settings.dat", CREATE_NEW), None);
+        files.provide("layout.dat", vec![1]);
+        assert_eq!(files.create("layout.dat", CREATE_NEW), None);
+    }
+
+    #[test]
+    fn a_new_file_still_refuses_create_new_when_it_is_there() {
+        let mut files = Files::default();
+        assert!(files.create("save0001.dat", CREATE_ALWAYS).is_some());
+        assert_eq!(files.create("save0001.dat", CREATE_NEW), None);
+        assert_eq!(files.create("missing.dat", OPEN_EXISTING), None);
     }
 
     /// Opens `name` for writing and returns the handle.
@@ -984,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn a_save_can_be_deleted_and_a_bundle_file_cannot() {
+    fn a_deleted_file_is_gone_for_the_session_even_when_the_payload_supplied_it() {
         let Some((mut host, mut memory)) = machine() else {
             return;
         };
@@ -998,14 +1333,58 @@ mod tests {
         );
         assert!(!host.files.exists("save0004.dat"));
 
-        let bundle = STACK_BASE + 0xa500;
-        memory.write_bytes(bundle, b"sfx.dat\0").unwrap();
+        // The payload's files are the guest's to remove as well.
+        let bundled = STACK_BASE + 0xa500;
+        memory.write_bytes(bundled, b"sfx.dat\0").unwrap();
         assert_eq!(
-            call_shim(&mut host, &mut memory, "DeleteFileA", &[bundle]).unwrap(),
+            call_shim(&mut host, &mut memory, "DeleteFileA", &[bundled]).unwrap(),
+            Return(1)
+        );
+        assert!(!host.files.exists("sfx.dat"));
+        assert!(host.files.find("sfx.dat").is_none(), "a listing does not show it");
+        assert!(host.files.contents("sfx.dat").is_none());
+        // Deleting it again is "no such file", which is what Windows answers.
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "DeleteFileA", &[bundled]).unwrap(),
+            Return(0)
+        );
+        assert_eq!(host.last_error, ERROR_FILE_NOT_FOUND);
+        // And the guest can make it again, empty.
+        assert!(host.files.create("sfx.dat", CREATE_ALWAYS).is_some());
+        assert_eq!(host.files.contents("sfx.dat"), Some(&[][..]));
+    }
+
+    #[test]
+    fn a_read_only_handle_cannot_write_a_file_someone_else_opened_for_writing() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        host.files.provide("settings.dat", vec![1, 2, 3]);
+        let name = STACK_BASE + 0xa800;
+        memory.write_bytes(name, b"settings.dat\0").unwrap();
+
+        // A reader first, then the writer: the file is the guest's from the
+        // moment the second open happens, but the first handle still cannot
+        // write, because the right belongs to the handle and not to the file.
+        let reader = open_sfx(&mut host, &mut memory);
+        let writer = create_save(&mut host, &mut memory, b"settings.dat\0");
+        let buffer = STACK_BASE + 0xa900;
+        let written = STACK_BASE + 0xaa00;
+        memory.write_bytes(buffer, b"changed").unwrap();
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "WriteFile", &[reader, buffer, 7, written, 0])
+                .unwrap(),
             Return(0)
         );
         assert_eq!(host.last_error, ERROR_ACCESS_DENIED);
-        assert!(host.files.exists("sfx.dat"));
+        assert_eq!(host.files.contents("settings.dat"), Some(&[1, 2, 3][..]));
+
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "WriteFile", &[writer, buffer, 7, written, 0])
+                .unwrap(),
+            Return(1)
+        );
+        assert_eq!(host.files.contents("settings.dat"), Some(&b"changed"[..]));
     }
 
     #[test]
@@ -1042,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn a_provided_save_is_writable_and_the_bundle_is_not() {
+    fn a_restored_save_is_writable_without_being_a_change() {
         let mut files = Files::default();
         files.provide("sfx.dat", vec![1]);
         files.provide_saved("save0001.dat", vec![2, 3]);
@@ -1053,11 +1432,31 @@ mod tests {
             files.create("save0001.dat", CREATE_ALWAYS).is_some(),
             "a restored save may be overwritten"
         );
-        assert_eq!(
-            files.create("sfx.dat", CREATE_ALWAYS),
-            None,
-            "a bundle file may not"
-        );
+        // A payload file is not the guest's until the guest writes it.
+        assert!(!files.saved("sfx.dat"));
+        assert!(files.create("sfx.dat", CREATE_ALWAYS).is_some());
+    }
+
+    #[test]
+    fn a_restored_save_shadows_the_payload_file_of_the_same_name() {
+        let mut files = Files::default();
+        // The page may hand either over first: a save shadows the install copy
+        // instead of replacing it, so the order cannot lose one of them.
+        files.provide_saved("settings.dat", vec![9, 9]);
+        files.provide("settings.dat", vec![1, 2, 3]);
+        assert_eq!(files.contents("settings.dat"), Some(&[9, 9][..]));
+        assert!(files.saved("settings.dat"));
+
+        let mut files = Files::default();
+        files.provide("settings.dat", vec![1, 2, 3]);
+        files.provide_saved("settings.dat", vec![9, 9]);
+        assert_eq!(files.contents("settings.dat"), Some(&[9, 9][..]));
+
+        // A save the payload does not ship is just a file.
+        let mut files = Files::default();
+        files.provide_saved("save0001.dat", vec![4]);
+        assert_eq!(files.contents("save0001.dat"), Some(&[4][..]));
+        assert!(files.install.is_empty());
     }
 
     #[test]

@@ -356,6 +356,20 @@ impl Input {
     }
 
     /// `GetAsyncKeyState`'s answer for a virtual-key code.
+    /// Whether `vk` is down, without consuming the press edge.
+    ///
+    /// This is the `GetKeyState` reading: the queue's own view of the key, where
+    /// `GetAsyncKeyState` also reports (and takes) whether it was pressed since
+    /// the last call. There is no toggle state here, so `CAPSLOCK` and `NUMLOCK`
+    /// never report latched.
+    pub fn keyboard_state(&self, vk: u8) -> u16 {
+        if self.async_down[usize::from(vk)] {
+            0x8000
+        } else {
+            0
+        }
+    }
+
     pub fn async_state(&mut self, vk: u8) -> u16 {
         let index = usize::from(vk);
         let down = self.async_down[index];
@@ -675,6 +689,19 @@ mod tests {
         // A key that is not text produces nothing.
         assert!(!input.translate(WINDOW, WM_KEYDOWN, 0x26));
         assert!(!input.translate(WINDOW, WM_KEYUP, u32::from(b'H')));
+    }
+
+    #[test]
+    fn get_key_state_does_not_consume_the_press_edge() {
+        let mut input = Input::new();
+        input.key(0x1e, true, WINDOW);
+        assert_eq!(input.keyboard_state(b'A'), 0x8000);
+        // Reading it again says the same thing: only `GetAsyncKeyState` takes the
+        // edge, which is what the two calls exist to distinguish.
+        assert_eq!(input.keyboard_state(b'A'), 0x8000);
+        assert_eq!(input.async_state(b'A'), 0x8001, "the edge is still there");
+        input.key(0x1e, false, WINDOW);
+        assert_eq!(input.keyboard_state(b'A'), 0);
     }
 
     #[test]

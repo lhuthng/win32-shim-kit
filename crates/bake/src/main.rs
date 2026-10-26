@@ -79,9 +79,22 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         }
+        // `fs::copy` keeps the source's mode, and game installs are often
+        // read-only, so the copy has to be made writable: otherwise the second
+        // bake into the same folder fails on its own first output.
+        if target.exists() {
+            let _ = fs::remove_file(&target);
+        }
         if let Err(error) = fs::copy(install.join(name), &target) {
             eprintln!("error: {}: {error}", target.display());
             return ExitCode::from(1);
+        }
+        if let Ok(metadata) = fs::metadata(&target) {
+            let mut permissions = metadata.permissions();
+            if permissions.readonly() {
+                permissions.set_readonly(false);
+                let _ = fs::set_permissions(&target, permissions);
+            }
         }
     }
 

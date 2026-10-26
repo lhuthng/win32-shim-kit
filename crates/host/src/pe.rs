@@ -26,6 +26,14 @@ const SECTION_HEADER_SIZE: usize = 40;
 const DATA_DIRECTORY_OFFSET: usize = 96;
 const NUMBER_OF_DIRECTORIES_OFFSET: usize = 92;
 const IMPORT_DIRECTORY: usize = 1;
+const RESOURCE_DIRECTORY: usize = 2;
+const BASE_RELOCATION_DIRECTORY: usize = 5;
+const EXPORT_DIRECTORY: usize = 0;
+/// `IMAGE_REL_BASED_HIGHLOW`: the relocation this reader applies.
+const RELOCATION_HIGHLOW: u16 = 3;
+/// Depth the resource tree has: type, name, language. A reader that follows
+/// more than this is following a cycle, not a directory.
+const RESOURCE_DEPTH: usize = 3;
 /// A hint/name entry is two bytes of hint followed by the name.
 const HINT_NAME_SKIP: u32 = 2;
 const MAX_IMPORT_DESCRIPTORS: usize = 4096;
@@ -95,6 +103,27 @@ pub struct Import {
     pub iat_va: u32,
 }
 
+/// One key in the resource tree: a number (`MAKEINTRESOURCE`) or a name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResourceKey {
+    Id(u32),
+    Name(String),
+}
+
+/// One resource the image carries: its type, its name, and where its bytes are.
+///
+/// The language level is dropped: this machine has one language, and a game that
+/// asks for a specific one gets the first entry in the directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resource {
+    pub kind: ResourceKey,
+    pub name: ResourceKey,
+    /// RVA of the data, which is inside the mapped image (`.rsrc`), so a shim
+    /// can hand the guest the address without copying anything.
+    pub rva: u32,
+    pub size: u32,
+}
+
 /// A parsed image. `bytes` is the file as shipped; `memory` copies from it.
 #[derive(Clone, Debug)]
 pub struct Image {
@@ -106,6 +135,14 @@ pub struct Image {
     pub size_of_headers: u32,
     pub sections: Vec<Section>,
     pub imports: Vec<Import>,
+    /// RVAs that hold an absolute address and move with the image.
+    ///
+    /// The program this kit boots has no relocation directory and never moves.
+    /// A library loaded beside it does: it is mapped where the host has room, so
+    /// its own table says what to adjust.
+    pub relocations: Vec<u32>,
+    /// Names the image exports, and the RVA each one starts at.
+    pub exports: Vec<(String, u32)>,
 }
 
 impl Image {
@@ -170,9 +207,89 @@ impl Image {
             size_of_headers,
             sections,
             imports: Vec::new(),
+            relocations: Vec::new(),
+            exports: Vec::new(),
         };
         image.imports = image.parse_imports(optional)?;
+        image.relocations = image.parse_relocations(optional)?;
+        image.exports = image.parse_exports(optional)?;
         Ok(image)
+    }
+
+    /// The RVAs a rebase has to adjust, from the base relocation directory.
+    ///
+    /// One relocation is four bytes of absolute address, which is what an i386
+    /// image holds; the other kinds describe a machine this host does not run.
+    fn parse_relocations(&self, optional: usize) -> Result<Vec<u32>> {
+        let Some(directory) = self.data_directory(optional, BASE_RELOCATION_DIRECTORY)? else {
+            return Ok(Vec::new());
+        };
+        let mut offset = self
+            .rva_to_offset(directory)
+            .ok_or("relocation directory is not inside any section")?;
+        let mut relocations = Vec::new();
+        // A block is a page and the size of the whole block, then its entries.
+        while let Ok(page) = u32_at(&self.bytes, offset) {
+            let size = u32_at(&self.bytes, offset + 4)? as usize;
+            if page == 0 || size < 8 {
+                break;
+            }
+            let entries = (size - 8) / 2;
+            for index in 0..entries {
+                let entry = u16_at(&self.bytes, offset + 8 + index * 2)?;
+                if entry >> 12 == RELOCATION_HIGHLOW {
+                    relocations.push(page + u32::from(entry & 0x0fff));
+                }
+            }
+            offset += size;
+        }
+        Ok(relocations)
+    }
+
+    /// The names the image exports, with the RVA each one starts at.
+    fn parse_exports(&self, optional: usize) -> Result<Vec<(String, u32)>> {
+        let Some(directory) = self.data_directory(optional, EXPORT_DIRECTORY)? else {
+            return Ok(Vec::new());
+        };
+        let mut offset = self
+            .rva_to_offset(directory)
+            .ok_or("export directory is not inside any section")?;
+        let count = u32_at(&self.bytes, offset + 24)?;
+        let functions = u32_at(&self.bytes, offset + 28)?;
+        let ordinals = u32_at(&self.bytes, offset + 36)?;
+        if count == 0 || functions == 0 || ordinals == 0 {
+            return Ok(Vec::new());
+        }
+        let names_at = self
+            .rva_to_offset(u32_at(&self.bytes, offset + 32)?)
+            .ok_or("export name table is not inside any section")?;
+        let functions_at = self
+            .rva_to_offset(functions)
+            .ok_or("export address table is not inside any section")?;
+        let ordinals_at = self
+            .rva_to_offset(ordinals)
+            .ok_or("export ordinal table is not inside any section")?;
+        let mut exports = Vec::new();
+        for index in 0..count as usize {
+            let name_rva = u32_at(&self.bytes, names_at + index * 4)?;
+            let ordinal = u16_at(&self.bytes, ordinals_at + index * 2)? as usize;
+            let function = u32_at(&self.bytes, functions_at + ordinal * 4)?;
+            if function == 0 {
+                continue;
+            }
+            exports.push((self.read_cstr(name_rva)?, function));
+        }
+        Ok(exports)
+    }
+
+    /// A data directory's RVA, or `None` when the image has no directory there.
+    fn data_directory(&self, optional: usize, index: usize) -> Result<Option<u32>> {
+        let directories = u32_at(&self.bytes, optional + NUMBER_OF_DIRECTORIES_OFFSET)?;
+        if directories <= index as u32 {
+            return Ok(None);
+        }
+        let rva = u32_at(&self.bytes, optional + DATA_DIRECTORY_OFFSET + index * 8)?;
+        Ok((rva != 0).then_some(rva))
     }
 
     fn parse_imports(&self, optional: usize) -> Result<Vec<Import>> {
@@ -223,6 +340,95 @@ impl Image {
             offset += 20;
         }
         Ok(imports)
+    }
+
+    /// The image's resources, as `FindResourceA` will look them up.
+    pub fn resources(&self) -> Result<Vec<Resource>> {
+        let pe = u32_at(&self.bytes, 0x3c)? as usize;
+        self.parse_resources(pe + COFF_HEADER)
+    }
+
+    /// Every resource in the image's tree, flattened: one entry per type and
+    /// name, with the language level dropped.
+    ///
+    /// A game reaches its own resources through `FindResourceA`, and Cave Story
+    /// reads its Organya instrument table from a `WAVE` resource before it draws
+    /// anything, so an image whose tree a port cannot read is one it cannot run.
+    fn parse_resources(&self, optional: usize) -> Result<Vec<Resource>> {
+        let directories = u32_at(&self.bytes, optional + NUMBER_OF_DIRECTORIES_OFFSET)?;
+        if directories <= RESOURCE_DIRECTORY as u32 {
+            return Ok(Vec::new());
+        }
+        let directory = DATA_DIRECTORY_OFFSET + RESOURCE_DIRECTORY * 8;
+        let root = u32_at(&self.bytes, optional + directory)?;
+        if root == 0 {
+            return Ok(Vec::new());
+        }
+        let mut resources = Vec::new();
+        self.walk_resources(root, root, &mut Vec::new(), &mut resources)?;
+        Ok(resources)
+    }
+
+    /// Walks one level of the tree. `root` is where the tree starts: every
+    /// offset inside it is relative to that RVA, at every level.
+    fn walk_resources(
+        &self,
+        root: u32,
+        directory_rva: u32,
+        path: &mut Vec<ResourceKey>,
+        resources: &mut Vec<Resource>,
+    ) -> Result<()> {
+        let base = self
+            .rva_to_offset(directory_rva)
+            .ok_or("resource directory is not inside any section")?;
+        // IMAGE_RESOURCE_DIRECTORY: characteristics, timestamp, version, two
+        // counts, then the entries.
+        let named = u16_at(&self.bytes, base + 12)? as usize;
+        let ids = u16_at(&self.bytes, base + 14)? as usize;
+        for index in 0..named + ids {
+            let entry = base + 16 + index * 8;
+            let raw_name = u32_at(&self.bytes, entry)?;
+            let raw_target = u32_at(&self.bytes, entry + 4)?;
+            let key = if raw_name & 0x8000_0000 != 0 {
+                let name = self
+                    .rva_to_offset(root.wrapping_add(raw_name & 0x7fff_ffff))
+                    .ok_or("resource name is not inside any section")?;
+                // Two bytes of length, then UTF-16. A .rsrc in this kit only
+                // ever spells its names in ASCII.
+                let length = u16_at(&self.bytes, name)? as usize;
+                let mut text = String::new();
+                for unit in 0..length {
+                    let code = u16_at(&self.bytes, name + 2 + unit * 2)?;
+                    text.push(char::from_u32(u32::from(code)).unwrap_or('?'));
+                }
+                ResourceKey::Name(text)
+            } else {
+                ResourceKey::Id(raw_name)
+            };
+            if raw_target & 0x8000_0000 != 0 {
+                path.push(key);
+                if path.len() < RESOURCE_DEPTH {
+                    let child = root.wrapping_add(raw_target & 0x7fff_ffff);
+                    self.walk_resources(root, child, path, resources)?;
+                }
+                path.pop();
+            } else {
+                let data = self
+                    .rva_to_offset(root.wrapping_add(raw_target))
+                    .ok_or("resource data entry is not inside any section")?;
+                let mut keys = path.clone();
+                keys.push(key);
+                if keys.len() >= 2 {
+                    resources.push(Resource {
+                        kind: keys[0].clone(),
+                        name: keys[1].clone(),
+                        rva: u32_at(&self.bytes, data)?,
+                        size: u32_at(&self.bytes, data + 4)?,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Maps an RVA to a file offset, headers included. Bytes that exist only as

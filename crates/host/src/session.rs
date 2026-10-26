@@ -18,6 +18,9 @@ pub struct Session {
     pub target: &'static Target,
     pub memory: GuestMemory,
     pub cpu: Cpu,
+    /// The decoded-instruction cache, which lives beside the CPU so the step
+    /// loop can read an instruction it has already decoded without copying it.
+    pub(crate) decodes: cpu::Decodes,
     pub host: Host,
     /// Import calls the guest made, and how many of them a shim answered.
     pub host_calls: u64,
@@ -73,6 +76,14 @@ struct CallFrame {
     /// routine returns.
     args: u32,
     arg_bytes: u32,
+    /// The value the import returns instead of the routine's own, when the shim
+    /// said so: `LoadLibraryA` answers with a module handle, not `DllMain`'s.
+    answer: Option<u32>,
+    /// The import to run again when the routine returns, when the shim asked to be
+    /// resumed (`_initterm` and `exit` walk a list one entry per pass). The
+    /// routine's frame was pushed over the import's arguments, so a resumed shim
+    /// reads its state from the host instead.
+    resume: Option<&'static shim::Binding>,
 }
 
 /// What [`Session::serve`] did with a host call.
@@ -139,6 +150,9 @@ impl Session {
         let image = Image::parse(bytes)?;
         let entry = image.entry_point;
         let image_size = image.size_of_image;
+        // Read before the image becomes guest memory: a resource's bytes live in
+        // the mapped `.rsrc`, but the tree that names them is only read here.
+        let resources = image.resources()?;
         let mut memory = GuestMemory::load(image)?;
         // Fill the import table with host stubs, which is what a real loader
         // does with DLL addresses. Without this, code that loads a slot into a
@@ -153,6 +167,12 @@ impl Session {
         cpu.regs.esp = crate::memory::STACK_TOP;
         cpu.regs.ebp = 0;
         let mut host = Host::with_target(target);
+        host.resources = resources;
+        // A CRT variable is not a function: `_acmdln`'s slot holds the address of
+        // a pointer the guest dereferences, not a stub to call. `npos` in the C++
+        // runtime is the same shape.
+        shim::crt::fill_data_slots(&mut host, &mut memory, target.table)?;
+        shim::msvcp::fill_data_slots(&mut host, &mut memory, target.table)?;
         // A device the browser cannot have is supplied as a name and a length:
         // the guest measures the file and never reads it. The names come from
         // the target, so no product's disc layout lives in this crate.
@@ -166,6 +186,7 @@ impl Session {
             target,
             memory,
             cpu,
+            decodes: cpu::Decodes::new(),
             host,
             host_calls: 0,
             host_returns: 0,
@@ -197,6 +218,37 @@ impl Session {
 
     pub fn instructions(&self) -> u64 {
         self.cpu.instructions
+    }
+
+    /// The return addresses on the guest's frame chain, innermost first.
+    ///
+    /// A guest that spins without calling the host is otherwise a mystery: the
+    /// chain names the routine that is spinning and the calls that led to it,
+    /// which no import name can.
+    pub fn call_stack(&self, depth: usize) -> Vec<u32> {
+        let mut stack = Vec::new();
+        let mut frame = self.cpu.regs.ebp;
+        for _ in 0..depth {
+            if frame == 0 {
+                break;
+            }
+            let (Ok(saved), Ok(returned)) = (
+                self.memory.read_u32(frame),
+                self.memory.read_u32(frame.wrapping_add(4)),
+            ) else {
+                break;
+            };
+            if returned == 0 {
+                break;
+            }
+            stack.push(returned);
+            // The chain climbs the stack; a frame that does not is not a frame.
+            if saved <= frame {
+                break;
+            }
+            frame = saved;
+        }
+        stack
     }
 
     /// Sprite blits the host drew instead of the interpreter, and the pixels
@@ -247,11 +299,48 @@ impl Session {
                             cpu::CALL_TRAMPOLINE
                         ));
                     };
-                    // The routine's result is the import's return value, and the
-                    // import's frame -- arguments still on the stack -- is restored.
-                    let result = self.cpu.regs.eax;
+                    // The routine's result is the import's return value -- unless
+                    // the shim said what the import must answer -- and the import's
+                    // frame, arguments still on the stack, is restored.
+                    let result = frame.answer.unwrap_or(self.cpu.regs.eax);
                     self.cpu.regs = frame.regs;
                     self.cpu.fpu = frame.fpu;
+                    // A shim that asked to be resumed runs again here, with the
+                    // routine's result available to it, and decides whether the
+                    // import is finished or the next entry is needed.
+                    if let Some(binding) = frame.resume {
+                        self.host.guest_result = result;
+                        self.host.resumed = true;
+                        self.host.this = self.cpu.regs.ecx;
+                        let mut arguments = shim::Call {
+                            memory: &mut self.memory,
+                            args: frame.args,
+                            arg_bytes: binding.arg_bytes,
+                        };
+                        let action = (binding.shim)(&mut self.host, &mut arguments);
+                        self.host.resumed = false;
+                        let action = match action {
+                            Ok(action) => action,
+                            Err(error) => return Outcome::Fault(error),
+                        };
+                        let popped = if shim::is_cdecl(binding.dll, binding.name) {
+                            0
+                        } else {
+                            binding.arg_bytes
+                        };
+                        match self.finish(action, frame.args, popped, Some(binding)) {
+                            Ok(Served::Call) => continue,
+                            Ok(Served::Return(value)) => {
+                                self.cpu.regs.eax = value;
+                                continue;
+                            }
+                            Ok(Served::Exit(code)) => {
+                                self.host.exit_code = Some(code);
+                                return Outcome::Halted;
+                            }
+                            Err(error) => return Outcome::Fault(error),
+                        }
+                    }
                     self.cpu.regs.eax = result;
                     self.cpu.regs.esp = frame.args.wrapping_add(frame.arg_bytes);
                     continue;
@@ -315,7 +404,7 @@ impl Session {
                     return Outcome::Fault(fault);
                 }
             }
-            match cpu::step(&mut self.memory, &mut self.cpu) {
+            match cpu::step(&mut self.memory, &mut self.cpu, &mut self.decodes) {
                 Ok(Step::Continue) => {}
                 Ok(Step::Halt) => return Outcome::Halted,
                 Ok(Step::HostCall(call)) => {
@@ -355,6 +444,11 @@ impl Session {
         }
         let now = self.host.guest_time_ms(self.cpu.instructions);
         let (id, callback, user) = self.host.timers.due(now)?;
+        if std::env::var("SHIMKIT_LOG_TIMERS").is_ok() && self.host.notices.len() < 600 {
+            self.host.notice(format!(
+                "timer #{id} fires at {now} ms, callback {callback:#010x}"
+            ));
+        }
         let mut esp = self.cpu.regs.esp;
         for value in [0, 0, user, 0, id] {
             esp = esp.wrapping_sub(4);
@@ -378,10 +472,42 @@ impl Session {
     /// stdcall callee does; the dispatch table's arity is a cross-check, never
     /// the source of truth.
     fn serve(&mut self, call: &HostCall) -> Result<Option<Served>> {
+        // A name the guest resolved with `GetProcAddress` and called: the binding
+        // is the host's own, and its declared signature is what the stack is
+        // popped by, since there was never an import slot to record one.
+        if let Some(index) = call.proc {
+            let Some(binding) = self.host.procs.get(index).copied() else {
+                return Err(format!(
+                    "call to the resolved name {index} (address {:#010x}), which this host never handed out",
+                    call.iat_va
+                ));
+            };
+            self.host.this = self.cpu.regs.ecx;
+            let mut arguments = shim::Call {
+                memory: &mut self.memory,
+                args: call.args,
+                arg_bytes: binding.arg_bytes,
+            };
+            let action = (binding.shim)(&mut self.host, &mut arguments)
+                .map_err(|error| named(binding, &error))?;
+            let popped = if shim::is_cdecl(binding.dll, binding.name) {
+                0
+            } else {
+                binding.arg_bytes
+            };
+            self.last_import = Some(format!(
+                "{} (resolved) args={:#010x} eax={:#010x}",
+                binding.name,
+                call.args,
+                action_value(action)
+            ));
+            return self.finish(action, call.args, popped, Some(binding)).map(Some);
+        }
         // A call through a host object carries its own interface and method, and
         // the argument count comes from the same table the step loop used.
         if let Some((kind, method)) = call.thunk {
             let arg_bytes = crate::thunks::arg_bytes(kind, method);
+            self.host.this = self.cpu.regs.ecx;
             let mut arguments = shim::Call {
                 memory: &mut self.memory,
                 args: call.args,
@@ -392,12 +518,9 @@ impl Session {
                 "{} args={:#010x} eax={:#010x}",
                 crate::thunks::label(kind, method),
                 call.args,
-                match action {
-                    Action::Return(value) => value,
-                    Action::Exit(code) => code,
-                }
+                action_value(action)
             ));
-            return self.finish(action, call.args, arg_bytes).map(Some);
+            return self.finish(action, call.args, arg_bytes, None).map(Some);
         }
         let Some(slot) = self.target.table.slots.get(call.slot) else {
             return Err(format!("slot {} is outside the dispatch table", call.slot));
@@ -416,22 +539,38 @@ impl Session {
             }
         }
 
+        // `__thiscall` passes `this` in `ecx`, which is the only way a C++ member
+        // function can be served: the shim reads it from here.
+        self.host.this = self.cpu.regs.ecx;
         let mut arguments = shim::Call {
             memory: &mut self.memory,
             args: call.args,
             arg_bytes: binding.arg_bytes,
         };
-        let action = (binding.shim)(&mut self.host, &mut arguments)?;
+        // A shim that fails names the import it failed on: the address a fault
+        // reports is the guest's, which on its own does not say whose fault it is.
+        let action =
+            (binding.shim)(&mut self.host, &mut arguments).map_err(|error| named(binding, &error))?;
+        // A cdecl import leaves its arguments for the caller's own `add esp`.
+        let popped = if shim::is_cdecl(slot.dll, &slot.name) {
+            0
+        } else {
+            binding.arg_bytes
+        };
         self.last_import = Some(format!(
             "{} args={:#010x} eax={:#010x}",
             slot.label(),
             call.args,
-            match action {
-                Action::Return(value) => value,
-                Action::Exit(code) => code,
-            }
+            action_value(action)
         ));
-        self.finish(action, call.args, binding.arg_bytes).map(Some)
+        if std::env::var("SHIMKIT_LOG_CALLS").is_ok() {
+            println!(
+                "{:14} {}",
+                self.cpu.instructions,
+                self.last_import.as_deref().unwrap_or_default()
+            );
+        }
+        self.finish(action, call.args, popped, Some(binding)).map(Some)
     }
 
     /// Completes a host call whose shim has run.
@@ -441,16 +580,41 @@ impl Session {
     /// and `CALL_TRAMPOLINE` as its return address, the import's own frame is
     /// suspended under it, and the value the routine leaves in `eax` finishes the
     /// import when the trampoline is reached.
-    fn finish(&mut self, action: Action, args: u32, arg_bytes: u32) -> Result<Served> {
+    ///
+    /// `resumable` is the import the shim belongs to, when it asked to run again
+    /// after the routine returns -- a table walk needs one entry per pass.
+    fn finish(
+        &mut self,
+        action: Action,
+        args: u32,
+        arg_bytes: u32,
+        resumable: Option<&'static shim::Binding>,
+    ) -> Result<Served> {
         if let Some(request) = self.host.guest_call.take() {
-            self.start_guest_call(request, args, arg_bytes)?;
+            let resume = if request.resume { resumable } else { None };
+            self.enter_guest_call(request, args, arg_bytes, resume)?;
             return Ok(Served::Call);
         }
         // stdcall: the callee pops its arguments.
         self.cpu.regs.esp = args.wrapping_add(arg_bytes);
         Ok(match action {
             Action::Return(value) => Served::Return(value),
+            Action::Return64(value) => {
+                // A 64-bit result is `edx:eax`, and a caller that ignores the
+                // high half must still see it zeroed rather than whatever the
+                // previous call left.
+                self.cpu.regs.edx = (value >> 32) as u32;
+                Served::Return(value as u32)
+            }
             Action::Exit(code) => Served::Exit(code),
+            Action::Float(op) => {
+                let (value, high) = self.cpu.fpu.apply(op);
+                // `_ftol` answers in `edx:eax`, and a `double` return leaves the
+                // high word zero because the caller only reads `eax` when it does
+                // not take the float stack.
+                self.cpu.regs.edx = high;
+                Served::Return(value)
+            }
         })
     }
 
@@ -461,6 +625,17 @@ impl Session {
     /// calling it; it is public so a port can drive a routine directly when it
     /// needs to probe the guest.
     pub fn start_guest_call(&mut self, request: GuestCall, args: u32, arg_bytes: u32) -> Result<()> {
+        self.enter_guest_call(request, args, arg_bytes, None)
+    }
+
+    /// The same entry, with the import to run again when the routine returns.
+    fn enter_guest_call(
+        &mut self,
+        request: GuestCall,
+        args: u32,
+        arg_bytes: u32,
+        resume: Option<&'static shim::Binding>,
+    ) -> Result<()> {
         let mut esp = self.cpu.regs.esp;
         for value in request.args.iter().rev() {
             esp = esp.wrapping_sub(4);
@@ -473,6 +648,8 @@ impl Session {
             fpu: self.cpu.fpu.clone(),
             args,
             arg_bytes,
+            answer: request.answer,
+            resume,
         });
         self.cpu.regs.esp = esp;
         self.cpu.regs.eip = request.entry;
@@ -497,6 +674,23 @@ impl Session {
     /// `DLL!Function` for the slot a host call went through.
     pub fn label(&self, call: &HostCall) -> String {
         label(call, self.target.table)
+    }
+}
+
+/// A shim's error, prefixed with the import it came from.
+fn named(binding: &shim::Binding, error: &str) -> String {
+    format!("{}!{}: {error}", binding.dll, binding.name)
+}
+
+/// The value the trace prints for an action. A float result lives on the x87
+/// stack rather than in `eax`, so the line names the import and leaves the value
+/// out instead of guessing at one.
+fn action_value(action: Action) -> u32 {
+    match action {
+        Action::Return(value) => value,
+        Action::Return64(value) => value as u32,
+        Action::Exit(code) => code,
+        Action::Float(_) => 0,
     }
 }
 

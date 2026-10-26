@@ -55,6 +55,7 @@ impl GuestMemory {
             size_of_headers,
             sections,
             imports,
+            ..
         } = image;
 
         if image_base != IMAGE_BASE {
@@ -225,10 +226,52 @@ impl GuestMemory {
         Ok(&self.store[start..start + len])
     }
 
+    /// The tail of memory from `va`, when the address maps. Reads narrower than
+    /// the tail run their own bounds check against its length, so the single
+    /// word and byte reads below cost one subtraction and two compares instead
+    /// of a call into [`Self::read_bytes`] with a `Result` and a slice.
+    ///
+    /// The interpreter retires tens of millions of loads a second through here,
+    /// which is why the plain case is written out rather than reasoned about.
+    #[inline]
+    fn tail(&self, va: u32) -> Option<&[u8]> {
+        self.store.get(va.wrapping_sub(IMAGE_BASE) as usize..)
+    }
+
+    /// The same as [`Self::tail`], for a write. Nothing under `IMAGE_BASE` and
+    /// nothing past [`MEMORY_TOP`] maps, and the image is checked against its
+    /// sections by [`Self::check_writable`] instead.
+    #[inline]
+    fn tail_mut(&mut self, va: u32) -> Option<&mut [u8]> {
+        self.store
+            .get_mut(va.wrapping_sub(IMAGE_BASE) as usize..)
+    }
+
+    /// Whether a plain store at `va` is allowed without consulting the section
+    /// table: above the TEB, which is where the stack and the heap live.
+    ///
+    /// The same range [`Self::check_writable`] accepts, so the fast path answers
+    /// what the slow one would: below it is the image, whose sections decide, and
+    /// between the image and the TEB nothing is mapped at all.
+    #[inline]
+    fn unchecked_write(va: u32, len: usize) -> bool {
+        va >= TEB_BASE && va as u64 + len as u64 <= MEMORY_TOP as u64
+    }
+
+    #[inline]
     pub fn write_bytes(&mut self, va: u32, bytes: &[u8]) -> Result<()> {
-        self.check_writable(va, bytes.len())?;
-        let start = self.offset(va, bytes.len())?;
-        self.store[start..start + bytes.len()].copy_from_slice(bytes);
+        let len = bytes.len();
+        if Self::unchecked_write(va, len) {
+            if let Some(target) = self.tail_mut(va) {
+                if target.len() >= len {
+                    target[..len].copy_from_slice(bytes);
+                    return Ok(());
+                }
+            }
+        }
+        self.check_writable(va, len)?;
+        let start = self.offset(va, len)?;
+        self.store[start..start + len].copy_from_slice(bytes);
         Ok(())
     }
 
@@ -250,31 +293,77 @@ impl GuestMemory {
         Ok(())
     }
 
+    #[inline]
     pub fn read_u8(&self, va: u32) -> Result<u8> {
+        if let Some(tail) = self.tail(va) {
+            if let Some(first) = tail.first() {
+                return Ok(*first);
+            }
+        }
         Ok(self.read_bytes(va, 1)?[0])
     }
 
+    #[inline]
     pub fn write_u8(&mut self, va: u32, value: u8) -> Result<()> {
+        if Self::unchecked_write(va, 1) {
+            if let Some(target) = self.tail_mut(va) {
+                if let Some(first) = target.first_mut() {
+                    *first = value;
+                    return Ok(());
+                }
+            }
+        }
         self.write_bytes(va, &[value])
     }
 
+    #[inline]
     pub fn read_u16(&self, va: u32) -> Result<u16> {
+        if let Some(tail) = self.tail(va) {
+            if tail.len() >= 2 {
+                return Ok(u16::from_le_bytes([tail[0], tail[1]]));
+            }
+        }
         Ok(u16::from_le_bytes(self.read_bytes(va, 2)?.try_into().unwrap()))
     }
 
+    #[inline]
     pub fn write_u16(&mut self, va: u32, value: u16) -> Result<()> {
+        if Self::unchecked_write(va, 2) {
+            if let Some(target) = self.tail_mut(va) {
+                if target.len() >= 2 {
+                    target[..2].copy_from_slice(&value.to_le_bytes());
+                    return Ok(());
+                }
+            }
+        }
         self.write_bytes(va, &value.to_le_bytes())
     }
 
+    #[inline]
     pub fn read_u32(&self, va: u32) -> Result<u32> {
+        if let Some(tail) = self.tail(va) {
+            if tail.len() >= 4 {
+                return Ok(u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]));
+            }
+        }
         Ok(u32::from_le_bytes(self.read_bytes(va, 4)?.try_into().unwrap()))
     }
 
+    #[inline]
     pub fn read_i32(&self, va: u32) -> Result<i32> {
         Ok(self.read_u32(va)? as i32)
     }
 
+    #[inline]
     pub fn write_u32(&mut self, va: u32, value: u32) -> Result<()> {
+        if Self::unchecked_write(va, 4) {
+            if let Some(target) = self.tail_mut(va) {
+                if target.len() >= 4 {
+                    target[..4].copy_from_slice(&value.to_le_bytes());
+                    return Ok(());
+                }
+            }
+        }
         self.write_bytes(va, &value.to_le_bytes())
     }
 

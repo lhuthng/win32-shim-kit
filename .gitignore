@@ -1,8 +1,17 @@
 target/
+# Scratch space: downloaded games, extracted folders, one-off probes.
+tmp/
 *.wasm
+# The demo ships the module its payloads run on; everything else under `dist/`
+# stays out of the repository.
+!demo/payloads/*/host_wasm.wasm
+demo-site/node_modules/
 __pycache__/
 *.pyc
 .DS_Store
 release/
 # A built payload: the module plus the game's own files, which the kit never owns.
 dist/
+# Not shipped yet: the payload is baked and played locally, but the game's files
+# are not in the repository and the demo does not list it.
+demo/payloads/ntsd-community/

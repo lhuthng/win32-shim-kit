@@ -49,6 +49,19 @@ rm -f "$out/index.html" "$out/main.js" "$out/style.css"
 
 if [ -n "$install" ]; then
     "$here/target/debug/shimkit-bake" "$install" "$out"
+    # The settings that belong to the game rather than to the page: the frame
+    # rate it was written for, and whether a click should hand it the pointer.
+    # Written once and then left alone -- a rebuilt payload must not throw away
+    # the numbers someone worked out for it.
+    if [ ! -f "$out/config.json" ]; then
+        cat > "$out/config.json" <<'JSON'
+{
+  "fps": null,
+  "mouse": "lock"
+}
+JSON
+        printf '%s\n' "wrote $out/config.json (fps: null runs as fast as the host allows)"
+    fi
 else
     rm -rf "$out/game" "$out/artifact.json"
     printf '%s\n' 'no install directory given: the payload has no game'
