@@ -1,6 +1,6 @@
 <script>
   import { onDestroy } from "svelte";
-  import { boot } from "./lib/player.js";
+  import { boot, resumeAudio } from "./lib/player.js";
 
   export let slug;
   /** The files this game saves, from `payloads/index.json`; `null` keeps all. */
@@ -30,10 +30,11 @@
 
   async function start() {
     if (session || starting) return;
-    // `session` is null until the module has booted, so this cannot start audio
-    // here: the browser's gesture rule is satisfied again by the first click on
-    // the canvas, which is also what takes the pointer.
-    session?.resumeAudio();
+    // Before anything is awaited: this click is the browser's gesture, and a
+    // context created after the first `await` in here is one the browser keeps
+    // suspended. A game that plays music on its title screen would then be
+    // silent until the frame itself was clicked.
+    resumeAudio();
     starting = true;
     error = "";
     diagnostic = "";
@@ -176,7 +177,7 @@
 
   function onPointerDown(event) {
     if (!session) return;
-    session.resumeAudio();
+    resumeAudio();
     const button = BUTTONS[event.button] ?? 0;
     // No position: the button lands where the guest's cursor already is, which
     // is where the player put it. A window that acts on `WM_LBUTTONDOWN` reads
@@ -225,7 +226,7 @@
   <!-- The frame is shown at the guest's own size and aspect: a game that asks for
        794x550 is not a 4:3 window, and stretching it to one moves every pixel. -->
   <div class="flex justify-center">
-    <div class="relative overflow-hidden rounded-xl border border-line bg-charcoal">
+    <div class="relative overflow-hidden rounded-xl border border-line bg-panel">
       <canvas
         bind:this={canvas}
         width="640"
@@ -239,7 +240,7 @@
       ></canvas>
 
       {#if !session}
-        <div class="absolute inset-0 grid place-content-center justify-items-center gap-3 bg-charcoal/85 px-6 text-center">
+        <div class="absolute inset-0 grid place-content-center justify-items-center gap-3 bg-panel/85 px-6 text-center">
           <button
             type="button"
             on:click={start}
@@ -257,48 +258,31 @@
   </div>
 
   <div class="mt-4 flex flex-wrap items-center gap-2">
-    <button
-      type="button"
-      on:click={start}
-      disabled={Boolean(session) || starting}
-      class="rounded-lg bg-charcoal px-4 py-1.5 text-sm font-semibold text-white transition hover:bg-charcoal/85 disabled:opacity-40"
-    >
-      Start
-    </button>
-    <button
-      type="button"
-      on:click={togglePause}
-      disabled={!session}
-      class="rounded-lg border border-line px-4 py-1.5 text-sm font-semibold transition hover:border-violet disabled:opacity-40"
-    >
-      {paused ? "Resume" : "Pause"}
-    </button>
-    <button
-      type="button"
-      on:click={stop}
-      disabled={!session}
-      class="rounded-lg border border-line px-4 py-1.5 text-sm font-semibold transition hover:border-violet disabled:opacity-40"
-    >
-      Stop
-    </button>
-    <button
-      type="button"
-      on:click={() => (locked ? releasePointer() : lockPointer())}
-      disabled={!session}
-      class="rounded-lg border border-line px-4 py-1.5 text-sm font-semibold transition hover:border-violet disabled:opacity-40"
-    >
-      {locked ? "Release mouse" : "Lock mouse"}
-    </button>
+    {#if session}
+      <button
+        type="button"
+        on:click={togglePause}
+        class="rounded-lg border border-line px-4 py-1.5 text-sm font-semibold transition hover:border-violet"
+      >
+        {paused ? "Resume" : "Pause"}
+      </button>
+      <button
+        type="button"
+        on:click={stop}
+        class="rounded-lg border border-line px-4 py-1.5 text-sm font-semibold transition hover:border-violet"
+      >
+        Stop
+      </button>
+      <button
+        type="button"
+        on:click={() => (locked ? releasePointer() : lockPointer())}
+        class="rounded-lg border border-line px-4 py-1.5 text-sm font-semibold transition hover:border-violet"
+      >
+        {locked ? "Release mouse" : "Lock mouse"}
+      </button>
+    {/if}
     <span class="ml-auto font-mono text-xs text-muted">{status}</span>
   </div>
-
-  {#if session}
-    <p class="mt-3 text-sm text-muted">
-      The canvas forwards the keyboard and the pointer to the guest. Click inside the frame to
-      hand the game the mouse: it then gets movement rather than a position, so its cursor never
-      stops at the edge, and Escape returns it. Until then the game follows the pointer normally.
-    </p>
-  {/if}
 
   {#if diagnostic && halted}
     <p class="mt-3 font-mono text-xs break-words text-orange">{diagnostic}</p>

@@ -59,6 +59,16 @@ const WFX_BITS: u32 = 14;
 const WFX_BYTES: u32 = 18;
 const WAVE_FORMAT_PCM: u16 = 1;
 
+/// `DSCAPS_*` bits, which say what a device can mix.
+const DSCAPS_PRIMARYMONO: u32 = 0x0000_0001;
+const DSCAPS_PRIMARYSTEREO: u32 = 0x0000_0002;
+const DSCAPS_PRIMARY8BIT: u32 = 0x0000_0004;
+const DSCAPS_PRIMARY16BIT: u32 = 0x0000_0008;
+const DSCAPS_SECONDARYMONO: u32 = 0x0000_0100;
+const DSCAPS_SECONDARYSTEREO: u32 = 0x0000_0200;
+const DSCAPS_SECONDARY8BIT: u32 = 0x0000_0400;
+const DSCAPS_SECONDARY16BIT: u32 = 0x0000_0800;
+
 /// The largest secondary buffer this host accepts. The files are WAVs, not
 /// archives, and a non-WAV descriptor should fail loudly rather than eat the
 /// arena.
@@ -73,6 +83,11 @@ pub const EVENT_RELEASE: u32 = 3;
 /// again and replaces the voice's PCM, which is how `BGM.dat` streaming keeps
 /// feeding the mixer past the first snapshot.
 pub const EVENT_DATA: u32 = 4;
+/// The guest moved a voice's playhead with `SetCurrentPosition`. The byte offset
+/// is the event's `bytes`; a mixer keeps its own playhead, so this is the only
+/// way it learns that a buffer was rewound (`Stop`, seek to zero, `Play`, which
+/// is how Cave Story starts a drum).
+pub const EVENT_SEEK: u32 = 5;
 /// Event record: eleven little-endian dwords.
 pub const EVENT_WORDS: usize = 11;
 
@@ -303,6 +318,41 @@ pub(crate) fn serve(
     kind: u8,
     name: &'static str,
 ) -> Result<Action> {
+    // `SHIMKIT_LOG_AUDIO` traces every call into the device, which is the only
+    // way to see how a guest drives its mixer: a buffer that is played once and
+    // never refilled looks the same as one that is never played at all from the
+    // outside, and the two have different causes.
+    // The rendering pass creates a buffer per track and locks each one in small
+    // pieces, which is thousands of calls: only the playback lifecycle is traced.
+    // `SHIMKIT_LOG_AUDIO_ALL` traces every method instead, which says where a
+    // guest stops talking to its mixer at all -- a device that is never asked to
+    // play anything is a different fault from one that plays silence.
+    let every = std::env::var("SHIMKIT_LOG_AUDIO_ALL").is_ok();
+    if every {
+        let caller = call.memory.read_u32(call.args.wrapping_sub(4)).unwrap_or(0);
+        // Straight to stdout, uncapped: an init burst fills the notice list, and
+        // the calls after it are the ones worth reading.
+        println!(
+            "audio {name} args={:08x},{:08x},{:08x},{:08x} at {caller:#010x}",
+            call.arg(0).unwrap_or(0),
+            call.arg(1).unwrap_or(0),
+            call.arg(2).unwrap_or(0),
+            call.arg(3).unwrap_or(0),
+        );
+    }
+    if std::env::var("SHIMKIT_LOG_AUDIO").is_ok()
+        && host.notices.len() < 600
+        && matches!(name, "Play" | "Stop" | "GetCurrentPosition" | "GetStatus")
+    {
+        host.notice(format!(
+            "audio {name} this={:#010x} args={:08x},{:08x},{:08x},{:08x}",
+            call.arg(0).unwrap_or(0),
+            call.arg(1).unwrap_or(0),
+            call.arg(2).unwrap_or(0),
+            call.arg(3).unwrap_or(0),
+            call.arg(4).unwrap_or(0)
+        ));
+    }
     match (kind, name) {
         (_, "QueryInterface") => Ok(Return(E_NOINTERFACE)),
         (_, "AddRef") => Ok(Return(add_ref(host, call.arg(0)?))),
@@ -318,6 +368,22 @@ pub(crate) fn serve(
             let caps = call.arg(1)?;
             if caps != 0 {
                 call.zero(caps, 96)?;
+                // `DSDCAPS`: the size, then what this device can mix. A page
+                // mixes 8- and 16-bit, mono and stereo at any rate, so saying so
+                // is the truth -- and a game that only asks the device what it
+                // can do before enabling its music decides on this answer.
+                call.write_u32(caps, 96)?;
+                call.write_u32(
+                    caps + 4,
+                    DSCAPS_PRIMARYMONO
+                        | DSCAPS_PRIMARYSTEREO
+                        | DSCAPS_PRIMARY8BIT
+                        | DSCAPS_PRIMARY16BIT
+                        | DSCAPS_SECONDARYMONO
+                        | DSCAPS_SECONDARYSTEREO
+                        | DSCAPS_SECONDARY8BIT
+                        | DSCAPS_SECONDARY16BIT,
+                )?;
             }
             Ok(Return(DS_OK))
         }
@@ -338,7 +404,14 @@ pub(crate) fn serve(
         (thunks::DSOUND_BUFFER, "Play") => play(host, call),
         (thunks::DSOUND_BUFFER, "Stop") => {
             let this = call.arg(0)?;
+            // The play cursor stays where the sound got to, and `Play` resumes
+            // from it, so it has to be turned into a frozen offset here rather
+            // than left to go on advancing while nothing plays.
+            let position = position_of(host, this);
+            let now = host.now_ms();
             if let Some(buffer) = host.audio.buffers.get_mut(&this) {
+                buffer.start_bytes = position;
+                buffer.started_ms = now;
                 buffer.playing = false;
                 let event = AudioEvent {
                     kind: EVENT_STOP,
@@ -371,10 +444,18 @@ pub(crate) fn serve(
             let this = call.arg(0)?;
             let position = call.arg(1)?;
             let now = host.now_ms();
+            let mut start = position;
             if let Some(buffer) = host.audio.buffers.get_mut(&this) {
                 buffer.start_bytes = position.min(buffer.size);
                 buffer.started_ms = now;
+                start = buffer.start_bytes;
             }
+            host.audio.events.push(AudioEvent {
+                kind: EVENT_SEEK,
+                voice: this,
+                bytes: start,
+                ..AudioEvent::default()
+            });
             Ok(Return(DS_OK))
         }
         (thunks::DSOUND_BUFFER, "SetVolume") => {
@@ -612,6 +693,17 @@ fn create_sound_buffer(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let primary = flags & DSBCAPS_PRIMARYBUFFER != 0;
     let bytes = call.memory.read_u32(desc + DESC_BYTES)?;
     let format_address = call.memory.read_u32(desc + DESC_FORMAT)?;
+    if std::env::var("SHIMKIT_LOG_AUDIO").is_ok() && host.notices.len() < 600 {
+        // The caller's address, so a stream of buffer creations names the routine
+        // that asked for them rather than only their sizes.
+        let caller = call.memory.read_u32(call.args.wrapping_sub(4)).unwrap_or(0);
+        host.notice(format!(
+            "audio buffer {bytes} bytes, flags {:#x}, format {:#x} at {:#010x}",
+            call.memory.read_u32(desc + DESC_FLAGS).unwrap_or(0),
+            format_address,
+            caller
+        ));
+    }
 
     if !primary {
         if bytes == 0 || bytes > MAX_SOUND_BYTES {
@@ -666,6 +758,9 @@ fn lock(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         return Ok(Return(DSERR_INVALIDPARAM));
     };
     if buffer.primary {
+        if std::env::var("SHIMKIT_LOG_AUDIO").is_ok() && host.notices.len() < 600 {
+            host.notice("audio Lock on the primary buffer was refused".to_string());
+        }
         return Ok(Return(DSERR_INVALIDPARAM));
     }
     if offset > buffer.size {
@@ -729,7 +824,16 @@ fn unlock(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     Ok(Return(DS_OK))
 }
 
-fn play(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {    let this = call.arg(0)?;
+/// `Play`: start at the play cursor.
+///
+/// It does not rewind. A buffer that is already playing keeps its position and
+/// only takes the new loop flag, which is what a guest that sustains a looping
+/// waveform and retunes it relies on: Organya plays a note by setting the
+/// frequency and calling `Play` again, and rewinding there would cut the wave
+/// at every note, heard as a click per note. A guest that wants the start of
+/// the buffer says so, with `Stop` and `SetCurrentPosition`.
+fn play(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let this = call.arg(0)?;
     let flags = call.arg(3)?;
     let Some(buffer) = host.audio.buffers.get(&this) else {
         return Ok(Return(DSERR_INVALIDPARAM));
@@ -742,10 +846,14 @@ fn play(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {    let this = 
     host.audio.plays += 1;
     let event = {
         let buffer = host.audio.buffers.get_mut(&this).expect("the buffer was just read");
+        let resuming = !buffer.playing;
         buffer.playing = true;
         buffer.looping = flags & DSBPLAY_LOOPING != 0;
-        buffer.started_ms = now;
-        buffer.start_bytes = 0;
+        if resuming {
+            // Stopped: the cursor was frozen at `start_bytes`, and playing goes
+            // on from there. Still playing: leave the cursor alone.
+            buffer.started_ms = now;
+        }
         buffer.pcm = pcm;
         play_event(buffer, this)
     };
@@ -988,6 +1096,52 @@ mod tests {
             serve(&mut host, &mut status, thunks::DSOUND_BUFFER, "GetStatus").unwrap(),
             Return(0)
         );
+    }
+
+    /// A second `Play` is not a rewind: Organya sustains a looping waveform and
+    /// retunes it, and starting it over at every note is a click per note.
+    #[test]
+    fn play_leaves_a_playing_buffer_where_it_is() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        host.set_clock(1_000);
+        let device = open(&mut host, &mut memory);
+        // 22050 frames at 22050 Hz is one second, so a millisecond is 22 bytes.
+        let buffer = create_secondary(&mut host, &mut memory, device, 44_100, 1, 22_050);
+        let position = |host: &mut Host, memory: &mut GuestMemory| {
+            let out = STACK_BASE + 0x7500;
+            let mut call = invoke(memory, &[buffer, out, 0]);
+            serve(host, &mut call, thunks::DSOUND_BUFFER, "GetCurrentPosition").unwrap();
+            call.memory.read_u32(out).unwrap()
+        };
+        let mut play = invoke(&mut memory, &[buffer, 0, 0, 1]);
+        serve(&mut host, &mut play, thunks::DSOUND_BUFFER, "Play").unwrap();
+        host.set_clock(1_500);
+        assert_eq!(position(&mut host, &mut memory), 11_025);
+        // The same call again, half a second in, keeps the cursor there.
+        let mut play = invoke(&mut memory, &[buffer, 0, 0, 1]);
+        serve(&mut host, &mut play, thunks::DSOUND_BUFFER, "Play").unwrap();
+        assert_eq!(position(&mut host, &mut memory), 11_025);
+        // Stop and Play resumes from where it stopped rather than from zero.
+        let mut stop = invoke(&mut memory, &[buffer]);
+        serve(&mut host, &mut stop, thunks::DSOUND_BUFFER, "Stop").unwrap();
+        host.set_clock(3_000);
+        let mut play = invoke(&mut memory, &[buffer, 0, 0, 1]);
+        serve(&mut host, &mut play, thunks::DSOUND_BUFFER, "Play").unwrap();
+        assert_eq!(position(&mut host, &mut memory), 11_025);
+        // SetCurrentPosition is how a guest asks for the start, and the play
+        // after it starts there.
+        let mut seek = invoke(&mut memory, &[buffer, 0]);
+        serve(&mut host, &mut seek, thunks::DSOUND_BUFFER, "SetCurrentPosition").unwrap();
+        assert_eq!(position(&mut host, &mut memory), 0);
+        // The page keeps its own playhead, so a rewind has to reach it: an
+        // event carrying the byte the guest asked for, or the mixer keeps
+        // playing from where it was and a drum restarted this way is silent.
+        let event = host.audio.events().last().copied().unwrap();
+        assert_eq!(event.kind, EVENT_SEEK);
+        assert_eq!(event.voice, buffer);
+        assert_eq!(event.bytes, 0);
     }
 
     #[test]

@@ -385,24 +385,15 @@ impl Host {
     /// Sets the guest's clock, in milliseconds. Monotonic, and only ever read as
     /// a difference, so any origin works: the page passes `performance.now()`.
     ///
-    /// A clock that has run ahead -- because the guest slept, see
-    /// [`Host::advance_clock`] -- is not moved back: `GetTickCount` that goes
-    /// backwards makes every "is the next frame due yet" test wrong.
+    /// It is not moved back: `GetTickCount` that goes backwards makes every "is
+    /// the next frame due yet" test wrong. Nothing here ever moves it forward
+    /// either, which is the point: the only clock a guest sees is the embedder's,
+    /// so a game that waits for its own next frame waits for real time. Moving
+    /// it forward on a `Sleep` was how this host used to invent time, and a game
+    /// then ran at whatever rate the interpreter could manage -- Cave Story's
+    /// clock measured 44x real time that way.
     pub fn set_clock(&mut self, milliseconds: u64) {
         self.clock_ms = Some(milliseconds.max(self.clock_ms.unwrap_or(0)));
-    }
-
-    /// Moves the guest's clock forward, which is what a wait does.
-    ///
-    /// A program that waits for its next frame does it with `Sleep` in a loop
-    /// against `GetTickCount`. The page hands this host a clock once a frame, so
-    /// between two frames the time it reads never changes: the loop could only
-    /// end when the page came back, and it spent everything the page gave it
-    /// spinning. A sleep moves the clock, exactly as a sleeping thread's clock
-    /// moves, so the loop ends after the number of waits the program asked for.
-    pub fn advance_clock(&mut self, milliseconds: u64) {
-        let now = self.clock_ms.unwrap_or(0);
-        self.clock_ms = Some(now.saturating_add(milliseconds));
     }
 
     /// The guest's time in milliseconds: the embedder's clock when it supplied

@@ -519,11 +519,18 @@ fn find_with(
     name: crate::pe::ResourceKey,
     kind: crate::pe::ResourceKey,
 ) -> Result<Action> {
-    let Some(index) = host
+    // Names compare the way Windows compares them, which is without case, so a
+    // guest that names a resource in its own spelling still finds it.
+    let found = host
         .resources
         .iter()
-        .position(|resource| resource.kind == kind && resource.name == name)
-    else {
+        .position(|resource| resource.kind.same(&kind) && resource.name.same(&name));
+    if std::env::var("SHIMKIT_LOG_RESOURCES").is_ok() {
+        // Which lookups a guest makes and which of them this host can answer is
+        // what separates "the game skipped it" from "the resource is missing".
+        println!("resource {kind:?}/{name:?} -> {}", found.is_some());
+    }
+    let Some(index) = found else {
         // A resource the image does not carry is the answer a game handles by
         // skipping it, so it is a return value and not a stop.
         host.last_error = ERROR_RESOURCE_NAME_NOT_FOUND;
@@ -1003,19 +1010,20 @@ fn is_bad_pointer(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
     Ok(Return(0))
 }
 
-/// The guest's files come from the bundle, which is read-only, and the writable
-/// area that will hold saves does not exist yet. So nothing a caller can name has
-/// been written by this host, and "no such file" is the truth rather than a
-/// placeholder: the CRT's `remove()` maps it to `ENOENT`, which is exactly what a
-/// caller cleaning up a temp file that is not there should see.
-fn sleep(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
-    // A blocking sleep here would freeze the page, so the wait is spent on the
-    // guest's clock instead of on the host's: the thread asked for time to pass,
-    // and a program that waits for its next frame in `Sleep` against
-    // `GetTickCount` sees exactly that. Without it the wait loop can only end
-    // when the page hands a new clock, and it burns a frame's instructions doing
-    // nothing.
-    host.advance_clock(u64::from(call.arg(0)?));
+/// `Sleep(ms)`: a yield, and nothing else.
+///
+/// A thread that sleeps really does lose that much time, so the guest's own wait
+/// loop (`while (GetTickCount() - t < 20) Sleep(1);`) is how a game keeps its
+/// frame rate. Moving the clock forward here instead of waiting looked free and
+/// was not: the loop then ends after a handful of cheap instructions rather than
+/// after 20 ms, so the game runs at whatever rate the interpreter can manage and
+/// every fade, timer and animation written against `GetTickCount` runs with it.
+/// Cave Story's clock measured five times real time that way.
+///
+/// Nothing is moved. The embedder is the clock, it pushes real time before every
+/// chunk, and the guest spins until that clock says the wait is over -- the same
+/// loop, reading the same time, just no longer lied to.
+fn sleep(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
     Ok(Return(0))
 }
 

@@ -110,6 +110,19 @@ pub enum ResourceKey {
     Name(String),
 }
 
+impl ResourceKey {
+    /// Whether a lookup for `other` finds this key, which is Windows' rule and
+    /// not string equality: resource names are case-insensitive, so a game that
+    /// asks for its `ORG` song `"Curly"` finds the image's `CURLY`.
+    pub fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Id(mine), Self::Id(theirs)) => mine == theirs,
+            (Self::Name(mine), Self::Name(theirs)) => mine.eq_ignore_ascii_case(theirs),
+            _ => false,
+        }
+    }
+}
+
 /// One resource the image carries: its type, its name, and where its bytes are.
 ///
 /// The language level is dropped: this machine has one language, and a game that
@@ -251,7 +264,7 @@ impl Image {
         let Some(directory) = self.data_directory(optional, EXPORT_DIRECTORY)? else {
             return Ok(Vec::new());
         };
-        let mut offset = self
+        let offset = self
             .rva_to_offset(directory)
             .ok_or("export directory is not inside any section")?;
         let count = u32_at(&self.bytes, offset + 24)?;

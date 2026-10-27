@@ -15,6 +15,42 @@ const EVENT_UPDATE = 1;
 const EVENT_STOP = 2;
 const EVENT_RELEASE = 3;
 const EVENT_DATA = 4;
+/** The guest moved the playhead with `SetCurrentPosition`; its offset is in `bytes`. */
+const EVENT_SEEK = 5;
+
+/**
+ * The page's audio context, one for the whole page.
+ *
+ * It lives here rather than inside `boot` because a browser only lets a user
+ * gesture start a context, and `boot` runs after an `await` -- by then the
+ * click that started the game no longer counts and the context it creates stays
+ * suspended. A game whose first screen has music then plays that music into a
+ * context that never runs: the menu is silent and the sound only arrives at the
+ * first click on the frame, which is what resumes it.
+ */
+let audio = null;
+
+/**
+ * Starts the page's audio from a click.
+ *
+ * Called by the page's own controls, which are gestures the browser accepts,
+ * and safe to call before `boot`: the context is created on the first call and
+ * every session mixes into it.
+ */
+export function resumeAudio() {
+  audioContext();
+}
+
+/** The context to mix into, created on first use. */
+function audioContext() {
+  if (!audio) {
+    const Constructor = window.AudioContext ?? window.webkitAudioContext;
+    if (!Constructor) return null;
+    audio = new Constructor();
+  }
+  if (audio.state === "suspended") audio.resume().catch(() => {});
+  return audio;
+}
 
 /** PC set 1 scancodes, which are also the DIK_* names the host's input keeps. */
 const SCANCODES = {
@@ -166,7 +202,7 @@ export async function boot({
   const base = payloadUrl.endsWith("/") ? payloadUrl : `${payloadUrl}/`;
   onStatus("fetching payload");
 
-  const [artifact, fileList, wasmResponse, settings] = await Promise.all([
+  const [artifact, fileList, settings] = await Promise.all([
     fetch(`${base}artifact.json`).then((response) => {
       if (!response.ok) throw new Error(`artifact.json: HTTP ${response.status}`);
       return response.json();
@@ -175,16 +211,23 @@ export async function boot({
       if (!response.ok) throw new Error(`game/files.json: HTTP ${response.status}`);
       return response.json();
     }),
-    fetch(`${base}host_wasm.wasm`).then((response) => {
-      if (!response.ok) throw new Error(`host_wasm.wasm: HTTP ${response.status}`);
-      return response.arrayBuffer();
-    }),
     // Optional, and missing on every payload baked before it existed: the
     // settings that belong to this game rather than to the page.
     fetch(`${base}config.json`)
       .then((response) => (response.ok ? response.json() : {}))
       .catch(() => ({})),
   ]);
+
+  // The module's URL never changes, so a browser keeps whatever build it first
+  // fetched -- a page reload replays the old shims without saying so, which
+  // reads as a fix that did not take. The size the artifact records changes with
+  // every rebuild, so it is the cache key: the same build is fetched once, and a
+  // rebuilt payload cannot be missed.
+  const build = artifact.module?.bytes ?? 0;
+  const wasmResponse = await fetch(`${base}host_wasm.wasm?v=${build}`).then((response) => {
+    if (!response.ok) throw new Error(`host_wasm.wasm: HTTP ${response.status}`);
+    return response.arrayBuffer();
+  });
 
   const builds = Array.isArray(artifact.executables)
     ? artifact.executables
@@ -206,7 +249,7 @@ export async function boot({
     await (await fetch(`${base}game/${encodeURIComponent(executableEntry.name)}`)).arrayBuffer(),
   );
 
-  const { instance } = await WebAssembly.instantiate(await wasmResponse, {});
+  const { instance } = await WebAssembly.instantiate(wasmResponse, {});
   const host = instance.exports;
 
   const screen = artifact.screen ?? { width: 640, height: 480, depth: 8 };
@@ -302,6 +345,9 @@ export async function boot({
         refreshPalette();
         for (let x = 0; x < width; x += 1) out[line + x] = palette[memory[row + x]];
       } else if (depth === 16) {
+        // Five and six bit channels widen by repeating their top bits, which is
+        // how a display expands them: shifting alone caps white at 248,252,248,
+        // so every bright pixel comes out a shade dull and a shade green.
         for (let x = 0; x < width; x += 1) {
           const at = row + x * 2;
           const value = memory[at] | (memory[at + 1] << 8);
@@ -310,9 +356,9 @@ export async function boot({
           const blue = value & 0x1f;
           out[line + x] =
             0xff000000 |
-            ((blue << 3) << 16) |
-            ((green << 2) << 8) |
-            (red << 3);
+            (((blue << 3) | (blue >> 2)) << 16) |
+            (((green << 2) | (green >> 4)) << 8) |
+            ((red << 3) | (red >> 2));
         }
       } else {
         for (let x = 0; x < width; x += 1) {
@@ -331,32 +377,18 @@ export async function boot({
 
   // ---- audio --------------------------------------------------------------
 
-  let audio = null;
-  /** One entry per sound the page is mixing, keyed by the DirectSound voice. */
-  const voices = new Map();
   /**
-   * Plays waiting for the guest's samples.
-   *
-   * A guest that fills its buffer on a timer of its own can call `Play` before
-   * the samples are written, and the copy taken then is the silence that was
-   * there. These are re-read for a few frames until they hold something.
+   * One entry per sounding voice: its format, and where the playhead has got
+   * to. The samples are not copied -- the mixer reads them where the guest
+   * keeps them, so a buffer rewritten under a playing voice is heard as it is.
    */
-  const waiting = new Map();
-  /** How long a play waits for its samples, in milliseconds. */
-  const WAIT_MS = 250;
+  const voices = new Map();
+  /** Seconds of audio rendered into one queued block. */
+  const CHUNK = 0.05;
+  /** How far ahead of the audio clock the queue is kept filled. */
+  const AHEAD = 0.09;
 
-  function audioContext() {
-    if (!audio) {
-      const Constructor = window.AudioContext ?? window.webkitAudioContext;
-      if (!Constructor) return null;
-      audio = new Constructor();
-    }
-    if (audio.state === "suspended") audio.resume().catch(() => {});
-    return audio;
-  }
-
-  /** DirectSound volume is hundredths of a decibel: 0 is unity, -10000 silent. */
-  function gainOf(volume) {
+  /** DirectSound volume is hundredths of a decibel: 0 is unity, -10000 silent. */  function gainOf(volume) {
     if (!volume) return 1;
     return Math.min(1, Math.pow(10, volume / 2000));
   }
@@ -366,103 +398,139 @@ export async function boot({
     return Math.max(-1, Math.min(1, pan / 10000));
   }
 
+  /** One frame of a voice's buffer, as a fraction of full scale. */
+  function sampleAt(memory, base, index, bytes, bits) {
+    const at = base + index * bytes;
+    if (bits === 8) return (memory[at] - 128) / 128;
+    // 16-bit samples are signed and little-endian.
+    return (((memory[at] | (memory[at + 1] << 8)) << 16) >> 16) / 32768;
+  }
+
   /**
-   * A voice's samples as they are in guest memory right now.
+   * The bus every voice mixes into.
    *
-   * A DirectSound buffer is memory the guest writes into — at creation, or
-   * every frame when it streams — and `wh_audio_samples` hands back that
-   * memory, so this plays the sound as it stands rather than as it was when
-   * `Play` was called.
+   * A game hands DirectSound a dozen 8-bit voices at once and DirectSound adds
+   * them up; the sum passes full scale often enough that adding them here
+   * unguarded clips on every loud chord, which is heard as roughness over the
+   * music. A limiter is what keeps the sum inside the range without turning the
+   * game down.
    */
-  function samples(voice) {
-    if (host.wh_audio_samples) {
-      const address = host.wh_audio_samples(voice);
-      const length = host.wh_audio_samples_len(voice);
-      if (address && length) {
-        const offset = host.wh_memory_ptr() + address;
-        return new Uint8Array(host.memory.buffer, offset, length).slice();
+  let master = null;
+  function output(context) {
+    if (master) return master;
+    master = context.createGain();
+    if (context.createDynamicsCompressor) {
+      const limiter = context.createDynamicsCompressor();
+      limiter.threshold.value = -6;
+      limiter.knee.value = 6;
+      limiter.ratio.value = 12;
+      limiter.attack.value = 0.002;
+      limiter.release.value = 0.2;
+      master.connect(limiter);
+      limiter.connect(context.destination);
+    } else {
+      master.connect(context.destination);
+    }
+    return master;
+  }
+
+  /** Where the queue ends, on the audio clock. */
+  let queued = 0;
+
+  /**
+   * Renders one block of the mix and queues it.
+   *
+   * DirectSound is a mixer: it reads each voice's buffer at that voice's own
+   * play position, wraps a looping buffer and stops at the end of a one-shot.
+   * One `AudioBufferSource` per `Play` cannot express that -- it copies the
+   * samples once and loops that copy, so a note retuned under it keeps the old
+   * waveform, a buffer the guest rewrites is played stale, and every restart
+   * puts a step in the waveform. A step inside a period is a click; at the rate
+   * a low note plays, several of them per period is noise. So the sum is
+   * computed here, straight out of guest memory, and these blocks are the only
+   * thing Web Audio plays.
+   */
+  function mixBlock(context) {
+    const rate = context.sampleRate || 22_050;
+    const frames = Math.max(1, Math.round(CHUNK * rate));
+    const buffer = context.createBuffer(2, frames, rate);
+    const left = buffer.getChannelData(0);
+    const right = buffer.getChannelData(1);
+    const memory = new Uint8Array(host.memory.buffer);
+
+    for (const [voice, entry] of voices) {
+      if (entry.stopped) continue;
+      const spec = entry.spec;
+      const bytes = spec.channels * (spec.bits / 8);
+      if (!spec.channels || !spec.bits || !spec.rate || !bytes) continue;
+
+      // Live memory first: a streaming guest writes into the buffer it plays.
+      let base = 0;
+      let length = 0;
+      const address = host.wh_audio_samples ? host.wh_audio_samples(voice) : 0;
+      if (address) {
+        length = host.wh_audio_samples_len(voice);
+        base = host.wh_memory_ptr() + address;
       }
-    }
-    // A voice the guest released: the host kept the copy it took at `Play`.
-    const length = host.wh_audio_pcm_len(voice);
-    if (!length) return new Uint8Array(0);
-    return new Uint8Array(host.memory.buffer, host.wh_audio_pcm_ptr(voice), length).slice();
-  }
-
-  /** Whether every sample is the format's zero, so the guest has not written yet. */
-  function silent(pcm, bits) {
-    const zero = bits === 8 ? 0x80 : 0x00;
-    for (let index = 0; index < pcm.length; index += 1) {
-      if (pcm[index] !== zero) return false;
-    }
-    return true;
-  }
-
-  function stopVoice(voice) {
-    const entry = voices.get(voice);
-    if (!entry) return;
-    voices.delete(voice);
-    entry.source.onended = null;
-    try {
-      entry.source.stop();
-    } catch {
-      // A source that already ended throws; the nodes are gone either way.
-    }
-    entry.source.disconnect();
-    if (entry.panner) entry.panner.disconnect();
-    entry.gain.disconnect();
-  }
-
-  function startVoice(voice, spec, pcm) {
-    const context = audioContext();
-    if (!context) return;
-    const channels = spec.channels;
-    const rate = spec.rate;
-    const bits = spec.bits;
-    const bytesPerFrame = channels * (bits / 8);
-    if (!channels || !rate || !bytesPerFrame) return;
-    const frames = Math.floor(pcm.length / bytesPerFrame);
-    if (frames <= 0) return;
-
-    const buffer = context.createBuffer(channels, frames, rate);
-    const view = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-    for (let channel = 0; channel < channels; channel += 1) {
-      const out = buffer.getChannelData(channel);
-      for (let frame = 0; frame < frames; frame += 1) {
-        const at = frame * bytesPerFrame + channel * (bits / 8);
-        out[frame] =
-          bits === 8
-            ? (view.getUint8(at) - 128) / 128
-            : view.getInt16(at, true) / 32768;
+      if (!length) {
+        // A voice the guest released: the host kept the copy it took.
+        length = host.wh_audio_pcm_len ? host.wh_audio_pcm_len(voice) : 0;
+        base = host.wh_audio_pcm_ptr ? host.wh_audio_pcm_ptr(voice) : 0;
       }
+      const available = length ? Math.floor(length / bytes) : 0;
+      if (!available) continue;
+
+      // `frequency` is the playback rate in Hz against the buffer's own rate,
+      // which is what makes DirectSound's tiny looping waveforms notes.
+      const step = (spec.frequency || spec.rate) / spec.rate;
+      const gain = gainOf(spec.volume);
+      const angle = ((panOf(spec.pan) + 1) / 2) * (Math.PI / 2);
+      const leftGain = Math.cos(angle) * gain;
+      const rightGain = Math.sin(angle) * gain;
+
+      let position = entry.position;
+      if (position >= available) position = spec.looping ? position % available : available;
+      for (let index = 0; index < frames; index += 1) {
+        if (position >= available) {
+          if (!spec.looping) break;
+          position -= available;
+        }
+        const frame = Math.floor(position);
+        const next = frame + 1 < available ? frame + 1 : 0;
+        const between = position - frame;
+        const first = sampleAt(memory, base, frame, bytes, spec.bits);
+        const second = sampleAt(memory, base, next, bytes, spec.bits);
+        const value = first + (second - first) * between;
+        left[index] += value * leftGain;
+        right[index] += value * rightGain;
+        position += step;
+      }
+      entry.position = position;
     }
 
-    stopVoice(voice);
-    const gain = context.createGain();
-    gain.gain.value = gainOf(spec.volume);
-    const panner = context.createStereoPanner ? context.createStereoPanner() : null;
     const source = context.createBufferSource();
     source.buffer = buffer;
-    source.loop = spec.looping;
-    // `frequency` is the playback rate in Hz, which `SetFrequency` can change.
-    source.playbackRate.value = (spec.frequency || rate) / rate;
-    if (panner) {
-      panner.pan.value = panOf(spec.pan);
-      source.connect(panner);
-      panner.connect(gain);
-    } else {
-      source.connect(gain);
-    }
-    gain.connect(context.destination);
+    source.connect(output(context));
+    source.start(queued);
+    queued += frames / rate;
+  }
 
-    source.onended = () => {
-      if (voices.get(voice)?.source === source) voices.delete(voice);
-      source.disconnect();
-      if (panner) panner.disconnect();
-      gain.disconnect();
-    };
-    source.start();
-    voices.set(voice, { source, gain, panner });
+  /**
+   * Keeps a block or two queued ahead of the audio clock.
+   *
+   * Called once a frame, so the guest's samples are in memory before they are
+   * mixed, and a block is short enough that a stop or a retune is heard within
+   * a frame or two.
+   */
+  function pumpAudio() {
+    const context = audioContext();
+    if (!context || context.state === "suspended") return;
+    // Nothing queued, or the clock ran past the queue -- a pause, a stall, the
+    // first block. Start again from now rather than trying to catch up.
+    if (queued < context.currentTime + 0.005) queued = context.currentTime + 0.015;
+    for (let guard = 0; guard < 8 && queued < context.currentTime + AHEAD; guard += 1) {
+      mixBlock(context);
+    }
   }
 
   function drainAudio() {
@@ -476,74 +544,109 @@ export async function boot({
         const kind = words[at];
         const voice = words[at + 1];
         if (kind === EVENT_PLAY) {
-          waiting.set(voice, {
-            spec: {
-              channels: words[at + 2],
-              rate: words[at + 3],
-              volume: words[at + 5] | 0,
-              pan: words[at + 6] | 0,
-              looping: (words[at + 7] & 1) === 1,
-              frequency: words[at + 9],
-              bits: words[at + 10],
-            },
-            until: performance.now() + WAIT_MS,
-          });
-        } else if (kind === EVENT_STOP || kind === EVENT_RELEASE) {
-          waiting.delete(voice);
-          stopVoice(voice);
+          const spec = {
+            channels: words[at + 2],
+            rate: words[at + 3],
+            volume: words[at + 5] | 0,
+            pan: words[at + 6] | 0,
+            looping: (words[at + 7] & 1) === 1,
+            frequency: words[at + 9],
+            bits: words[at + 10],
+          };
+          const sounding = voices.get(voice);
+          if (sounding) {
+            // `Play` starts at the play cursor, so a voice that is already
+            // sounding keeps playing: this is a sustained looping waveform
+            // being retuned, not a new note.
+            sounding.spec = { ...sounding.spec, ...spec };
+            sounding.stopped = false;
+          } else {
+            voices.set(voice, { spec, position: 0, stopped: false });
+          }
+        } else if (kind === EVENT_STOP) {
+          // A stopped buffer keeps its play cursor, in the guest and here: the
+          // `Play` that follows resumes where it stopped.
+          const entry = voices.get(voice);
+          if (entry) entry.stopped = true;
+        } else if (kind === EVENT_RELEASE) {
+          voices.delete(voice);
+        } else if (kind === EVENT_SEEK) {
+          // The guest moved the playhead itself, which is how a drum restarts:
+          // `iw` is the byte it asked for.
+          const entry = voices.get(voice);
+          if (entry) {
+            const bytes = entry.spec.channels * (entry.spec.bits / 8);
+            entry.position = bytes ? words[at + 8] / bytes : 0;
+          }
         } else if (kind === EVENT_UPDATE) {
           const entry = voices.get(voice);
           if (entry) {
-            entry.gain.gain.value = gainOf(words[at + 5] | 0);
-            if (entry.panner) entry.panner.pan.value = panOf(words[at + 6] | 0);
-            const rate = words[at + 3];
-            const frequency = words[at + 9];
-            if (rate && frequency) entry.source.playbackRate.value = frequency / rate;
+            // An update carries the frequency and not the buffer's own rate --
+            // `SetFrequency` is how a game retunes a waveform it is already
+            // playing, which is every note of Cave Story's music.
+            entry.spec = {
+              ...entry.spec,
+              volume: words[at + 5] | 0,
+              pan: words[at + 6] | 0,
+              frequency: words[at + 9] || entry.spec.frequency,
+            };
           }
         }
-        // EVENT_DATA needs nothing: the mixer reads the buffer itself, so a
-        // guest streaming into it is already heard.
+        // `EVENT_DATA` needs nothing here: the mixer reads the buffer as it
+        // stands, so a write the guest makes is heard on the next block.
       }
       host.wh_audio_events_clear();
     }
 
-    // Start what the guest has written. One frame is usually enough, because
-    // `Play` comes back before the writes do, not after them.
-    for (const [voice, entry] of waiting) {
-      const pcm = samples(voice);
-      if (!pcm.length) {
-        waiting.delete(voice);
-        continue;
-      }
-      if (silent(pcm, entry.spec.bits) && performance.now() < entry.until) continue;
-      waiting.delete(voice);
-      startVoice(voice, entry.spec, pcm);
-    }
+    pumpAudio();
   }
 
   /**
-   * The mixer follows the tab.
+   * The mixer and the guest's clock follow the tab and the pause button.
    *
-   * A hidden tab gets no animation frames, so the guest stops and nothing calls
-   * `drainAudio` -- but `AudioContext` is the browser's, not the page's, and on
-   * macOS Brave and Chrome leave it running while the page is in the background.
-   * A looping `AudioBufferSource` then repeats whatever it holds with nobody
-   * refilling it, which is heard as one short sound stuck on a loop. Worse, the
-   * context can be suspended on the way out and nothing here ever asked it to
-   * resume, so the frozen note is still there on the way back.
+   * A hidden tab gets no animation frames and a paused one runs none, so the
+   * guest stops and nothing calls `drainAudio` -- but `AudioContext` is the
+   * browser's, not the page's, and on macOS Brave and Chrome leave it running
+   * while the page is in the background. A streaming game refills its music a
+   * half buffer at a time, so a looping `AudioBufferSource` then repeats
+   * whatever it holds with nobody refilling it, which is heard as one short
+   * fragment stuck on a loop. Worse, the context can be suspended on the way out
+   * and nothing here ever asked it to resume, so the frozen note is still there
+   * on the way back.
    *
    * Suspending it ourselves makes both directions explicit: silence while the
-   * tab is away, and the same position -- loops, playheads, gain -- when it
-   * comes back.
+   * guest is not running, and the same position -- loops, playheads, gain -- when
+   * it is. The audio clock stops with it, which is what keeps a refill after the
+   * pause seeking to the right place rather than to where the wall clock says.
+   *
+   * The guest's clock stops too. A pause is not time passing for the game: it is
+   * still the same frame when it resumes, and a `GetTickCount` that jumped by the
+   * pause would make every one of its waits return at once and skip ahead.
    */
-  function followVisibility() {
-    if (!audio) return;
-    if (document.hidden) audio.suspend().catch(() => {});
-    else audio.resume().catch(() => {});
+  function notRunning() {
+    // `document` is absent in the headless harness that boots this loader.
+    return paused || (typeof document !== "undefined" && document.hidden);
   }
-  // `document` is absent in the headless harness that boots this loader.
+
+  function followPause() {
+    if (notRunning()) {
+      if (frozenAt) return;
+      frozenAt = performance.now();
+      if (audio) audio.suspend().catch(() => {});
+      return;
+    }
+    if (!frozenAt) return;
+    const away = performance.now() - frozenAt;
+    frozenAt = 0;
+    // The page's clock keeps running; the guest's does not. Everything that
+    // counts in the guest's time is moved by the same amount, so the frame that
+    // follows a pause is the next frame of the game and not a jump.
+    clockShift += away;
+    origin += away;
+    if (audio) audio.resume().catch(() => {});
+  }
   if (typeof document !== "undefined") {
-    document.addEventListener("visibilitychange", followVisibility);
+    document.addEventListener("visibilitychange", followPause);
   }
 
   // ---- the loop -----------------------------------------------------------
@@ -609,8 +712,12 @@ export async function boot({
   const rate = Number(settings.fps ?? fps);
   const paced = Number.isFinite(rate) && rate > 0;
   // Seeded one interval in the past, so the first frame is due at once.
-  const origin = performance.now() - (paced ? 1000 / rate : 0);
+  let origin = performance.now() - (paced ? 1000 / rate : 0);
   let presented = 0;
+  /** Milliseconds of pause the guest has not been told about. */
+  let clockShift = 0;
+  /** When the guest stopped running, or 0 while it is. */
+  let frozenAt = 0;
 
   function status(text) {
     if (text === lastStatus) return;
@@ -633,25 +740,32 @@ export async function boot({
       // Not due yet: leave the guest where it is and keep the audio flowing.
       // The clock still moves, so the guest's own timers see real time either way.
       if (presented >= due) {
-        host.wh_set_time(now);
+        host.wh_set_time(now - clockShift);
         drainAudio();
         return;
       }
     }
 
-    host.wh_set_time(now);
+    host.wh_set_time(now - clockShift);
     const started = performance.now();
     let outcome = 0;
     // A frame's budget is instructions, not time: 250,000 per chunk, repeated
-    // until the guest presents or a small wall-clock slice is used up, so one
-    // slow frame cannot freeze the page.
+    // until the guest presents or a wall-clock slice is used up, so one slow
+    // frame cannot freeze the page.
+    //
+    // A paced game gets its own interval as that slice. It waits for real time
+    // inside the guest -- `Sleep` against `GetTickCount`, which is how a game
+    // written for 50 made its own frame rate -- so a slice shorter than a frame
+    // cuts the wait in half and costs a frame. An unpaced one keeps the 12 ms
+    // that has always been enough to keep a page responsive.
+    const slice = paced ? Math.max(12, 1000 / rate) : 12;
     for (let chunk = 0; chunk < 8; chunk += 1) {
       outcome = host.wh_run(250_000);
       instructions += 250_000;
       if (outcome !== 0) break;
       if (host.wh_flips() !== flips) break;
       if (host.wh_frame_version() !== version) break;
-      if (performance.now() - started > 12) break;
+      if (performance.now() - started > slice) break;
     }
 
     if (host.wh_flips() !== flips || host.wh_frame_version() !== version) {
@@ -685,7 +799,11 @@ export async function boot({
       running = false;
       return;
     }
-    status(`running — ${host.wh_framebuffer_width()}×${host.wh_framebuffer_height()}`);
+    // The depth is the surface the guest actually draws on, not the one the
+    // artifact seeded: a game is free to ask for another mode, and Cave Story
+    // does -- the payload says 8 and the game runs 16.
+    const depth = host.wh_framebuffer_depth ? host.wh_framebuffer_depth() : 8;
+    status(`running — ${host.wh_framebuffer_width()}×${host.wh_framebuffer_height()}×${depth}`);
   }
 
   present();
@@ -744,13 +862,19 @@ export async function boot({
     artifact,
     imports: host.wh_import_count ? host.wh_import_count() : 0,
     instructions: () => instructions,
+    /**
+     * The clock the guest reads, in milliseconds.
+     *
+     * The page pushes real time; this is what the guest got. They differ when a
+     * shim has moved the clock, which is exactly the bug a fast-playing game is:
+     * the guest is being told time passed when it did not.
+     */
+    clockMs: () => (host.wh_clock_ms ? host.wh_clock_ms() : 0),
     setPaused(value) {
+      if (paused === value) return;
       paused = value;
+      followPause();
       onStatus(value ? "paused" : "running");
-    },
-    /** Browser audio starts suspended; the page calls this from a click. */
-    resumeAudio() {
-      audioContext();
     },
     /**
      * Whether the guest wants the pointer shown.
@@ -770,10 +894,10 @@ export async function boot({
       running = false;
       if (handle !== null) cancelAnimationFrame(handle);
       handle = null;
-      for (const voice of [...voices.keys()]) stopVoice(voice);
-      waiting.clear();
+      voices.clear();
+      queued = 0;
       if (typeof document !== "undefined") {
-        document.removeEventListener("visibilitychange", followVisibility);
+        document.removeEventListener("visibilitychange", followPause);
       }
       if (audio) audio.close().catch(() => {});
       audio = null;

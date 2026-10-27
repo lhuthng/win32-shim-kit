@@ -278,6 +278,9 @@ fn main() -> ExitCode {
                 pressed = 1;
                 session.host.key(0x39, true);
                 session.host.key(0x1c, true);
+                // `Z`, which is what a Cave Story menu confirms with: a run that
+                // only presses space and return sits on the title for ever.
+                session.host.key(0x2c, true);
                 // In the middle of the window, where a menu's first item sits: a
                 // button at the top-left corner is a click on nothing.
                 session.host.pointer(396, 274);
@@ -287,6 +290,7 @@ fn main() -> ExitCode {
                 pressed = 2;
                 session.host.key(0x39, false);
                 session.host.key(0x1c, false);
+                session.host.key(0x2c, false);
                 session.host.pointer_button(0, false);
             }
         }
@@ -381,6 +385,34 @@ fn main() -> ExitCode {
     // looked at rather than only measured.
     if let Ok(path) = std::env::var("PROBE_FRAME") {
         write_frame(&session, Path::new(&path));
+    }
+
+    // `PROBE_MEMORY=<path>` writes the guest's memory as it stands, so a surface
+    // the guest filled can be looked at where it lives: `0xADDRESS` in a log is
+    // an offset into this file at `ADDRESS - 0x400000`.
+    if let Ok(path) = std::env::var("PROBE_MEMORY") {
+        let memory = session.memory.as_slice();
+        if let Err(error) = fs::write(&path, memory) {
+            println!("  could not write {path}: {error}");
+        } else {
+            println!(
+                "  memory at {path}: {} bytes, indexed from {:#010x}",
+                memory.len(),
+                pe::IMAGE_BASE
+            );
+        }
+    }
+
+    // `PROBE_PALETTE` prints the palette the guest set, which is the only place
+    // an eight-bit-minded guest's "colour 0" is written down.
+    if std::env::var("PROBE_PALETTE").is_ok() {
+        let palette = session.host.ddraw.palette();
+        for (index, entry) in palette.iter().enumerate().take(16) {
+            println!(
+                "  palette {index:3} = ({}, {}, {})",
+                entry[0], entry[1], entry[2]
+            );
+        }
     }
 
     if let Ok(addresses) = std::env::var("PROBE_PEEK") {

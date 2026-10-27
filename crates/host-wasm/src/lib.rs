@@ -440,6 +440,21 @@ pub extern "C" fn wh_set_time(milliseconds: f64) -> i32 {
     })
 }
 
+/// The clock the guest reads, in milliseconds.
+///
+/// `wh_set_time` says what the embedder's clock is; this says what the guest
+/// sees, which is not the same number once a shim has moved it. A page that
+/// shows the difference can tell a game that is waiting from one that is being
+/// told time has passed when it has not.
+#[no_mangle]
+pub extern "C" fn wh_clock_ms() -> f64 {
+    SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(0.0, |session| session.host.now_ms() as f64)
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn wh_entry() -> u32 {
     SESSION.with(|cell| cell.borrow().as_ref().map_or(0, Session::entry))

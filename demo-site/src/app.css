@@ -1,31 +1,36 @@
 @import "tailwindcss";
 
 /* The palette: seven colours, one accent role each, plus a muted gray and a
-   light line for text and dividers. Every `--color-*` name becomes utilities
-   (`bg-violet`, `text-charcoal`, `border-line`). */
+   line for text and dividers. Every `--color-*` name becomes utilities
+   (`bg-violet`, `text-charcoal`, `border-line`).
+
+   The page is black: `--color-panel` is the surface a card lifts onto, and the
+   inks are light. `charcoal` stays dark because it is the ink that sits *on* an
+   accent -- the label of a yellow button -- not a surface. */
 @theme {
   --color-charcoal: #252324;
+  --color-panel: #121016;
   --color-violet: #8061ff;
   --color-yellow: #ffea5e;
   --color-orange: #ff7038;
   --color-teal: #0f9970;
   --color-blue: #0000ee;
-  --color-muted: #6b6870;
-  --color-line: #ebe9f0;
+  --color-muted: #9d98a6;
+  --color-line: #2b2832;
 
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-  --shadow-panel: 0 10px 30px rgb(37 35 36 / 0.08);
+  --shadow-panel: 0 10px 30px rgb(0 0 0 / 0.6);
 }
 
 @layer base {
   :root {
-    color-scheme: light;
+    color-scheme: dark;
   }
 
   body {
-    background-color: white;
-    color: var(--color-charcoal);
+    background-color: black;
+    color: #f4f2f7;
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
   }

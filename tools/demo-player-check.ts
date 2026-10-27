@@ -41,11 +41,27 @@ const canvas = {
 };
 
 // A Web Audio context that only records: what the loader hands the mixer is the
-// whole question, and a headless run has no speakers to ask.
+// whole question, and a headless run has no speakers to ask. It starts
+// suspended, the way a browser starts one, so a run that never resumes it is a
+// run whose sounds go nowhere.
 let mixed: Float32Array[] = [];
+let contexts = 0;
+let resumes = 0;
+let suspends = 0;
+let context: RecordingAudioContext | null = null;
+const opened = performance.now();
 class RecordingAudioContext {
-  state = "running";
+  state = "suspended";
   destination = {};
+  sampleRate = 44_100;
+  /** The loader queues blocks against this clock, so it has to run. */
+  get currentTime() {
+    return (performance.now() - opened) / 1000;
+  }
+  constructor() {
+    contexts += 1;
+    context = this;
+  }
   createBuffer(channels: number, frames: number, rate: number) {
     const data = Array.from({ length: channels }, () => new Float32Array(frames));
     mixed.push(data[0]);
@@ -61,6 +77,13 @@ class RecordingAudioContext {
     return { pan: { value: 0 }, connect() {}, disconnect() {} };
   }
   resume() {
+    resumes += 1;
+    this.state = "running";
+    return Promise.resolve();
+  }
+  suspend() {
+    suspends += 1;
+    this.state = "suspended";
     return Promise.resolve();
   }
   close() {
@@ -94,7 +117,13 @@ try {
 
   const statuses: string[] = [];
   const diagnostics: string[] = [];
-  const { boot } = await import("../demo-site/src/lib/player.js");
+  const { boot, resumeAudio } = await import("../demo-site/src/lib/player.js");
+  // The page's Play button is a gesture, and a browser only starts audio from
+  // one. A game that plays music on its first screen is silent for ever if the
+  // context it mixes into was made after the click had been awaited away, so
+  // the loader has to be able to start it before `boot` and then use it.
+  resumeAudio();
+  check(contexts === 1 && resumes === 1, "a click before boot starts the audio context");
   const session = await boot({
     canvas,
     payloadUrl: `${base}/payloads/${payload.slug}/`,
@@ -171,6 +200,26 @@ try {
   // Web Audio instead, with the samples the guest left in the buffer.
   check(mixed.length > 0, `${mixed.length} buffer(s) reached Web Audio after ${clicks} click(s)`);
   check(loudness() > 0.01, `the loudest mixed sample is ${loudness().toFixed(3)}`);
+  check(contexts === 1, "the session mixes into the context the click started");
+
+  // A pause has to reach the mixer as well as the guest: the music is a buffer
+  // the guest refills while it runs, so a context left playing repeats the last
+  // half buffer it got -- one short fragment on a loop -- and a clock left
+  // running makes the resume seek past where the music had got to.
+  const before = session.clockMs();
+  const resumesBefore = resumes;
+  const suspendsBefore = suspends;
+  session.setPaused(true);
+  check(suspends > suspendsBefore, "pausing suspends the page's audio");
+  await Bun.sleep(1200);
+  check(session.clockMs() === before, "the guest's clock stops while paused");
+  check(resumes === resumesBefore, "nothing resumes the audio while paused");
+  session.setPaused(false);
+  check(resumes > resumesBefore, "unpausing resumes it");
+  await Bun.sleep(300);
+  const advanced = session.clockMs() - before;
+  check(advanced > 0, `the guest's clock moves again (${Math.round(advanced)} ms)`);
+  check(advanced < 1000, `it did not jump by the pause (${Math.round(advanced)} ms for a 1200 ms pause)`);
 
   session.stop();
 } finally {

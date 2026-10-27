@@ -50,6 +50,8 @@ use crate::shim::{Action, Binding, Call, Host};
 /// Whether the GDI trace is on. A blit asks this on every call, and a guest draws
 /// its frame out of thousands of them, so it is read once.
 static LOGGING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// `SHIMKIT_LOG_GDI_SURFACE` traces the scaled copies onto DirectDraw surfaces.
+static SURFACE_LOGGING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 use crate::Result;
 
 use Action::Return;
@@ -1579,6 +1581,39 @@ fn stretch_blt(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         }
         return Ok(Return(0));
     };
+    if crate::shim::switch(&SURFACE_LOGGING, "SHIMKIT_LOG_GDI_SURFACE") {
+        // Which surface a scaled copy lands on, and what each side is: a surface
+        // that stays black either never got a copy or got one from a source the
+        // pixel reader could not read.
+        let corner = read_pixel(call.memory, &source, 0, 0)
+            .ok()
+            .flatten()
+            .map_or("?".to_string(), |(r, g, b)| format!("{r:02x}{g:02x}{b:02x}"));
+        // How much of the source is actually painted: a scaled copy that lands
+        // black either had nothing to copy or dropped what it had.
+        let mut lit = 0;
+        let mut sampled = 0;
+        for row in 0..16 {
+            for column in 0..16 {
+                let x = source_w * column / 16;
+                let y = source_h * row / 16;
+                sampled += 1;
+                if let Ok(Some((r, g, b))) = read_pixel(call.memory, &source, x, y) {
+                    if r != 0 || g != 0 || b != 0 {
+                        lit += 1;
+                    }
+                }
+            }
+        }
+        host.notice(format!(
+            "StretchBlt to surface {:#010x} ({dest_w}x{dest_h}) from {source_w}x{source_h} \
+             source {}bit ({} colours, corner {corner}, {lit}/{sampled} lit) dest {}bit",
+            dest.surface().unwrap_or(0),
+            source.bits,
+            source.colours.len(),
+            dest.device.bits
+        ));
+    }
     if crate::shim::switch(&LOGGING, "SHIMKIT_LOG_GDI")
         && host.gdi.dcs.get(&dest_dc).map_or(false, |context| context.window)
     {
@@ -1628,6 +1663,31 @@ fn stretch_blt(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
             };
             dest.put_with_alpha(call.memory, dest_x + column, dest_y + row, colour, alpha)?;
         }
+    }
+    if crate::shim::switch(&SURFACE_LOGGING, "SHIMKIT_LOG_GDI_SURFACE") {
+        // What the copy left behind, read back through the same pixel reader: a
+        // surface that is still black here had its pixels written somewhere else.
+        let mut lit = 0;
+        let mut sampled = 0;
+        for row in 0..16 {
+            for column in 0..16 {
+                let x = dest_w * column / 16;
+                let y = dest_h * row / 16;
+                sampled += 1;
+                if let Ok(Some((r, g, b))) =
+                    read_pixel(call.memory, &dest.device, dest_x + x, dest_y + y)
+                {
+                    if r != 0 || g != 0 || b != 0 {
+                        lit += 1;
+                    }
+                }
+            }
+        }
+        host.notice(format!(
+            "  after the copy surface {:#010x} at {:#010x} reads {lit}/{sampled} lit",
+            dest.surface().unwrap_or(0),
+            dest.device.buffer
+        ));
     }
     if let Some(surface) = dest.surface() {
         host.ddraw.touch(surface);

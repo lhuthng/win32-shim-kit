@@ -675,6 +675,22 @@ pub(crate) fn serve(
     if std::env::var("SHIMKIT_LOG_DDRAW").is_ok() && host.notices.len() < 600 {
         host.notice(format!("ddraw {name}"));
     }
+    // `SHIMKIT_TRACE_SURFACE=<handle>` follows one surface: every method the
+    // guest calls on it, which is how a surface that comes out black is traced
+    // to whether the guest ever wrote to it at all.
+    if let Ok(wanted) = std::env::var("SHIMKIT_TRACE_SURFACE") {
+        if let Some(handle) = wanted.trim().strip_prefix("0x").and_then(|hex| u32::from_str_radix(hex, 16).ok()) {
+            if kind == thunks::DDRAW_SURFACE && call.arg(0).ok() == Some(handle) {
+                println!(
+                    "surface {name} args={:08x},{:08x},{:08x},{:08x}",
+                    call.arg(1).unwrap_or(0),
+                    call.arg(2).unwrap_or(0),
+                    call.arg(3).unwrap_or(0),
+                    call.arg(4).unwrap_or(0),
+                );
+            }
+        }
+    }
     match (kind, name) {
         // A surface is reference counted for real: the last `Release` frees its
         // pixels, which is what keeps a board session inside the heap. Every
@@ -709,6 +725,7 @@ pub(crate) fn serve(
             host.ddraw.width = width;
             host.ddraw.height = height;
             host.ddraw.depth = depth;
+            host.notice(format!("DirectDraw: display mode {width}x{height}x{depth}"));
             Ok(Return(DD_OK))
         }
         (thunks::DDRAW, "RestoreDisplayMode") | (thunks::DDRAW, "WaitForVerticalBlank") => {
@@ -1084,9 +1101,17 @@ fn lock(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let offset = top as u32 * surface.pitch + left as u32 * bytes;
     let pointer = surface.buffer + offset;
     let pitch = surface.pitch;
+    // A surface the guest fills itself -- a background it renders in code rather
+    // than loading -- is only ever written through a lock, so a region that
+    // comes out black is traced to whether the lock happened at all.
+    let line = format!(
+        "lock {this:#010x} {}x{}x{} rect {left},{top},{right},{bottom} pitch {pitch} at {pointer:#010x}",
+        surface.width, surface.height, surface.bits
+    );
     if let Some(surface) = host.ddraw.surfaces.get_mut(&this) {
         surface.locks += 1;
     }
+    trace(host, line);
     call.zero(destination, DESC_SIZE)?;
     call.write_u32(destination, DESC_SIZE)?;
     call.write_u32(
@@ -1232,7 +1257,87 @@ fn blit(host: &mut Host, call: &mut Call<'_>, method: &'static str) -> Result<Ac
         } else {
             call.memory.read_u32(effects + FILL_COLOR)?
         };
+        let shape = host
+            .ddraw
+            .surfaces
+            .get(&this)
+            .map_or_else(|| "?".to_string(), |surface| {
+                format!("{}x{}x{}", surface.width, surface.height, surface.bits)
+            });
+        // `SHIMKIT_LOG_DRAW=fill` also wants the structure itself when the
+        // colour read from it is not the one that reaches the screen: a field at
+        // the wrong offset shows up as a grey fill of zero.
+        let mut words = String::new();
+        if effects != 0 {
+            for offset in (0..0x60).step_by(4) {
+                let value = call.memory.read_u32(effects + offset).unwrap_or(0);
+                words.push_str(&format!(" {offset:02x}:{value:08x}"));
+            }
+        }
+        trace(
+            host,
+            format!("fill {colour:#010x} rect {rect:#010x} on {this:#010x} ({shape}){words}"),
+        );
         return fill(host, call, this, rect, colour);
+    }
+    {
+        // A rectangle that is copied is only half the story: which surface it
+        // came from and how big that surface is says whether the window is the
+        // tile the guest meant or an empty corner of a bitmap that never loaded.
+        let shape = |id: u32| {
+            host.ddraw
+                .surfaces
+                .get(&id)
+                .map_or_else(|| "?".to_string(), |surface| {
+                    format!("{}x{}x{}", surface.width, surface.height, surface.bits)
+                })
+        };
+        let window = if source_rect == 0 {
+            "whole".to_string()
+        } else {
+            format!(
+                "{},{},{},{}",
+                call.memory.read_u32(source_rect).unwrap_or(0),
+                call.memory.read_u32(source_rect + 4).unwrap_or(0),
+                call.memory.read_u32(source_rect + 8).unwrap_or(0),
+                call.memory.read_u32(source_rect + 12).unwrap_or(0)
+            )
+        };
+        let (from, onto) = (shape(source), shape(this));
+        // The pixel at the window's corner, so a rectangle that comes out black
+        // says whether the source surface holds black or the copy dropped it.
+        let sample = host.ddraw.surfaces.get(&source).map_or_else(
+            || " source ?".to_string(),
+            |surface| {
+                let bytes = u32::from(surface.bits / 8).max(1);
+                let (left, top) = if source_rect == 0 {
+                    (0, 0)
+                } else {
+                    (
+                        call.memory.read_u32(source_rect).unwrap_or(0),
+                        call.memory.read_u32(source_rect + 4).unwrap_or(0),
+                    )
+                };
+                let at = surface
+                    .buffer
+                    .wrapping_add(top.saturating_mul(surface.pitch))
+                    .wrapping_add(left.saturating_mul(bytes));
+                let mut value = 0u32;
+                for index in 0..bytes.min(4) {
+                    if let Ok(byte) = call.memory.read_bytes(at + index, 1) {
+                        value |= u32::from(byte[0]) << (8 * index);
+                    }
+                }
+                format!(" source pixel {value:#06x}")
+            },
+        );
+        trace(
+            host,
+            format!(
+                "blt {method} src={source:#010x} ({from}) dst={this:#010x} ({onto}) at {dx},{dy} window {window} transfer {:#x}{sample}",
+                if method == "BltFast" { call.arg(5)? } else { call.arg(4)? }
+            ),
+        );
     }
     if source == 0 {
         // Without a fill flag a null source copies the destination onto itself,
@@ -1266,8 +1371,27 @@ fn blit(host: &mut Host, call: &mut Call<'_>, method: &'static str) -> Result<Ac
         let onto = host.ddraw.surfaces.get(&this).map(|surface| {
             format!("{}x{}x{}", surface.width, surface.height, surface.bits)
         });
+        let key = host
+            .ddraw
+            .surfaces
+            .get(&source)
+            .and_then(|surface| surface.src_key)
+            .map_or("none".to_string(), |(low, high)| {
+                format!("{low:#06x}..={high:#06x}")
+            });
+        let rect = if source_rect == 0 {
+            "whole".to_string()
+        } else {
+            format!(
+                "{},{},{},{}",
+                call.memory.read_u32(source_rect).unwrap_or(0),
+                call.memory.read_u32(source_rect + 4).unwrap_or(0),
+                call.memory.read_u32(source_rect + 8).unwrap_or(0),
+                call.memory.read_u32(source_rect + 12).unwrap_or(0)
+            )
+        };
         host.notice(format!(
-            "{method} {shape:?} -> {onto:?} transfer {transfer:#x} source_rect {source_rect:#x}"
+            "{method} {shape:?} -> {onto:?} transfer {transfer:#x} at {dx},{dy} rect {rect} key {key}"
         ));
     }
     let Some(from) = host.ddraw.surfaces.get(&source) else {
@@ -1376,11 +1500,13 @@ fn blit(host: &mut Host, call: &mut Call<'_>, method: &'static str) -> Result<Ac
     // Cave Story draws at 640x480x16, so a column added raw lands half a sprite
     // away, which reads as a scrambled screen rather than a misplaced one.
     let pixel_bytes = bytes as u32;
+    let mut copied = 0_usize;
     for row in 0..height {
         let source_at = from_base + (sy + row) * from_pitch + sx * pixel_bytes;
         let destination = to_base + (top as u32 + row) * to_pitch + left as u32 * pixel_bytes;
         if src_key.is_none() && dest_key.is_none() {
             call.memory.copy(source_at, destination, row_bytes)?;
+            copied += width as usize;
             continue;
         }
         row_buffer.clear();
@@ -1403,12 +1529,56 @@ fn blit(host: &mut Host, call: &mut Call<'_>, method: &'static str) -> Result<Ac
             }
             let at = column * bytes;
             composed[at..at + bytes].copy_from_slice(&row_buffer[at..at + bytes]);
+            copied += 1;
         }
         call.memory.write_bytes(destination, &composed)?;
+    }
+    if log {
+        // The first bytes of the source row, so "the copy found nothing" can be
+        // told from "the copy read the wrong memory".
+        let head = call
+            .memory
+            .read_bytes(from_base + sy * from_pitch + sx * pixel_bytes, (row_bytes).min(8))
+            .map(|bytes| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>())
+            .unwrap_or_default();
+        host.notice(format!(
+            "blit copied {copied} of {} pixels ({method} onto {this:#010x}) from {from_base:#010x} at {sx},{sy} row {head} to {to_base:#010x} at {left},{top}",
+            width as usize * height as usize
+        ));
     }
     host.ddraw.row = row_buffer;
     host.ddraw.composed = composed;
     Ok(Return(DD_OK))
+}
+
+/// `SHIMKIT_LOG_DRAW` traces what the guest draws, which is how a region that
+/// comes out the wrong colour is traced to the call that painted it: a rectangle
+/// that is never filled and one filled with 0 look the same on screen.
+fn trace(host: &mut Host, line: String) {
+    let Ok(wanted) = std::env::var("SHIMKIT_LOG_DRAW") else {
+        return;
+    };
+    // A screen that tiles its backdrop makes hundreds of blits a frame and a
+    // handful of fills, so an unfiltered trace fills the notice list before the
+    // frame that matters. A plain `1` means every call; anything else names a
+    // prefix -- `fill`, `blt` -- so the list is spent on one kind of call
+    // instead of the loudest one.
+    let everything = wanted.is_empty()
+        || wanted == "1"
+        || wanted.eq_ignore_ascii_case("true")
+        || wanted.eq_ignore_ascii_case("yes");
+    if !everything && !line.starts_with(&wanted) {
+        return;
+    }
+    // `SHIMKIT_LOG_DRAW_LIMIT` raises the cap for a run that has to see every
+    // call of one frame rather than the first two frames of a scene.
+    let limit = std::env::var("SHIMKIT_LOG_DRAW_LIMIT")
+        .ok()
+        .and_then(|text| text.trim().parse::<usize>().ok())
+        .unwrap_or(600);
+    if host.notices.len() < limit {
+        host.notice(format!("draw {line}"));
+    }
 }
 
 /// Paints one colour across a rectangle, which is `DDBLT_COLORFILL`.
@@ -1426,9 +1596,8 @@ fn fill(
     let Some(surface) = host.ddraw.surfaces.get(&this) else {
         return Err(format!("DirectDraw: fill of {this:#010x}, which is not a surface"));
     };
-    let (left, top, right, bottom) = bounds(call, rect, surface)?;
-    let bytes = usize::from(surface.bits / 8).max(1);
-    let mut pixel = vec![0_u8; bytes];
+    let (left, top, right, bottom) = bounds(call, rect, surface)?;            let bytes = usize::from(surface.bits / 8).max(1);
+            let mut pixel = vec![0_u8; bytes];
     for (index, byte) in colour.to_le_bytes().iter().take(bytes).enumerate() {
         pixel[index] = *byte;
     }

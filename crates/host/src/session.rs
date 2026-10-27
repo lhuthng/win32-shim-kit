@@ -564,9 +564,17 @@ impl Session {
             action_value(action)
         ));
         if std::env::var("SHIMKIT_LOG_CALLS").is_ok() {
+            // The caller's own address, from the stack the call pushed: a name and
+            // an argument count say which import a game is stuck on, but not which
+            // of its routines asked, which is what a disassembly is read from.
+            let caller = self
+                .memory
+                .read_u32(call.args.wrapping_sub(4))
+                .unwrap_or(0);
             println!(
-                "{:14} {}",
+                "{:14} {:#010x} {}",
                 self.cpu.instructions,
+                caller,
                 self.last_import.as_deref().unwrap_or_default()
             );
         }

@@ -18,9 +18,10 @@ by this one.
 ## Styling
 
 Tailwind CSS v4 through `@tailwindcss/vite`. The palette lives in the `@theme`
-block of `src/app.css` — charcoal, violet, yellow, orange, teal, plus a muted
-gray and a light line — so `bg-violet`, `text-charcoal` and `border-line` are
-utilities, and `shadow-panel` comes from `--shadow-panel`. Components carry no
+block of `src/app.css` — violet, yellow, orange and teal accents, a muted gray,
+a line, and the `panel` surface the frame sits on — so `bg-violet`, `bg-panel`
+and `border-line` are utilities, and `shadow-panel` comes from `--shadow-panel`. The page is black; `charcoal` is only the ink that sits on an
+accent, such as the label of a yellow button. Components carry no
 `<style>` blocks; everything is utilities on the markup, and the canvas keeps
 `image-rendering: pixelated`.
 
@@ -88,9 +89,17 @@ localStorage.removeItem("win32-shim-kit:saves:cavestory");
 ## Playing
 
 `Play` boots the payload and starts the guest on `requestAnimationFrame`. The
-canvas takes the keyboard while it has focus; the click also lets the browser
-start audio. `Pause` stops presenting new frames without dropping the session,
+canvas takes the keyboard while it has focus. `Play` also starts audio: a
+browser only lets a gesture do that, and a game whose title screen already has
+music would otherwise be silent until the frame itself was clicked, because the
+context a boot after an `await` creates stays suspended. `Pause` stops presenting new frames without dropping the session,
 `Stop` ends it — reload or press `Start` again to boot a fresh one.
+
+`Pause`, and a tab put in the background, also stop the guest: no frames, so nothing
+refills the DirectSound buffers. The mixer is suspended with it, because a context
+left running repeats the last half buffer it was handed as one short fragment on a
+loop; and the guest's clock is held still, so the frame after the pause is the next
+frame of the game rather than a jump by however long it was away.
 
 Sounds are mixed one Web Audio voice per DirectSound buffer, reading the samples
 where the guest left them (`wh_audio_samples`) rather than a copy taken at
