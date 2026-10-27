@@ -104,8 +104,31 @@ frame of the game rather than a jump by however long it was away.
 Sounds are mixed one Web Audio voice per DirectSound buffer, reading the samples
 where the guest left them (`wh_audio_samples`) rather than a copy taken at
 `Play`, with the buffer's volume, pan, frequency and loop as the game set them.
-This demo's game keeps its soundtrack on a CD (`open cdaudio`), which a payload
-cannot carry, so it has effects but no music.
+
+### What the sound can and cannot be
+
+The mix renders at the rate the guest's own buffers use -- Cave Story asks
+DirectSound for mono, 22050 Hz, 8 bits, which is the only `WAVEFORMATEX` in
+Doukutsu.exe -- and hands that buffer to Web Audio, whose resampler is
+band-limited. Mixing straight into the device rate instead folded images of the
+22 kHz source back into 11 to 22 kHz (measured at -38 dB) and is what a listener
+hears as a hiss laid over the music; the same material now measures -92 dB there.
+A buffer's `SetFrequency` is a playback rate against its own sample rate, so the
+mix advances `frequency / render rate` source frames per output frame, and the
+play cursor the guest reads back moves at that same rate.
+
+That leaves the ceiling where the game put it. Eight-bit samples are 256 levels
+and a 22050 Hz source holds nothing above 11 kHz, so percussion rendered by the
+game into those buffers is crunchy by construction; this host adds nothing on top
+but cannot recover what was never there. A recording that sounds cleaner than
+the page is either a 16-bit reimplementation (NXEngine, Cave Story+) or a
+different mix, not this payload. Two known simplifications of our own: a stereo
+buffer's right channel is ignored (no payload here creates one), and the sum
+runs through a safety limiter at -1 dB that is inert at these levels.
+
+Elimination III is the one payload with nothing to hear from the mixer unless a
+sound effect plays: its soundtrack is a CD (`open cdaudio` through
+`mciSendStringA`), and a payload cannot carry a disc.
 
 The mouse is **locked to the canvas** when the game starts, so the guest gets
 movement (`wh_pointer_move`) instead of a position that stops at the edge — which

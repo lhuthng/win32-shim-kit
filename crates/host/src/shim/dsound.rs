@@ -162,9 +162,23 @@ impl SoundBuffer {
         self.size / self.frame_bytes()
     }
 
+    /// The rate the play cursor moves at.
+    ///
+    /// `SetFrequency` does not only change what is heard: it plays the buffer
+    /// itself faster, so its cursor reaches the end sooner and a one-shot stops
+    /// sooner. A guest that retunes every note -- which is how Cave Story's
+    /// instruments are pitched -- reads the cursor back at this rate.
+    fn play_rate(&self) -> u32 {
+        if self.frequency == 0 {
+            self.format.rate
+        } else {
+            self.frequency
+        }
+    }
+
     /// How long a non-looping play lasts, in milliseconds.
     fn duration_ms(&self) -> u64 {
-        let rate = u64::from(self.format.rate.max(1));
+        let rate = u64::from(self.play_rate().max(1));
         let frames = u64::from(self.frames());
         frames.saturating_mul(1000) / rate
     }
@@ -933,7 +947,7 @@ fn position_of(host: &Host, this: u32) -> u32 {
     }
     let elapsed = host.now_ms().saturating_sub(buffer.started_ms);
     let bytes = (elapsed as u128)
-        .saturating_mul(buffer.format.rate as u128)
+        .saturating_mul(buffer.play_rate() as u128)
         .saturating_mul(buffer.frame_bytes() as u128)
         / 1000;
     let mut position = (buffer.start_bytes as u128).saturating_add(bytes);

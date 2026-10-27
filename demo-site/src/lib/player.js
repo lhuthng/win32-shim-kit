@@ -420,12 +420,18 @@ export async function boot({
     if (master) return master;
     master = context.createGain();
     if (context.createDynamicsCompressor) {
+      // A safety limiter, not compression. DirectSound never compressed -- the
+      // guest sets its own levels, and percussion is a transient by definition --
+      // so this only has to catch the rare moment a dozen voices sum past full
+      // scale. Held at -6 dB with a 6 dB knee it caught every drum hit instead:
+      // a mix whose peaks reach 0.5 was reduced by six, twelve decibels of
+      // punch stripped off the one sound that is nothing but attack.
       const limiter = context.createDynamicsCompressor();
-      limiter.threshold.value = -6;
-      limiter.knee.value = 6;
-      limiter.ratio.value = 12;
-      limiter.attack.value = 0.002;
-      limiter.release.value = 0.2;
+      limiter.threshold.value = -1;
+      limiter.knee.value = 0;
+      limiter.ratio.value = 20;
+      limiter.attack.value = 0.003;
+      limiter.release.value = 0.25;
       master.connect(limiter);
       limiter.connect(context.destination);
     } else {
@@ -451,7 +457,17 @@ export async function boot({
    * thing Web Audio plays.
    */
   function mixBlock(context) {
-    const rate = context.sampleRate || 22_050;
+    // Render at the rate the guest's own buffers use, not the device's, and let
+    // Web Audio do the conversion: its resampler is band-limited, while mixing
+    // straight into 48 kHz here folded images of the 22 kHz source -- Cave
+    // Story's buffers are mono 8-bit at 22050 -- back into 11 to 22 kHz, which
+    // is the hiss laid over the music that the original does not have.
+    let sourceRate = 0;
+    for (const entry of voices.values()) {
+      if (entry.stopped) continue;
+      if (entry.spec.rate > sourceRate) sourceRate = entry.spec.rate;
+    }
+    const rate = Math.min(context.sampleRate || 22_050, sourceRate || 22_050);
     const frames = Math.max(1, Math.round(CHUNK * rate));
     const buffer = context.createBuffer(2, frames, rate);
     const left = buffer.getChannelData(0);
@@ -481,8 +497,12 @@ export async function boot({
       if (!available) continue;
 
       // `frequency` is the playback rate in Hz against the buffer's own rate,
-      // which is what makes DirectSound's tiny looping waveforms notes.
-      const step = (spec.frequency || spec.rate) / spec.rate;
+      // which is what makes DirectSound's tiny looping waveforms notes. The mix
+      // leaves at the context's rate rather than the buffer's, so one source
+      // frame lasts `frequency / output rate` output frames: dividing by the
+      // buffer's rate instead plays a 22050 Hz track at 48000/22050 of its true
+      // length -- fast, and wrapping its loop before the guest has refilled it.
+      const step = (spec.frequency || spec.rate) / rate;
       const gain = gainOf(spec.volume);
       const angle = ((panOf(spec.pan) + 1) / 2) * (Math.PI / 2);
       const leftGain = Math.cos(angle) * gain;
