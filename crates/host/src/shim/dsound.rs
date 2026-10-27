@@ -184,6 +184,19 @@ impl SoundBuffer {
     }
 }
 
+/// A voice some other shim mixes through this device.
+///
+/// `MSS32.dll` (Miles) has its own handle space and its own idea of a sample,
+/// but the page has one mixer: the event queue and the two lookups below are
+/// the whole contract, so a Miles sample is one more voice in it. `pcm` is a
+/// copy this host made; `live` is where the guest's own bytes are, which is what
+/// a sample address is -- the guest may rewrite it between frames.
+#[derive(Default)]
+struct Foreign {
+    pcm: Vec<u8>,
+    live: Option<(u32, u32)>,
+}
+
 /// Everything `DirectSoundCreate` leaves behind.
 pub struct DirectSound {
     device: Option<u32>,
@@ -193,6 +206,8 @@ pub struct DirectSound {
     /// outlive the guest object so the page can copy it when it processes the
     /// queued Play.
     retired: HashMap<u32, SoundBuffer>,
+    /// Voices the Miles shim started, keyed by the voice number it used.
+    foreign: HashMap<u32, Foreign>,
     events: Vec<AudioEvent>,
     /// How many sounds the guest started, for the page's status line and tests.
     plays: u64,
@@ -206,6 +221,7 @@ impl Default for DirectSound {
             primary: None,
             buffers: HashMap::new(),
             retired: HashMap::new(),
+            foreign: HashMap::new(),
             events: Vec::new(),
             plays: 0,
             cooperative_level: 0,
@@ -233,10 +249,15 @@ impl DirectSound {
     /// The samples for a voice, whether it is still alive or only waiting for
     /// the page to consume its Release event.
     pub fn pcm(&self, voice: u32) -> &[u8] {
-        self.buffers
-            .get(&voice)
-            .or_else(|| self.retired.get(&voice))
-            .map_or(&[], |buffer| buffer.pcm.as_slice())
+        if let Some(buffer) = self.buffers.get(&voice).or_else(|| self.retired.get(&voice)) {
+            return buffer.pcm.as_slice();
+        }
+        // A Miles voice this host copied for the page; a Miles *sample* has no
+        // copy at all, because the mixer reads the guest's own bytes.
+        match self.foreign.get(&voice) {
+            Some(entry) => entry.pcm.as_slice(),
+            None => &[],
+        }
     }
 
     /// Where a voice's samples live, in guest memory, and how many bytes the
@@ -244,6 +265,9 @@ impl DirectSound {
     /// buffer while it plays, so a mixer reads here rather than trusting the
     /// copy taken at Play.
     pub fn samples(&self, voice: u32) -> Option<(u32, u32)> {
+        if let Some((address, length)) = self.foreign.get(&voice).and_then(|entry| entry.live) {
+            return Some((address, length));
+        }
         let buffer = self
             .buffers
             .get(&voice)
@@ -254,10 +278,43 @@ impl DirectSound {
         Some((buffer.data, buffer.size))
     }
 
+    /// Queues a voice whose samples stay in guest memory.
+    ///
+    /// This is what a Miles sample is: `AIL_set_sample_address` points at bytes
+    /// the guest owns and may rewrite, so the mixer has to read there rather
+    /// than from a copy taken at `AIL_start_sample`.
+    pub fn play_live(&mut self, event: AudioEvent, address: u32, length: u32) {
+        self.foreign.entry(event.voice).or_default().live = Some((address, length));
+        self.events.push(event);
+    }
+
+    /// Queues a voice whose samples this host copied for the page.
+    pub fn play_copy(&mut self, event: AudioEvent, pcm: Vec<u8>) {
+        self.foreign.entry(event.voice).or_default().pcm = pcm;
+        self.events.push(event);
+    }
+
+    /// Queues an event that only changes a voice already on the mixer.
+    pub fn notify(&mut self, event: AudioEvent) {
+        self.events.push(event);
+    }
+
+    /// Takes a voice off the mixer and forgets its samples.
+    pub fn silence(&mut self, voice: u32) {
+        self.foreign.remove(&voice);
+    }
+
     /// The page has processed every event, so a released voice's samples can go.
     pub fn clear_events(&mut self) {
         self.events.clear();
         self.retired.clear();
+        // A Miles sample's bytes belong to the guest, so those addresses stay:
+        // the voice is still playing after the page has read the event. A copy
+        // has been consumed by the time the queue is cleared.
+        for entry in self.foreign.values_mut() {
+            entry.pcm = Vec::new();
+        }
+        self.foreign.retain(|_, entry| entry.live.is_some());
     }
 }
 

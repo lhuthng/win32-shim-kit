@@ -37,6 +37,7 @@ pub mod gdi32;
 pub mod gdiplus;
 pub mod kernel32;
 pub mod msimg32;
+pub mod mss32;
 pub mod msvcp;
 pub mod ole32;
 pub mod quartz;
@@ -246,6 +247,9 @@ pub struct Host {
     pub ddraw: ddraw::DirectDraw,
     /// The audio device, its buffers and the events the page's mixer consumes.
     pub audio: dsound::DirectSound,
+    /// The Miles library: its device, samples and streams (`mss32`), which mix
+    /// through the same event queue as `audio`.
+    pub mss: mss32::Mss,
     /// The SDL 1.2 surface `SDL.dll` games draw into, and the state the
     /// functions around it keep (`sdl`).
     pub sdl: sdl::Sdl,
@@ -355,6 +359,7 @@ impl Host {
             files: files::Files::default(),
             ddraw: ddraw::DirectDraw::with_screen(u32::from(width), u32::from(height), depth),
             audio: dsound::DirectSound::default(),
+            mss: mss32::Mss::default(),
             sdl: sdl::Sdl::default(),
             tls: kernel32::ThreadLocals::default(),
             timers: winmm::Timers::default(),
@@ -738,6 +743,7 @@ pub const TABLES: &[&[Binding]] = &[
     msimg32::SHIMS,
     advapi32::SHIMS,
     dsound::SHIMS,
+    mss32::SHIMS,
     ddraw::SHIMS,
     dinput::SHIMS,
     winmm::SHIMS,
@@ -821,8 +827,8 @@ pub fn named(
         .rev()
         .flat_map(|table| table.iter())
         .find(|binding| {
-            (binding.name == name
-                || export_name(dll.unwrap_or(binding.dll), &binding.name) == name)
+            (same_name(binding.name, name)
+                || same_name(export_name(dll.unwrap_or(binding.dll), &binding.name), name))
                 && dll.is_none_or(|dll| same_dll(binding.dll, dll))
         })
 }
@@ -844,12 +850,12 @@ pub fn binding(tables: &'static [&'static [Binding]], slot: &Slot) -> Option<&'s
         .flat_map(|table| table.iter())
         .find(|binding| {
             same_dll(binding.dll, &slot.dll)
-                && (binding.name == slot.name
-                    || binding.name == export_name(&slot.dll, &slot.name)
+                && (same_name(binding.name, &slot.name)
+                    || same_name(export_name(&slot.dll, &slot.name), &binding.name)
                     // The other direction: a binding filed by ordinal answers an
                     // image that imported the name. Cave Story imports
                     // `DirectSoundCreate` by name; the shim is filed as `#1`.
-                    || slot.name == export_name(&slot.dll, binding.name))
+                    || same_name(&slot.name, export_name(&slot.dll, binding.name)))
         })
 }
 
@@ -859,6 +865,39 @@ pub fn binding(tables: &'static [&'static [Binding]], slot: &Slot) -> Option<&'s
 /// family: `MSVCRT.dll!malloc` is the same import as `msvcr80.dll!malloc`.
 fn same_dll(filed: &str, imported: &str) -> bool {
     filed.eq_ignore_ascii_case(imported) || (is_c_runtime(filed) && is_c_runtime(imported))
+}
+
+/// A name with its stdcall decoration removed: `_AIL_startup@0` is
+/// `AIL_startup`.
+///
+/// A linker writes a stdcall entry point into the import table the way it spelled
+/// it, so `MSS32.dll` arrives as `_AIL_startup@0` and its argument bytes as the
+/// `@N` suffix. Filing the table under the plain name and comparing undecorated
+/// forms keeps the table readable *and* answers the image -- and it holds for a
+/// guest that resolves the same function through `GetProcAddress` with either
+/// spelling.
+fn undecorated(name: &str) -> &str {
+    let name = name.strip_prefix('_').unwrap_or(name);
+    // The decoration is a suffix, so it is counted from the end: a name that does
+    // not end in digits -- which is nearly every name -- is answered after one
+    // byte. Searching for the last '@' first would scan the whole name, and this
+    // runs for every candidate when a slot is resolved.
+    let bytes = name.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1].is_ascii_digit() {
+        end -= 1;
+    }
+    if end > 0 && end < bytes.len() && bytes[end - 1] == b'@' {
+        &name[..end - 1]
+    } else {
+        name
+    }
+}
+
+/// Whether a filed name and an imported one are the same entry point, allowing
+/// for stdcall decoration on either side.
+fn same_name(filed: &str, imported: &str) -> bool {
+    filed == imported || undecorated(filed) == undecorated(imported)
 }
 
 /// The name a binding is filed under, for a slot that may have been imported by
@@ -901,6 +940,37 @@ mod tests {
                 "WSOCK32.dll!{ordinal} is not answered"
             );
         }
+    }
+
+    /// Miles is a stdcall DLL, so the image imports its entry points decorated:
+    /// `MSS32.dll!_AIL_set_sample_volume@8`. The table files them plain, which is
+    /// only correct if the lookup strips the decoration -- and the `@N` is also
+    /// the argument count, so a binding whose `arg_bytes` disagrees with its own
+    /// name would pop the wrong number of bytes.
+    #[test]
+    fn a_stdcall_import_is_answered_by_its_plain_name() {
+        for name in ["AIL_startup", "AIL_set_sample_volume", "AIL_set_file_callbacks"] {
+            let filed = named(TABLES, Some("MSS32.dll"), name)
+                .unwrap_or_else(|| panic!("{name} is not filed"));
+            let imported = format!("_{name}@{}", filed.arg_bytes);
+            let slot = Slot {
+                dll: "mss32.dll",
+                name: Box::leak(imported.clone().into_boxed_str()),
+                iat_va: 0x0040_1000,
+                args: None,
+                sites: 1,
+                agreement: 0,
+                ambiguous: 0,
+            };
+            let found = binding(TABLES, &slot)
+                .unwrap_or_else(|| panic!("{imported} does not resolve"));
+            assert_eq!(found.name, name);
+            // And the same name the way `GetProcAddress` is asked for it.
+            assert!(named(TABLES, Some("MSS32.dll"), &imported).is_some());
+        }
+        assert_eq!(undecorated("_AIL_shutdown@0"), "AIL_shutdown");
+        assert_eq!(undecorated("AIL_shutdown"), "AIL_shutdown");
+        assert_eq!(undecorated("??0Foo@@QAE@XZ"), "??0Foo@@QAE@XZ");
     }
 
     #[test]

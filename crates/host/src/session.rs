@@ -16,6 +16,14 @@ use crate::Result;
 pub struct Session {
     /// What this machine is running, supplied by the port.
     pub target: &'static Target,
+    /// The shim for each slot of `target.table`, resolved once at load.
+    ///
+    /// A host call is the most frequent thing a guest does, and resolving it by
+    /// scanning every shim table each time was a string search per candidate per
+    /// call -- in the browser profile it was ninety percent of the page's time.
+    /// The answer cannot change while the session lives, so it is worked out here
+    /// and indexed by slot.
+    bindings: Vec<Option<&'static shim::Binding>>,
     pub memory: GuestMemory,
     pub cpu: Cpu,
     /// The decoded-instruction cache, which lives beside the CPU so the step
@@ -184,6 +192,11 @@ impl Session {
         }
         Ok(Self {
             target,
+            bindings: target
+                .table
+                .iter()
+                .map(|slot| shim::binding(target.shims, slot))
+                .collect(),
             memory,
             cpu,
             decodes: cpu::Decodes::new(),
@@ -525,7 +538,7 @@ impl Session {
         let Some(slot) = self.target.table.slots.get(call.slot) else {
             return Err(format!("slot {} is outside the dispatch table", call.slot));
         };
-        let Some(binding) = shim::binding(self.target.shims, slot) else {
+        let Some(binding) = self.bindings.get(call.slot).copied().flatten() else {
             return Ok(None);
         };
         if let Some(agreed) = slot.arg_bytes() {

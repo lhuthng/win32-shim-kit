@@ -234,22 +234,33 @@ impl Image {
     /// One relocation is four bytes of absolute address, which is what an i386
     /// image holds; the other kinds describe a machine this host does not run.
     fn parse_relocations(&self, optional: usize) -> Result<Vec<u32>> {
-        let Some(directory) = self.data_directory(optional, BASE_RELOCATION_DIRECTORY)? else {
+        let Some((directory, declared)) = self.data_directory_and_size(optional, BASE_RELOCATION_DIRECTORY)?
+        else {
             return Ok(Vec::new());
         };
-        let mut offset = self
+        let start = self
             .rva_to_offset(directory)
             .ok_or("relocation directory is not inside any section")?;
+        // The table is the directory, not the section: a block header that starts
+        // past the declared length is padding, and a truncated one ends the walk
+        // rather than failing it.
+        let end = start.saturating_add(declared as usize).min(self.bytes.len());
+        let mut offset = start;
         let mut relocations = Vec::new();
         // A block is a page and the size of the whole block, then its entries.
-        while let Ok(page) = u32_at(&self.bytes, offset) {
+        while offset + 8 <= end {
+            let page = u32_at(&self.bytes, offset)?;
             let size = u32_at(&self.bytes, offset + 4)? as usize;
             if page == 0 || size < 8 {
                 break;
             }
             let entries = (size - 8) / 2;
             for index in 0..entries {
-                let entry = u16_at(&self.bytes, offset + 8 + index * 2)?;
+                let at = offset + 8 + index * 2;
+                if at + 2 > end {
+                    break;
+                }
+                let entry = u16_at(&self.bytes, at)?;
                 if entry >> 12 == RELOCATION_HIGHLOW {
                     relocations.push(page + u32::from(entry & 0x0fff));
                 }
@@ -297,12 +308,30 @@ impl Image {
 
     /// A data directory's RVA, or `None` when the image has no directory there.
     fn data_directory(&self, optional: usize, index: usize) -> Result<Option<u32>> {
+        Ok(self
+            .data_directory_and_size(optional, index)?
+            .map(|(rva, _)| rva))
+    }
+
+    /// A data directory's RVA and byte length.
+    ///
+    /// The length is the directory's own bound, which is not the same as its
+    /// section's: a table can end a few bytes short of the raw data, and reading
+    /// the padding after it as if it were another entry is how a valid image gets
+    /// refused. `gta-vc.exe`'s relocation table is exactly that case -- its last
+    /// block header is four bytes past the declared end of the directory and four
+    /// bytes past the end of the file.
+    fn data_directory_and_size(&self, optional: usize, index: usize) -> Result<Option<(u32, u32)>> {
         let directories = u32_at(&self.bytes, optional + NUMBER_OF_DIRECTORIES_OFFSET)?;
         if directories <= index as u32 {
             return Ok(None);
         }
-        let rva = u32_at(&self.bytes, optional + DATA_DIRECTORY_OFFSET + index * 8)?;
-        Ok((rva != 0).then_some(rva))
+        let at = optional + DATA_DIRECTORY_OFFSET + index * 8;
+        let rva = u32_at(&self.bytes, at)?;
+        if rva == 0 {
+            return Ok(None);
+        }
+        Ok(Some((rva, u32_at(&self.bytes, at + 4)?)))
     }
 
     fn parse_imports(&self, optional: usize) -> Result<Vec<Import>> {
