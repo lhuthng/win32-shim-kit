@@ -75,12 +75,30 @@ const DESC_PITCH: u32 = 16;
 const DESC_SURFACE: u32 = 36;
 const DESC_CAPS: u32 = 104;
 
+// `ddpfPixelFormat` inside the descriptor, and the fields of it that say what a
+// pixel is. `dwRGBBitCount` is the mask a guest applies to a pixel it read back
+// through a lock, which is how Cave Story turns a colour into one this display
+// holds: it writes the colour into a pixel and masks what it reads. A zero bit
+// count masks every converted colour down to black, which is the difference
+// between a blue fade and a fade that never happens.
+const DESC_PIXEL_FORMAT: u32 = 0x48;
+const DESC_BITS: u32 = 0x54;
+const DESC_RED_MASK: u32 = 0x58;
+const DESC_GREEN_MASK: u32 = 0x5c;
+const DESC_BLUE_MASK: u32 = 0x60;
+const DDPIXELFORMAT_SIZE: u32 = 32;
+
 // DDSD_* flags the guest sets.
 const DDSD_CAPS: u32 = 0x1;
 const DDSD_HEIGHT: u32 = 0x2;
 const DDSD_WIDTH: u32 = 0x4;
 const DDSD_PITCH: u32 = 0x8;
 const DDSD_LPSURFACE: u32 = 0x100;
+const DDSD_PIXELFORMAT: u32 = 0x1000;
+
+// DDPF_*: how a pixel format describes its pixels.
+const DDPF_PALETTEINDEXED8: u32 = 0x20;
+const DDPF_RGB: u32 = 0x40;
 
 // DDSCAPS_* flags this host understands.
 const DDSCAPS_BACKBUFFER: u32 = 0x4;
@@ -511,13 +529,33 @@ fn write_desc(desc: &mut Call<'_>, address: u32, surface: &Surface) -> Result<()
     desc.write_u32(address, DESC_SIZE)?;
     desc.write_u32(
         address + DESC_FLAGS,
-        DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PITCH | DDSD_LPSURFACE,
+        DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PITCH | DDSD_LPSURFACE | DDSD_PIXELFORMAT,
     )?;
     desc.write_u32(address + DESC_HEIGHT, surface.height)?;
     desc.write_u32(address + DESC_WIDTH, surface.width)?;
     desc.write_u32(address + DESC_PITCH, surface.pitch)?;
     desc.write_u32(address + DESC_SURFACE, surface.buffer)?;
     desc.write_u32(address + DESC_CAPS, surface.caps)?;
+    write_pixel_format(desc, address, surface.bits)?;
+    Ok(())
+}
+
+/// Fills in the descriptor's `ddpfPixelFormat` for a surface of `bits` per
+/// pixel, the masks included: a guest that asks what a surface's pixels look
+/// like gets the layout this host stores them in, not a blank one.
+fn write_pixel_format(desc: &mut Call<'_>, address: u32, bits: u8) -> Result<()> {
+    let (flags, red, green, blue) = match bits {
+        8 => (DDPF_PALETTEINDEXED8, 0, 0, 0),
+        16 => (DDPF_RGB, 0xf800, 0x07e0, 0x001f),
+        _ => (DDPF_RGB, 0x00ff_0000, 0x0000_ff00, 0x0000_00ff),
+    };
+    let format = address + DESC_PIXEL_FORMAT;
+    desc.write_u32(format, DDPIXELFORMAT_SIZE)?;
+    desc.write_u32(format + 4, flags)?;
+    desc.write_u32(address + DESC_BITS, u32::from(bits))?;
+    desc.write_u32(address + DESC_RED_MASK, red)?;
+    desc.write_u32(address + DESC_GREEN_MASK, green)?;
+    desc.write_u32(address + DESC_BLUE_MASK, blue)?;
     Ok(())
 }
 
@@ -1101,6 +1139,7 @@ fn lock(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let offset = top as u32 * surface.pitch + left as u32 * bytes;
     let pointer = surface.buffer + offset;
     let pitch = surface.pitch;
+    let bits = surface.bits;
     // A surface the guest fills itself -- a background it renders in code rather
     // than loading -- is only ever written through a lock, so a region that
     // comes out black is traced to whether the lock happened at all.
@@ -1116,12 +1155,13 @@ fn lock(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     call.write_u32(destination, DESC_SIZE)?;
     call.write_u32(
         destination + DESC_FLAGS,
-        DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PITCH | DDSD_LPSURFACE,
+        DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PITCH | DDSD_LPSURFACE | DDSD_PIXELFORMAT,
     )?;
     call.write_u32(destination + DESC_HEIGHT, height)?;
     call.write_u32(destination + DESC_WIDTH, width)?;
     call.write_u32(destination + DESC_PITCH, pitch)?;
     call.write_u32(destination + DESC_SURFACE, pointer)?;
+    write_pixel_format(call, destination, bits)?;
     Ok(Return(DD_OK))
 }
 
@@ -1830,6 +1870,55 @@ mod tests {
         // The rectangle starts one row down and two bytes in.
         let base = host.ddraw.surfaces.get(&surface).unwrap().buffer;
         assert_eq!(pointer, base + 8 + 2);
+    }
+
+    #[test]
+    fn a_lock_describes_the_pixels_it_hands_out() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let draw = direct_draw(&mut host, &mut memory);
+        // A 16-bit display, so a surface the guest creates afterwards is one
+        // whose pixels a conversion masks with the bit count it reads back.
+        let args = STACK_BASE + 0xd000;
+        let desc = STACK_BASE + 0xd100;
+        let destination = STACK_BASE + 0xd200;
+        memory.write_u32(args, draw).unwrap();
+        memory.write_u32(args + 4, 640).unwrap();
+        memory.write_u32(args + 8, 480).unwrap();
+        memory.write_u32(args + 12, 16).unwrap();
+        let mut call = Call { memory: &mut memory, args, arg_bytes: 20 };
+        assert_eq!(
+            serve(&mut host, &mut call, thunks::DDRAW, "SetDisplayMode").unwrap(),
+            Return(DD_OK)
+        );
+
+        surface_args(desc, 8, 4, DDSCAPS_OFFSCREENPLAIN, &mut memory);
+        memory.write_u32(args, draw).unwrap();
+        memory.write_u32(args + 4, desc).unwrap();
+        memory.write_u32(args + 8, destination).unwrap();
+        let mut call = Call { memory: &mut memory, args, arg_bytes: 16 };
+        serve(&mut host, &mut call, thunks::DDRAW, "CreateSurface").unwrap();
+        let surface = call.memory.read_u32(destination).unwrap();
+
+        let lock_desc = STACK_BASE + 0xd300;
+        memory.write_u32(args, surface).unwrap();
+        memory.write_u32(args + 4, 0).unwrap();
+        memory.write_u32(args + 8, lock_desc).unwrap();
+        let mut call = Call { memory: &mut memory, args, arg_bytes: 16 };
+        assert_eq!(
+            serve(&mut host, &mut call, thunks::DDRAW_SURFACE, "Lock").unwrap(),
+            Return(DD_OK)
+        );
+        // Cave Story masks the pixel it reads through a lock with this count to
+        // find the colour it wrote, so a zero one turns every fade black.
+        assert_eq!(call.memory.read_u32(lock_desc + DESC_BITS).unwrap(), 16);
+        assert_eq!(call.memory.read_u32(lock_desc + DESC_RED_MASK).unwrap(), 0xf800);
+        assert_eq!(
+            call.memory.read_u32(lock_desc + DESC_FLAGS).unwrap() & DDSD_PIXELFORMAT,
+            DDSD_PIXELFORMAT,
+            "the format in the descriptor is one the guest is told to read"
+        );
     }
 
     #[test]
