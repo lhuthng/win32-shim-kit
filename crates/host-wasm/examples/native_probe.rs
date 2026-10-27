@@ -443,6 +443,26 @@ fn main() -> ExitCode {
         }
     }
 
+    // `PROBE_SURFACES` prints every surface the guest created, with the address
+    // of its pixels: a surface that never reaches the screen can be looked at
+    // where it lives instead, with `PROBE_MEMORY`.
+    if std::env::var("PROBE_SURFACES").is_ok() {
+        let mut surfaces = session.host.ddraw.surface_buffers();
+        surfaces.sort_by_key(|(buffer, _, _, _)| *buffer);
+        for (buffer, width, height, locks) in surfaces {
+            println!("  surface {buffer:#010x} {width}x{height} locks {locks}");
+        }
+        let ddraw = &session.host.ddraw;
+        for (label, handle) in [("primary", ddraw.primary_surface()), ("back", ddraw.back_surface())] {
+            match handle.and_then(|handle| ddraw.surface(handle).map(|shape| (handle, shape))) {
+                Some((handle, (buffer, width, height, _pitch, bits))) => println!(
+                    "  {label} {handle:#010x} buffer {buffer:#010x} {width}x{height}x{bits}"
+                ),
+                None => println!("  {label} none"),
+            }
+        }
+    }
+
     if std::env::var("PROBE_SAMPLES").is_ok() {
         let mut top: Vec<_> = samples.iter().collect();
         top.sort_by_key(|(_, count)| std::cmp::Reverse(**count));

@@ -1023,7 +1023,10 @@ fn is_bad_pointer(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
 /// Nothing is moved. The embedder is the clock, it pushes real time before every
 /// chunk, and the guest spins until that clock says the wait is over -- the same
 /// loop, reading the same time, just no longer lied to.
-fn sleep(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+fn sleep(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    if std::env::var("SHIMKIT_LOG_SLEEP").is_ok() && call.arg(0)? > 1 && host.notices.len() < 100_000 {
+        host.notice(format!("Sleep({})", call.arg(0)?));
+    }
     Ok(Return(0))
 }
 

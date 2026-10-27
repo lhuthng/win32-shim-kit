@@ -1223,6 +1223,12 @@ fn set_color_key(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         let high = call.memory.read_u32(key + 4)?;
         Some((low.min(high), low.max(high)))
     };
+    if std::env::var("SHIMKIT_LOG_KEYS").is_ok() && host.notices.len() < 4000 {
+        let (low, high) = range.unwrap_or((0, 0));
+        host.notice(format!(
+            "color key {this:#010x} flags {flags:#x} {low:#06x}..={high:#06x}"
+        ));
+    }
     if let Some(surface) = host.ddraw.surfaces.get_mut(&this) {
         if flags & DDCKEY_SRCBLT != 0 {
             surface.src_key = range;
