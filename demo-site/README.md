@@ -69,6 +69,12 @@ the address, and re-baking a game leaves it in place.
 kit and speaks only the module's `wh_*` ABI, including `wh_framebuffer_depth()`
 for the 8-, 16- and 32-bit surfaces an SDL game can ask for.
 
+`src/lib/webgl2.js` is what draws a Direct3D 8 game. The host does not rasterise:
+it records each device call in a command stream (`crates/host/src/render.rs`), and
+this module replays that stream into a WebGL2 canvas of its own, which the loader
+copies into the frame canvas. The branch is not declared anywhere — a game with a
+Direct3D device goes through WebGL2, and one without keeps `putImageData`.
+
 ## Saving
 
 The payload is a folder, and the game writes in it. Its saves are kept in

@@ -15,3 +15,4 @@ dist/
 # Not shipped yet: the payload is baked and played locally, but the game's files
 # are not in the repository and the demo does not list it.
 demo/payloads/ntsd-community/
+demo/payloads/madagascar/

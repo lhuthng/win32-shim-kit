@@ -648,8 +648,9 @@ fn invoke_watson(host: &mut Host, _: &mut Call<'_>) -> Result<Action> {
 
 // ---- housekeeping -------------------------------------------------------
 
-/// `_lock(lock)` and `_unlock(lock)`: the CRT's own locks, which a single-threaded
-/// machine never contends.
+/// `_lock(lock)` and `_unlock(lock)`: the CRT's own locks. They answer at once --
+/// this host does not make a guest block on its own locks, and the guest cannot
+/// tell the difference unless it is running two threads through one.
 fn lock(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
     Ok(Return(0))
 }
@@ -658,8 +659,8 @@ fn unlock(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
     Ok(Return(0))
 }
 
-/// `_configthreadlocale(kind)`: the previous per-thread locale setting. There is
-/// one thread, and the locale is the C one.
+/// `_configthreadlocale(kind)`: the previous per-thread locale setting. The
+/// locale is the C one, on every thread this host runs.
 fn config_thread_locale(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
     Ok(Return(0))
 }

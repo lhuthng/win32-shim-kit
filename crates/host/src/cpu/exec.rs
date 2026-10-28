@@ -12,7 +12,7 @@
 
 use crate::cpu::{
     Condition, Cpu, Flags, HostCall, Instruction, Mem, Mnemonic, Operand, Repeat, Size, Step, EAX,
-    ECX, EDX, SEG_FS,
+    EBX, ECX, EDX, SEG_FS,
 };
 use crate::memory::{GuestMemory, TEB_BASE};
 use crate::Result;
@@ -668,7 +668,7 @@ fn read_float(
     size: Size,
 ) -> Result<f64> {
     if integer {
-        return read_integer(memory, cpu, operand, size, false);
+        return read_integer(memory, cpu, operand, size, false, false);
     }
     let address = match operand {
         Operand::Mem(target) => address_of(cpu, target),
@@ -709,12 +709,20 @@ fn read_integer(
     operand: Operand,
     size: Size,
     double: bool,
+    extended: bool,
 ) -> Result<f64> {
     let address = match operand {
         Operand::Mem(target) => address_of(cpu, target),
         _ => return Err("an integer load into the FPU needs a memory operand".into()),
     };
-    Ok(if double {
+    Ok(if extended {
+        // An 80-bit signed integer: sign-extend the low 64 bits, which is what
+        // every value a compiler stores here has anyway (the top two bytes are
+        // its sign).
+        let low = memory.read_u32(address)?;
+        let high = memory.read_u32(address.wrapping_add(4))?;
+        (u64::from(low) | (u64::from(high) << 32)) as i64 as f64
+    } else if double {
         let low = memory.read_u32(address)?;
         let high = memory.read_u32(address.wrapping_add(4))?;
         (u64::from(low) | (u64::from(high) << 32)) as i64 as f64
@@ -731,6 +739,7 @@ fn write_integer(
     operand: Operand,
     size: Size,
     double: bool,
+    extended: bool,
     value: f64,
 ) -> Result<()> {
     let address = match operand {
@@ -739,9 +748,17 @@ fn write_integer(
     };
     // The hardware rounds toward zero here; Rust's float-to-int cast does too.
     let integer = value as i64;
-    if double {
+    if extended || double {
+        // The 80-bit store writes the low 64 bits and sets the top two bytes
+        // from the sign, which is how a ten-byte integer holds an i64.
         memory.write_u32(address, integer as u32)?;
-        memory.write_u32(address.wrapping_add(4), (integer as u64 >> 32) as u32)
+        memory.write_u32(address.wrapping_add(4), (integer as u64 >> 32) as u32)?;
+        if extended {
+            let sign = if integer < 0 { 0xffff_u16 } else { 0 };
+            memory.write_u16(address.wrapping_add(8), sign)
+        } else {
+            Ok(())
+        }
     } else if size == Size::Word {
         memory.write_u16(address, integer as u16)
     } else {
@@ -777,13 +794,30 @@ fn execute_x87(
         }
         Mnemonic::Fst | Mnemonic::Fstp => {
             let value = cpu.fpu.st(0);
-            write_float(memory, cpu, instruction.operand(0), instruction.double, value)?;
+            // `dd d0`/`dd d8` name a register rather than a memory operand: the
+            // value moves within the stack and nothing is written to the guest.
+            match instruction.operand(0) {
+                Operand::Imm8(index) => cpu.fpu.set_st(index, value),
+                operand => write_float(memory, cpu, operand, instruction.double, value)?,
+            }
             if instruction.mnemonic == Mnemonic::Fstp {
                 cpu.fpu.pop();
             }
         }
+        Mnemonic::Ffree => {
+            // A slot is named to be forgotten, and this stack has nothing to
+            // forget: the value is left where it is rather than replaced by a
+            // tag the rest of the machine would then have to honour.
+        }
         Mnemonic::Fild => {
-            let value = read_integer(memory, cpu, instruction.operand(0), size, instruction.double)?;
+            let value = read_integer(
+                memory,
+                cpu,
+                instruction.operand(0),
+                size,
+                instruction.double,
+                instruction.extended,
+            )?;
             cpu.fpu.push(value);
         }
         Mnemonic::Fist | Mnemonic::Fistp => {
@@ -794,6 +828,7 @@ fn execute_x87(
                 instruction.operand(0),
                 size,
                 instruction.double,
+                instruction.extended,
                 value,
             )?;
             if instruction.mnemonic == Mnemonic::Fistp {
@@ -901,6 +936,105 @@ fn execute_x87(
         }
         Mnemonic::Fdecstp => cpu.fpu.rotate(-1),
         Mnemonic::Fincstp => cpu.fpu.rotate(1),
+        // The transcendental row. The guest's maths library reaches these for
+        // every `pow`, `sin`, `cos` and `atan2` in its animation and camera code,
+        // so each one has to leave the stack the way the hardware does, not just
+        // compute the right number.
+        Mnemonic::F2xm1 => {
+            let value = cpu.fpu.st(0).exp2() - 1.0;
+            cpu.fpu.set_st(0, value);
+        }
+        Mnemonic::Fyl2x | Mnemonic::Fyl2xp1 => {
+            let top = cpu.fpu.st(0);
+            let base = cpu.fpu.st(1);
+            let logarithm = if instruction.mnemonic == Mnemonic::Fyl2xp1 {
+                (top + 1.0).log2()
+            } else {
+                top.log2()
+            };
+            cpu.fpu.set_st(1, base * logarithm);
+            cpu.fpu.pop();
+        }
+        Mnemonic::Fptan => {
+            let tangent = cpu.fpu.st(0).tan();
+            cpu.fpu.set_st(0, tangent);
+            // The hardware pushes 1.0 as a side effect; a caller that pairs
+            // `fptan` with `fdivp` depends on that slot existing.
+            cpu.fpu.push(1.0);
+        }
+        Mnemonic::Fpatan => {
+            let y = cpu.fpu.st(1);
+            let x = cpu.fpu.st(0);
+            cpu.fpu.set_st(1, y.atan2(x));
+            cpu.fpu.pop();
+        }
+        Mnemonic::Fsincos => {
+            let angle = cpu.fpu.st(0);
+            cpu.fpu.push(angle.cos());
+            cpu.fpu.set_st(1, angle.sin());
+        }
+        Mnemonic::Fxtract => {
+            let value = cpu.fpu.st(0);
+            if value == 0.0 || !value.is_finite() {
+                cpu.fpu.set_st(0, 0.0);
+                cpu.fpu.push(value);
+            } else {
+                let exponent = value.abs().log2().floor();
+                let significand = value / exponent.exp2();
+                cpu.fpu.set_st(0, exponent);
+                cpu.fpu.push(significand);
+            }
+        }
+        // Both remainders truncate toward zero, which is the C2-cleared answer;
+        // the partial-remainder loop the hardware may take is not modelled, so a
+        // caller that loops until C2 is clear gets its answer on the first pass.
+        Mnemonic::Fprem | Mnemonic::Fprem1 => {
+            let dividend = cpu.fpu.st(0);
+            let divisor = cpu.fpu.st(1);
+            let quotient = (dividend / divisor).trunc();
+            cpu.fpu.set_st(0, dividend - divisor * quotient);
+            cpu.fpu.status &= !0x0400;
+        }
+        Mnemonic::Frndint => {
+            // The control word is `0x037f` -- round to nearest -- and nothing here
+            // changes it.
+            cpu.fpu.set_st(0, cpu.fpu.st(0).round());
+        }
+        Mnemonic::Fscale => {
+            let scale = cpu.fpu.st(1).trunc();
+            cpu.fpu.set_st(0, cpu.fpu.st(0) * scale.exp2());
+        }
+        Mnemonic::Ftst => {
+            let value = cpu.fpu.st(0);
+            cpu.fpu.compare_status(if value.is_nan() {
+                None
+            } else {
+                value.partial_cmp(&0.0)
+            });
+        }
+        Mnemonic::Fxam => {
+            // `fxam` reports the value's class in C3/C2/C0 rather than comparing
+            // it: 010 is a normal number, 011 an infinity, 100 zero, 001 a NaN
+            // and 110 a denormal. The value itself is left alone.
+            let value = cpu.fpu.st(0);
+            let class = if value.is_nan() {
+                0x0100
+            } else if value.is_infinite() {
+                0x0500
+            } else if value == 0.0 {
+                0x4000
+            } else if value.abs() < f64::MIN_POSITIVE {
+                0x4400
+            } else {
+                0x0400
+            };
+            cpu.fpu.status = (cpu.fpu.status & !0x4700) | class;
+        }
+        Mnemonic::Fldpi => cpu.fpu.push(std::f64::consts::PI),
+        Mnemonic::Fldl2t => cpu.fpu.push(std::f64::consts::LOG2_10),
+        Mnemonic::Fldl2e => cpu.fpu.push(std::f64::consts::LOG2_E),
+        Mnemonic::Fldlg2 => cpu.fpu.push(std::f64::consts::LN_2 / std::f64::consts::LN_10),
+        Mnemonic::Fldln2 => cpu.fpu.push(std::f64::consts::LN_2),
         Mnemonic::Fnstsw => {
             let status = u32::from(cpu.fpu.status);
             write_operand(memory, cpu, instruction.operand(0), Size::Word, status)?;
@@ -1255,12 +1389,54 @@ pub fn execute(
             cpu.regs.ebp = pop32(memory, cpu)?;
             Ok(Step::Continue)
         }
+        Mnemonic::Cpuid => {
+            // A Pentium III with the x87, MMX left out on purpose: this
+            // interpreter has no MMX or SSE path, so claiming either would send
+            // the guest down an arithmetic route that does not exist here.
+            // CMOV and TSC are real, which is what a 2005 game checks for.
+            const FEATURES: u32 = 0x0000_8000 | 0x0000_0100 | 0x0000_0010 | 0x0000_0001;
+            const MAX_BASIC_LEAF: u32 = 1;
+            let leaf = cpu.regs.get(EAX);
+            match leaf {
+                0 => {
+                    // "GenuineIntel", the vendor every third-party instruction
+                    // set check expects from an Intel branch.
+                    cpu.regs.set(EAX, MAX_BASIC_LEAF);
+                    cpu.regs.set(EBX, u32::from_le_bytes(*b"Genu"));
+                    cpu.regs.set(EDX, u32::from_le_bytes(*b"ineI"));
+                    cpu.regs.set(ECX, u32::from_le_bytes(*b"ntel"));
+                }
+                1 => {
+                    // Family 6, model 8, stepping 3, one logical processor.
+                    cpu.regs.set(EAX, 0x0000_0683);
+                    cpu.regs.set(EBX, 1);
+                    cpu.regs.set(ECX, 0);
+                    cpu.regs.set(EDX, FEATURES);
+                }
+                // No extended leaves: the brand string and the extended feature
+                // bits are answers this machine does not have.
+                0x8000_0000 => {
+                    cpu.regs.set(EAX, 0x8000_0000);
+                    cpu.regs.set(EBX, 0);
+                    cpu.regs.set(ECX, 0);
+                    cpu.regs.set(EDX, 0);
+                }
+                _ => {
+                    cpu.regs.set(EAX, 0);
+                    cpu.regs.set(EBX, 0);
+                    cpu.regs.set(ECX, 0);
+                    cpu.regs.set(EDX, 0);
+                }
+            }
+            Ok(Step::Continue)
+        }
         Mnemonic::Pushfd => {
-            push32(memory, cpu, cpu.regs.eflags())?;
+            // `pushfw` under a `66` prefix pushes the low half of the same image.
+            push_sized(memory, cpu, cpu.regs.eflags(), size)?;
             Ok(Step::Continue)
         }
         Mnemonic::Popfd => {
-            let value = pop32(memory, cpu)?;
+            let value = pop_sized(memory, cpu, size)?;
             cpu.regs.flags = Flags::from_eflags(value);
             Ok(Step::Continue)
         }
@@ -1484,6 +1660,37 @@ mod tests {
         .unwrap();
         assert_eq!(cpu.regs.eax, 0);
         assert!(cpu.regs.flags.cf && cpu.regs.flags.zf && cpu.regs.flags.pf);
+    }
+
+    #[test]
+    fn a_memory_decrement_sets_zero_when_it_reaches_it() {
+        // A loop that counts a stack slot down to zero and stops on `jne` depends
+        // on this: a 32-bit `dec` of 1 must leave 0 and set ZF.
+        let (mut memory, mut cpu) = machine();
+        let slot = cpu.regs.esp + 0x14;
+        memory.write_u32(slot, 1).unwrap();
+        run(
+            &mut memory,
+            &mut cpu,
+            &instruction(
+                Mnemonic::Dec,
+                Size::Dword,
+                [
+                    Operand::Mem(Mem {
+                        base: Some(crate::cpu::ESP),
+                        index: None,
+                        scale: 1,
+                        disp: 0x14,
+                        segment: None,
+                    }),
+                    Operand::None,
+                    Operand::None,
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(memory.read_u32(slot).unwrap(), 0);
+        assert!(cpu.regs.flags.zf, "a decrement to zero must set ZF");
     }
 
     #[test]
@@ -2198,5 +2405,44 @@ mod tests {
         run(&mut memory, &mut cpu, &instruction(Mnemonic::Sahf, Size::Dword, [Operand::None; 3])).unwrap();
         assert!(cpu.regs.flags.cf, "C0 becomes CF, so `jbe` takes the branch");
         assert!(!cpu.regs.flags.zf);
+    }
+
+    #[test]
+    fn the_logarithm_row_is_what_a_pow_is_built_from() {
+        let (mut memory, mut cpu) = machine();
+        // `pow(8, 3)` as the compiler writes it: the exponent goes on first and
+        // the base on top of it, so `fyl2x` computes st(1)*log2(st(0)) = 9, the
+        // logarithm of the answer.
+        cpu.fpu.push(3.0);
+        cpu.fpu.push(8.0);
+        run(&mut memory, &mut cpu, &x87_instruction(Mnemonic::Fyl2x, Operand::None, false)).unwrap();
+        assert!((cpu.fpu.st(0) - 9.0).abs() < 1e-12, "fyl2x left {}", cpu.fpu.st(0));
+        assert_eq!(cpu.fpu.st(1), 0.0, "the exponent was popped");
+
+        cpu.fpu.pop();
+        cpu.fpu.push(9.0);
+        run(&mut memory, &mut cpu, &x87_instruction(Mnemonic::F2xm1, Operand::None, false)).unwrap();
+        assert!((cpu.fpu.st(0) - 511.0).abs() < 1e-9, "f2xm1 left {}", cpu.fpu.st(0));
+    }
+
+    #[test]
+    fn negating_and_taking_the_magnitude_do_not_move_the_stack() {
+        let (mut memory, mut cpu) = machine();
+        cpu.fpu.push(-2.5);
+        run(&mut memory, &mut cpu, &x87_instruction(Mnemonic::Fchs, Operand::None, false)).unwrap();
+        assert_eq!(cpu.fpu.st(0), 2.5);
+        assert_eq!(cpu.fpu.top(), 7, "no push or pop happened");
+
+        run(&mut memory, &mut cpu, &x87_instruction(Mnemonic::Fabs, Operand::None, false)).unwrap();
+        assert_eq!(cpu.fpu.st(0), 2.5);
+    }
+
+    #[test]
+    fn the_tangent_leaves_the_one_the_hardware_pushes() {
+        let (mut memory, mut cpu) = machine();
+        cpu.fpu.push(std::f64::consts::FRAC_PI_4);
+        run(&mut memory, &mut cpu, &x87_instruction(Mnemonic::Fptan, Operand::None, false)).unwrap();
+        assert!((cpu.fpu.st(0) - 1.0).abs() < 1e-12, "the pushed constant");
+        assert!((cpu.fpu.st(1) - 1.0).abs() < 1e-12, "tan(pi/4)");
     }
 }

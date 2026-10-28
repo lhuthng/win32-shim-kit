@@ -10,6 +10,8 @@
 
 import { join, resolve } from "node:path";
 
+import { recorder } from "./gl-recorder";
+
 const root = resolve(process.argv[2] ?? "demo");
 
 let failures = 0;
@@ -222,6 +224,79 @@ try {
   check(advanced < 1000, `it did not jump by the pause (${Math.round(advanced)} ms for a 1200 ms pause)`);
 
   session.stop();
+
+  // ---- the 3D payload, through the same loader -----------------------------
+  //
+  // A Direct3D game takes the other branch: the loader replays the host's
+  // command stream into an offscreen WebGL2 canvas and copies it into the frame
+  // canvas. Here that offscreen canvas is recorder-backed, so what this proves
+  // is the wiring -- that a device is noticed, that the renderer is built once,
+  // and that a presented frame reaches the canvas -- and not what the pixels
+  // look like.
+  const three = list.payloads.find(
+    (entry: { slug: string }) => entry.slug === "d3d8-triangle",
+  );
+  check(Boolean(three), "the Direct3D payload is listed");
+  if (three) {
+    const context3d = recorder();
+    const offscreen = {
+      width: 0,
+      height: 0,
+      getContext: () => context3d.gl,
+    };
+    let copied: { width: number; height: number } | null = null;
+    const frameCanvas = {
+      width: 0,
+      height: 0,
+      getContext: () => ({
+        createImageData: (width: number, height: number) => ({
+          width,
+          height,
+          data: new Uint8ClampedArray(width * height * 4),
+        }),
+        putImageData: () => {},
+        drawImage: (image: { width: number; height: number }) => {
+          copied = { width: image.width, height: image.height };
+        },
+      }),
+    };
+    globals.document = {
+      createElement: () => offscreen,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    };
+
+    const sceneStatus: string[] = [];
+    const sceneDiagnostics: string[] = [];
+    const scene = await boot({
+      canvas: frameCanvas,
+      payloadUrl: `${base}/payloads/${three.slug}/`,
+      onStatus: (text: string) => sceneStatus.push(text),
+      onDiagnostic: (text: string) => sceneDiagnostics.push(text),
+    });
+    const deadline3d = Date.now() + 20_000;
+    while (Date.now() < deadline3d && copied === null) await Bun.sleep(50);
+    check(copied !== null, "the 3D frame reached the canvas");
+    const copy = copied as { width: number; height: number } | null;
+    check(copy?.width === 640 && copy?.height === 480, `the 3D frame is ${copy?.width}x${copy?.height}`);
+    check(
+      context3d.all("drawArrays").length > 0,
+      `${context3d.all("drawArrays").length} draw(s) reached WebGL2`,
+    );
+    check(
+      frameCanvas.width === 640 && frameCanvas.height === 480,
+      "the frame canvas is the device's back buffer",
+    );
+    check(
+      sceneStatus.some((text) => text.startsWith("running")),
+      "the 3D loader reports it is running",
+    );
+    check(
+      !sceneDiagnostics.some((text) => text.includes("no shim") || text.includes("WebGL2:")),
+      `the 3D loader reported nothing (${sceneDiagnostics.join("; ")})`,
+    );
+    scene.stop();
+  }
 } finally {
   server.stop(true);
 }

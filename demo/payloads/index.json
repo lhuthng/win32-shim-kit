@@ -12,6 +12,11 @@
       "instructions": 900000000,
       "lit": 0.01,
       "saves": ["profile.dat", "290.rec"]
+    },
+    {
+      "slug": "d3d8-triangle",
+      "title": "Direct3D 8 triangle",
+      "note": "The kit's own Direct3D 8 guest, not a game: one textured triangle, rotating, through Direct3DCreate8, a vertex buffer filled by LockRect, a bitmap uploaded as a texture, and DrawPrimitive. The page draws it with WebGL2 from the host's command stream. Two colours on the triangle are a texture and a vertex colour multiplied, so a wrong combiner is visible."
     }
   ]
 }

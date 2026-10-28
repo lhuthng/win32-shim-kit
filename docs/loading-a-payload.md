@@ -243,8 +243,10 @@ should not assume any, since a build may be any PE32 the shims cover.
 ## Checking a payload
 
 ```sh
-tools/build-web.sh                         # module only -> dist/, no game
-tools/build-web.sh <install-dir> [out]     # ... plus game/ and artifact.json
+tools/build-web.sh                          # module only -> dist/, no game
+tools/build-web.sh <install-dir> [out]      # ... plus game/ and artifact.json
+tools/build-web.sh <install-dir>/<exe> [out]  # the same, with that entry point
+bun tools/demo-check.ts <demo-dir> <instructions> <slug>   # one payload, listed or not
 bun ../doraemon-monopoly-localization/tools/web-client/browser-check.ts [install-dir] [payload] [--exe Name.exe]
 ```
 

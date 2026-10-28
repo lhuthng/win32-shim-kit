@@ -403,6 +403,14 @@ fn two_byte(
                 [decoded.operand, Operand::Imm8(bit), Operand::None],
             ))
         }
+        // `cpuid`: the guest asks what this processor is. The answer is the one
+        // the executor holds, so the decoder only has to name it.
+        0xa2 => Ok(Instruction::plain(
+            pc,
+            cursor.len(),
+            Mnemonic::Cpuid,
+            Size::Dword,
+        )),
         0xa4 | 0xa5 => {
             if width == Size::Word {
                 return Err(unsupported(pc, "16-bit shld"));
@@ -551,6 +559,13 @@ fn x87(cursor: &mut Cursor, pc: u32, opcode: u8) -> Result<Instruction> {
         instruction.x87 = true;
         instruction
     };
+    // The ten-byte integer forms: no `Size` names them, so a flag carries the
+    // width the executor reads and writes.
+    let float_extended = |mnemonic: Mnemonic| {
+        let mut instruction = float(mnemonic, Size::Dword, false);
+        instruction.extended = true;
+        instruction
+    };
     // The integer forms reuse the float arithmetic and comparison, with the
     // memory operand read as a signed integer of the instruction's width.
     let float_int = |mnemonic: Mnemonic, size: Size| {
@@ -576,9 +591,16 @@ fn x87(cursor: &mut Cursor, pc: u32, opcode: u8) -> Result<Instruction> {
             (0xdd, 0) => Ok(float(Mnemonic::Fld, Size::Dword, true)),
             (0xdd, 2) => Ok(float(Mnemonic::Fst, Size::Dword, true)),
             (0xdd, 3) => Ok(float(Mnemonic::Fstp, Size::Dword, true)),
+            // `dd /7`: the status word to memory instead of to `ax`. A compiler
+            // uses it when `eax` is busy and reads the flags back as bytes.
+            (0xdd, 7) => Ok(float(Mnemonic::Fnstsw, Size::Word, false)),
             (0xdb, 0) => Ok(float(Mnemonic::Fild, Size::Dword, false)),
             (0xdb, 2) => Ok(float(Mnemonic::Fist, Size::Dword, false)),
             (0xdb, 3) => Ok(float(Mnemonic::Fistp, Size::Dword, false)),
+            // `db /5` and `db /7`: the ten-byte integer load and store, which a
+            // CRT reaches for when a `long long` passes through `long double`.
+            (0xdb, 5) => Ok(float_extended(Mnemonic::Fild)),
+            (0xdb, 7) => Ok(float_extended(Mnemonic::Fistp)),
             (0xdf, 0) => Ok(float(Mnemonic::Fild, Size::Word, false)),
             (0xdf, 2) => Ok(float(Mnemonic::Fist, Size::Word, false)),
             (0xdf, 3) => Ok(float(Mnemonic::Fistp, Size::Word, false)),
@@ -680,16 +702,33 @@ fn x87(cursor: &mut Cursor, pc: u32, opcode: u8) -> Result<Instruction> {
         (0xd9, 4) => match index {
             0 => Ok(stack(Mnemonic::Fchs, [Operand::None; 3])),
             1 => Ok(stack(Mnemonic::Fabs, [Operand::None; 3])),
+            // `d9 e4`/`d9 e5`: the two instructions that only set the condition
+            // codes, which a `test`/`sahf` sequence then turns into a branch.
+            4 => Ok(stack(Mnemonic::Ftst, [Operand::None; 3])),
+            5 => Ok(stack(Mnemonic::Fxam, [Operand::None; 3])),
             _ => Err(unsupported(pc, &format!("x87 d9 /4 rm={index}"))),
         },
         (0xd9, 5) => match index {
             0 => Ok(stack(Mnemonic::Fld1, [Operand::None; 3])),
+            1 => Ok(stack(Mnemonic::Fldl2t, [Operand::None; 3])),
+            2 => Ok(stack(Mnemonic::Fldl2e, [Operand::None; 3])),
+            3 => Ok(stack(Mnemonic::Fldpi, [Operand::None; 3])),
+            4 => Ok(stack(Mnemonic::Fldlg2, [Operand::None; 3])),
+            5 => Ok(stack(Mnemonic::Fldln2, [Operand::None; 3])),
             6 => Ok(stack(Mnemonic::Fldz, [Operand::None; 3])),
             _ => Err(unsupported(pc, &format!("x87 d9 /5 rm={index}"))),
         },
         // `d9 f0`-`d9 f7`: the register field is 6, and the rm field picks the
         // operation. FDECSTP and FINCSTP belong here -- `d9 f6` and `d9 f7`.
         (0xd9, 6) => match index {
+            0 => Ok(stack(Mnemonic::F2xm1, [Operand::None; 3])),
+            // `d9 f1`, which is the whole of a 2005 game's `pow`: the compiler
+            // writes `fyl2x` and a `f2xm1`/`fscale` pair around it.
+            1 => Ok(stack(Mnemonic::Fyl2x, [Operand::None; 3])),
+            2 => Ok(stack(Mnemonic::Fptan, [Operand::None; 3])),
+            3 => Ok(stack(Mnemonic::Fpatan, [Operand::None; 3])),
+            4 => Ok(stack(Mnemonic::Fxtract, [Operand::None; 3])),
+            5 => Ok(stack(Mnemonic::Fprem1, [Operand::None; 3])),
             6 => Ok(stack(Mnemonic::Fdecstp, [Operand::None; 3])),
             7 => Ok(stack(Mnemonic::Fincstp, [Operand::None; 3])),
             _ => Err(unsupported(pc, &format!("x87 d9 /6 rm={index}"))),
@@ -699,10 +738,24 @@ fn x87(cursor: &mut Cursor, pc: u32, opcode: u8) -> Result<Instruction> {
         // computes into a stack rotation and leaves the angle where the sine
         // should be, which draws a linear ramp where an oscillation belongs.
         (0xd9, 7) => match index {
+            0 => Ok(stack(Mnemonic::Fprem, [Operand::None; 3])),
+            1 => Ok(stack(Mnemonic::Fyl2xp1, [Operand::None; 3])),
             2 => Ok(stack(Mnemonic::Fsqrt, [Operand::None; 3])),
+            3 => Ok(stack(Mnemonic::Fsincos, [Operand::None; 3])),
+            4 => Ok(stack(Mnemonic::Frndint, [Operand::None; 3])),
+            5 => Ok(stack(Mnemonic::Fscale, [Operand::None; 3])),
             6 => Ok(stack(Mnemonic::Fsin, [Operand::None; 3])),
             7 => Ok(stack(Mnemonic::Fcos, [Operand::None; 3])),
             _ => Err(unsupported(pc, &format!("x87 d9 /7 rm={index}"))),
+        },
+        // `dd c0`-`dd ff`: the free and register-store forms, which address
+        // `st(i)` in the rm field rather than in memory.
+        (0xdd, 0) => Ok(stack(Mnemonic::Ffree, [Operand::Imm8(index), Operand::None, Operand::None])),
+        (0xdd, 2) => {
+            Ok(stack(Mnemonic::Fst, [Operand::Imm8(index), Operand::None, Operand::None]))
+        }
+        (0xdd, 3) => {
+            Ok(stack(Mnemonic::Fstp, [Operand::Imm8(index), Operand::None, Operand::None]))
         },
         (0xdb, 4) if index == 2 => Ok(stack(Mnemonic::Fnclex, [Operand::None; 3])),
         (0xdb, 4) if index == 3 => Ok(stack(Mnemonic::Fninit, [Operand::None; 3])),
@@ -988,15 +1041,15 @@ fn decode_opcode(
         0x98 => Instruction::plain(pc, cursor.len(), Mnemonic::Cwde, width),
         0x99 => Instruction::plain(pc, cursor.len(), Mnemonic::Cdq, width),
         0x9c | 0x9d => {
-            if width == Size::Word {
-                return Err(unsupported(pc, "16-bit pushf or popf"));
-            }
+            // `pushfw`/`popfw` move two bytes of flags, which is what the `66`
+            // prefix asks for. The executor is told the width rather than a
+            // second mnemonic, so one arm serves both.
             let mnemonic = if opcode == 0x9c {
                 Mnemonic::Pushfd
             } else {
                 Mnemonic::Popfd
             };
-            Instruction::plain(pc, cursor.len(), mnemonic, Size::Dword)
+            Instruction::plain(pc, cursor.len(), mnemonic, width)
         }
         0x9b => Instruction::plain(pc, cursor.len(), Mnemonic::Wait, Size::Dword),
         0x9e => Instruction::plain(pc, cursor.len(), Mnemonic::Sahf, Size::Dword),
@@ -1241,6 +1294,28 @@ mod tests {
         let mut memory = GuestMemory::empty(0x100).unwrap();
         memory.write_bytes(IMAGE_BASE, bytes).unwrap();
         decode(&memory, IMAGE_BASE).expect_err("must not decode")
+    }
+
+    #[test]
+    fn decodes_the_ten_byte_integer_load_and_store() {
+        // `db /5 m80` and `db /7 m80`: FILD and FISTP on a ten-byte integer,
+        // which the CRT reaches for when a `long long` rounds through a
+        // `long double`. The flag carries the width; no Size names it.
+        let fild = decode_bytes(&[0xdb, 0x2d, 0x34, 0x12, 0x00, 0x00]);
+        assert_eq!(fild.mnemonic, Mnemonic::Fild);
+        assert!(fild.extended, "db /5 is the ten-byte load");
+        assert!(!fild.double);
+        assert!(fild.x87);
+
+        let fistp = decode_bytes(&[0xdb, 0x3d, 0x34, 0x12, 0x00, 0x00]);
+        assert_eq!(fistp.mnemonic, Mnemonic::Fistp);
+        assert!(fistp.extended, "db /7 is the ten-byte store");
+
+        // The 32-bit siblings stay plain, so the executor's width choice does
+        // not silently widen them.
+        let fild32 = decode_bytes(&[0xdb, 0x05, 0x34, 0x12, 0x00, 0x00]);
+        assert_eq!(fild32.mnemonic, Mnemonic::Fild);
+        assert!(!fild32.extended && !fild32.double);
     }
 
     #[test]
@@ -1598,6 +1673,24 @@ mod tests {
         let status = decode_bytes(&[0xdf, 0xe0]);
         assert_eq!(status.mnemonic, Mnemonic::Fnstsw);
         assert_eq!(status.operands[0], Operand::Reg(EAX));
+
+        // `dd bd 60 ff ff ff`: FNSTSW word ptr [ebp-0xa0], the same status word
+        // with `ax` out of the way. Madagascar's Game.exe uses it.
+        let status_memory = decode_bytes(&[0xdd, 0xbd, 0x60, 0xff, 0xff, 0xff]);
+        assert_eq!(status_memory.mnemonic, Mnemonic::Fnstsw);
+        assert!(status_memory.x87);
+        assert_eq!(status_memory.size, Size::Word);
+        assert_eq!(status_memory.len, 6);
+        assert_eq!(
+            status_memory.operands[0],
+            Operand::Mem(Mem {
+                base: Some(EBP),
+                index: None,
+                scale: 1,
+                disp: -0xa0,
+                segment: None,
+            })
+        );
 
         assert_eq!(decode_bytes(&[0x9b]).mnemonic, Mnemonic::Wait);
     }

@@ -37,6 +37,39 @@ const E_NOINTERFACE: u32 = 0x8000_4002;
 /// `DSBSTATUS_*`: what `GetStatus` reports.
 pub const DSBSTATUS_PLAYING: u32 = 0x1;
 pub const DSBSTATUS_LOOPING: u32 = 0x4;
+/// `DS_CERTIFIED`: what `VerifyCertification` reports. The alternative,
+/// `DS_UNCERTIFIED`, is what a driver without hardware mixing says.
+const DS_CERTIFIED: u32 = 0;
+/// `KSPROPERTY_SUPPORT_*`: what `QuerySupport` reports about a property set.
+const KSPROPERTY_SUPPORT_GET: u32 = 1;
+const KSPROPERTY_SUPPORT_SET: u32 = 2;
+
+/// `IID_IUnknown`, the one interface every object offers.
+const IID_IUNKNOWN: [u8; 16] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+/// `IID_IDirectSoundNotify`
+/// `B0210783-89CD-11D0-AF08-00A0C925CD16`, little-endian fields first.
+const IID_NOTIFY: [u8; 16] = [
+    0x83, 0x07, 0x21, 0xb0, 0xcd, 0x89, 0xd0, 0x11, 0xaf, 0x08, 0x00, 0xa0, 0xc9, 0x25, 0xcd, 0x16,
+];
+/// `IID_IKsPropertySet`
+/// `31EFAC30-515C-11D0-A9AA-00AA0061BE93`, little-endian fields first. This is
+/// the interface a guest probes for effect support before it uses it, which is
+/// why the QI above hands it a real object.
+const IID_IKS_PROPERTYSET: [u8; 16] = [
+    0x30, 0xac, 0xef, 0x31, 0x5c, 0x51, 0xd0, 0x11, 0xa9, 0xaa, 0x00, 0xaa, 0x00, 0x61, 0xbe, 0x93,
+];
+/// `IID_IDirectSound3DBuffer`
+/// `279AFA86-4981-11CE-A521-0020AF0BE560`, little-endian fields first.
+const IID_3D_BUFFER: [u8; 16] = [
+    0x86, 0xfa, 0x9a, 0x27, 0x81, 0x49, 0xce, 0x11, 0xa5, 0x21, 0x00, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
+];
+/// `IID_IDirectSound3DListener`
+/// `279AFA84-4981-11CE-A521-0020AF0BE560`, little-endian fields first.
+const IID_3D_LISTENER: [u8; 16] = [
+    0x84, 0xfa, 0x9a, 0x27, 0x81, 0x49, 0xce, 0x11, 0xa5, 0x21, 0x00, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
+];
 /// `DSBPLAY_LOOPING`: the only play flag the guest uses.
 const DSBPLAY_LOOPING: u32 = 0x1;
 /// `DSBCAPS_PRIMARYBUFFER`.
@@ -135,6 +168,10 @@ impl Default for Format {
 struct SoundBuffer {
     refs: u32,
     primary: bool,
+    /// The `DSBCAPS_*` flags the guest asked for at creation, which `GetCaps`
+    /// reports back: a guest that created a buffer with control flags checks
+    /// for them again before it uses the controls.
+    caps: u32,
     /// Bytes the guest asked for and the guest address holding them. Zero for
     /// the primary buffer, which has no samples.
     size: u32,
@@ -212,6 +249,12 @@ pub struct DirectSound {
     /// How many sounds the guest started, for the page's status line and tests.
     plays: u64,
     cooperative_level: u32,
+    /// The 3D parameters of every `IDirectSound3DBuffer` handed out, by object.
+    /// The page's mixer does not place voices yet, but a guest that sets and
+    /// reads back its positions has to see its own numbers.
+    spatial: HashMap<u32, Spatial>,
+    /// The same for `IDirectSound3DListener`, of which a session has one.
+    listeners: HashMap<u32, Listener>,
 }
 
 impl Default for DirectSound {
@@ -225,6 +268,8 @@ impl Default for DirectSound {
             events: Vec::new(),
             plays: 0,
             cooperative_level: 0,
+            spatial: HashMap::new(),
+            listeners: HashMap::new(),
         }
     }
 }
@@ -318,7 +363,10 @@ impl DirectSound {
     }
 }
 
-/// `IDirectSound`, in vtable order.
+/// `IDirectSound`, in vtable order, plus the one method `IDirectSound8` adds:
+/// a guest that created its device through `DirectSoundCreate8` talks to an
+/// `IDirectSound8`, whose first eleven slots are these and whose twelfth asks
+/// whether the driver is certified.
 pub(crate) const SOUND_METHODS: &[Option<Method>] = &[
     m("QueryInterface", 12),
     m("AddRef", 4),
@@ -330,20 +378,21 @@ pub(crate) const SOUND_METHODS: &[Option<Method>] = &[
     m("Compact", 4),
     m("GetSpeakerConfig", 8),
     m("SetSpeakerConfig", 8),
-    m("Initialize", 12),
+    m("Initialize", 8),
+    m("VerifyCertification", 8),
 ];
 
 /// `IDirectSoundBuffer`, in vtable order. The offsets match DirectX 5:
 /// `Lock` 0x2C, `Play` 0x30, `SetCurrentPosition` 0x34, `SetFormat` 0x38,
 /// `SetVolume` 0x3C, `SetPan` 0x40, `SetFrequency` 0x44, `Stop` 0x48,
-/// `Unlock` 0x4C.
+/// `Unlock` 0x4C, and `Restore` follows them at 0x50.
 pub(crate) const BUFFER_METHODS: &[Option<Method>] = &[
     m("QueryInterface", 12),
     m("AddRef", 4),
     m("Release", 4),
     m("GetCaps", 8),
     m("GetCurrentPosition", 12),
-    m("GetFormat", 12),
+    m("GetFormat", 16),
     m("GetVolume", 8),
     m("GetPan", 8),
     m("GetFrequency", 8),
@@ -358,11 +407,148 @@ pub(crate) const BUFFER_METHODS: &[Option<Method>] = &[
     m("SetFrequency", 8),
     m("Stop", 4),
     m("Unlock", 20),
+    m("Restore", 4),
 ];
+
+/// `IDirectSoundNotify`, in vtable order: the interface a guest pins play
+/// events to.
+pub(crate) const NOTIFY_METHODS: &[Option<Method>] = &[
+    m("QueryInterface", 12),
+    m("AddRef", 4),
+    m("Release", 4),
+    m("SetNotificationPositions", 12),
+];
+
+/// `IDirectSound3DBuffer`, in vtable order. The getters and setters are paired
+/// by name, and every setter ends with an apply flag this host answers
+/// immediately, so the deferred mode is answered the same way.
+pub(crate) const THREE_D_METHODS: &[Option<Method>] = &[
+    m("QueryInterface", 12),
+    m("AddRef", 4),
+    m("Release", 4),
+    m("GetAllParameters", 8),
+    m("GetConeAngles", 12),
+    m("GetConeOrientation", 8),
+    m("GetConeOutsideVolume", 8),
+    m("GetMaxDistance", 8),
+    m("GetMinDistance", 8),
+    m("GetMode", 8),
+    m("GetPosition", 8),
+    m("GetVelocity", 8),
+    m("SetAllParameters", 12),
+    m("SetConeAngles", 16),
+    m("SetConeOrientation", 20),
+    m("SetConeOutsideVolume", 12),
+    m("SetMaxDistance", 12),
+    m("SetMinDistance", 12),
+    m("SetMode", 12),
+    m("SetPosition", 20),
+    m("SetVelocity", 20),
+];
+
+/// `IKsPropertySet`, in vtable order: the interface a guest asks what effect
+/// property sets the driver supports.
+pub(crate) const PROPERTY_SET_METHODS: &[Option<Method>] = &[
+    m("QueryInterface", 12),
+    m("AddRef", 4),
+    m("Release", 4),
+    m("Get", 32),
+    m("Set", 28),
+    m("QuerySupport", 16),
+];
+
+/// `IDirectSound3DListener`, in vtable order: the primary buffer's 3D twin.
+pub(crate) const LISTENER_METHODS: &[Option<Method>] = &[
+    m("QueryInterface", 12),
+    m("AddRef", 4),
+    m("Release", 4),
+    m("GetAllParameters", 8),
+    m("GetDistanceFactor", 8),
+    m("GetDopplerFactor", 8),
+    m("GetOrientation", 12),
+    m("GetPosition", 8),
+    m("GetRolloffFactor", 8),
+    m("GetVelocity", 8),
+    m("SetAllParameters", 12),
+    m("SetDistanceFactor", 12),
+    m("SetDopplerFactor", 12),
+    m("SetOrientation", 32),
+    m("SetPosition", 20),
+    m("SetRolloffFactor", 12),
+    m("SetVelocity", 20),
+    m("CommitDeferredSettings", 4),
+];
+
+/// The 3D parameters one `IDirectSound3DListener` carries, stored as raw bits
+/// like the buffer's are. The defaults are DirectSound's: no distance scaling,
+/// no Doppler, ears at the origin facing forward.
+#[derive(Clone, Copy)]
+pub struct Listener {
+    pub position: [u32; 3],
+    pub velocity: [u32; 3],
+    pub orientation_front: [u32; 3],
+    pub orientation_top: [u32; 3],
+    pub distance_factor: u32,
+    pub rolloff_factor: u32,
+    pub doppler_factor: u32,
+}
+
+impl Default for Listener {
+    fn default() -> Self {
+        Self {
+            position: [0; 3],
+            velocity: [0; 3],
+            // Facing down -z with up along +y, the DirectSound default.
+            orientation_front: [0, 0, 0xbf80_0000_u32], // -1.0f
+            orientation_top: [0, 0x3f80_0000_u32, 0],   // 1.0f
+            distance_factor: 1.0_f32.to_bits(),
+            rolloff_factor: 1.0_f32.to_bits(),
+            doppler_factor: 1.0_f32.to_bits(),
+        }
+    }
+}
+
+/// The 3D parameters one `IDirectSound3DBuffer` carries, stored as the raw bits
+/// a setter took so a getter hands them back unchanged. The defaults are the
+/// ones DirectSound documents: centred, facing forward, one metre near, and
+/// hearing everything.
+#[derive(Clone, Copy)]
+pub struct Spatial {
+    pub position: [u32; 3],
+    pub velocity: [u32; 3],
+    pub cone_orientation: [u32; 3],
+    pub cone_inside: u32,
+    pub cone_outside: u32,
+    pub cone_outside_volume: u32,
+    pub min_distance: u32,
+    pub max_distance: u32,
+    pub mode: u32,
+}
+
+impl Default for Spatial {
+    fn default() -> Self {
+        Self {
+            position: [0; 3],
+            velocity: [0; 3],
+            cone_orientation: [0; 3],
+            cone_inside: 360,
+            cone_outside: 360,
+            cone_outside_volume: 0,
+            min_distance: 1.0_f32.to_bits(),
+            max_distance: 1.0e9_f32.to_bits(),
+            mode: 0, // DS3DMODE_NORMAL
+        }
+    }
+}
 
 pub const SHIMS: &[Binding] = &[
     // Ordinal 1: `DirectSoundCreate(LPGUID, LPDIRECTSOUND *, LPUNKNOWN)`.
     Binding { dll: DSOUND, name: "#1", arg_bytes: 12, shim: direct_sound_create },
+    // Ordinal 11: `DirectSoundCreate8(LPGUID, LPDIRECTSOUND8 *, LPUNKNOWN)`,
+    // the DX8 create a guest imports when it wants the eight-and-later
+    // interface. Its first eleven slots are `IDirectSound`'s, so the same
+    // device answers both.
+    Binding { dll: DSOUND, name: "#11", arg_bytes: 12, shim: direct_sound_create },
 ];
 
 fn direct_sound_create(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
@@ -381,6 +567,152 @@ fn direct_sound_create(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         "DirectSound: device created (primary buffer, 8 mixing slots, 22050 Hz)".to_string(),
     );
     Ok(Return(DS_OK))
+}
+
+/// `QueryInterface`: `IID_IUnknown` answers the same object one reference
+/// heavier, and the two interfaces a guest upgrades a buffer to are answered
+/// with real objects a guest then drives. Everything else is refused the way
+/// COM refuses it, with `E_NOINTERFACE`: a guest told an interface exists
+/// would call into a vtable this host cannot answer.
+fn query_interface(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let this = call.arg(0)?;
+    let riid = call.arg(1)?;
+    let destination = call.arg(2)?;
+    if destination == 0 {
+        return Ok(Return(DSERR_INVALIDPARAM));
+    }
+    let mut iid = [0_u8; 16];
+    for (index, bytes) in iid.chunks_exact_mut(4).enumerate() {
+        bytes.copy_from_slice(&call.memory.read_u32(riid + index as u32 * 4)?.to_le_bytes());
+    }
+    let object = if iid == IID_IUNKNOWN {
+        add_ref(host, this);
+        this
+    } else if iid == IID_IKS_PROPERTYSET {
+        thunks::new_object(call.memory, host, thunks::DSOUND_PROPERTY_SET)?
+    } else if iid == IID_NOTIFY {
+        thunks::new_object(call.memory, host, thunks::DSOUND_NOTIFY)?
+    } else if iid == IID_3D_BUFFER {
+        thunks::new_object(call.memory, host, thunks::DSOUND_3D_BUFFER)?
+    } else if iid == IID_3D_LISTENER {
+        thunks::new_object(call.memory, host, thunks::DSOUND_3D_LISTENER)?
+    } else {
+        return Ok(Return(E_NOINTERFACE));
+    };
+    call.write_u32(destination, object)?;
+    Ok(Return(DS_OK))
+}
+
+/// `sizeof(DS3DBUFFER)` and where its members sit: the size dword, then the
+/// position and velocity vectors, the two cone angles, the cone orientation,
+/// the cone's outside volume, the two distances, and the mode.
+const DS3DBUFFER_BYTES: u32 = 64;
+const W3D_POSITION: u32 = 4;
+const W3D_VELOCITY: u32 = 16;
+const W3D_CONE_INSIDE: u32 = 28;
+const W3D_CONE_OUTSIDE: u32 = 32;
+const W3D_CONE_ORIENTATION: u32 = 36;
+const W3D_CONE_OUTSIDE_VOLUME: u32 = 48;
+const W3D_MIN_DISTANCE: u32 = 52;
+const W3D_MAX_DISTANCE: u32 = 56;
+const W3D_MODE: u32 = 60;
+
+/// The 3D parameters of an object, created from the documented defaults the
+/// first time a guest asks about a buffer it has only positioned pieces of.
+fn spatial_of(host: &mut Host, object: u32) -> Spatial {
+    *host.audio.spatial.entry(object).or_default()
+}
+
+/// Reads a `D3DVECTOR` as three raw float bits.
+fn read_vector(call: &Call<'_>, at: u32) -> Result<[u32; 3]> {
+    Ok([
+        call.memory.read_u32(at)?,
+        call.memory.read_u32(at + 4)?,
+        call.memory.read_u32(at + 8)?,
+    ])
+}
+
+/// Writes a `D3DVECTOR` as three raw float bits.
+fn write_vector(call: &mut Call<'_>, at: u32, vector: [u32; 3]) -> Result<()> {
+    for (index, word) in vector.iter().enumerate() {
+        call.write_u32(at + index as u32 * 4, *word)?;
+    }
+    Ok(())
+}
+
+/// Reads a whole `DS3DBUFFER`, which is how `SetAllParameters` sets everything
+/// at once.
+fn read_spatial(call: &Call<'_>, at: u32) -> Result<Spatial> {
+    Ok(Spatial {
+        position: read_vector(call, at + W3D_POSITION)?,
+        velocity: read_vector(call, at + W3D_VELOCITY)?,
+        cone_orientation: read_vector(call, at + W3D_CONE_ORIENTATION)?,
+        cone_inside: call.memory.read_u32(at + W3D_CONE_INSIDE)?,
+        cone_outside: call.memory.read_u32(at + W3D_CONE_OUTSIDE)?,
+        cone_outside_volume: call.memory.read_u32(at + W3D_CONE_OUTSIDE_VOLUME)?,
+        min_distance: call.memory.read_u32(at + W3D_MIN_DISTANCE)?,
+        max_distance: call.memory.read_u32(at + W3D_MAX_DISTANCE)?,
+        mode: call.memory.read_u32(at + W3D_MODE)?,
+    })
+}
+
+/// Writes a whole `DS3DBUFFER`, which is how `GetAllParameters` answers.
+fn write_spatial(call: &mut Call<'_>, at: u32, spatial: &Spatial) -> Result<()> {
+    call.write_u32(at, DS3DBUFFER_BYTES)?; // dwSize
+    write_vector(call, at + W3D_POSITION, spatial.position)?;
+    write_vector(call, at + W3D_VELOCITY, spatial.velocity)?;
+    call.write_u32(at + W3D_CONE_INSIDE, spatial.cone_inside)?;
+    call.write_u32(at + W3D_CONE_OUTSIDE, spatial.cone_outside)?;
+    write_vector(call, at + W3D_CONE_ORIENTATION, spatial.cone_orientation)?;
+    call.write_u32(at + W3D_CONE_OUTSIDE_VOLUME, spatial.cone_outside_volume)?;
+    call.write_u32(at + W3D_MIN_DISTANCE, spatial.min_distance)?;
+    call.write_u32(at + W3D_MAX_DISTANCE, spatial.max_distance)?;
+    call.write_u32(at + W3D_MODE, spatial.mode)?;
+    Ok(())
+}
+
+/// `sizeof(DS3DLISTENER)` and where its members sit: the size dword, then the
+/// position and velocity, the two orientation vectors, and the three scaling
+/// factors.
+const DS3DLISTENER_BYTES: u32 = 64;
+const L3D_POSITION: u32 = 4;
+const L3D_VELOCITY: u32 = 16;
+const L3D_ORIENT_FRONT: u32 = 28;
+const L3D_ORIENT_TOP: u32 = 40;
+const L3D_DISTANCE_FACTOR: u32 = 52;
+const L3D_ROLLOFF_FACTOR: u32 = 56;
+const L3D_DOPPLER_FACTOR: u32 = 60;
+
+/// The 3D parameters of a listener, created from the documented defaults the
+/// first time a guest asks.
+fn listener_of(host: &mut Host, object: u32) -> Listener {
+    *host.audio.listeners.entry(object).or_default()
+}
+
+/// Reads a whole `DS3DLISTENER`, which is how `SetAllParameters` sets it all.
+fn read_listener(call: &Call<'_>, at: u32) -> Result<Listener> {
+    Ok(Listener {
+        position: read_vector(call, at + L3D_POSITION)?,
+        velocity: read_vector(call, at + L3D_VELOCITY)?,
+        orientation_front: read_vector(call, at + L3D_ORIENT_FRONT)?,
+        orientation_top: read_vector(call, at + L3D_ORIENT_TOP)?,
+        distance_factor: call.memory.read_u32(at + L3D_DISTANCE_FACTOR)?,
+        rolloff_factor: call.memory.read_u32(at + L3D_ROLLOFF_FACTOR)?,
+        doppler_factor: call.memory.read_u32(at + L3D_DOPPLER_FACTOR)?,
+    })
+}
+
+/// Writes a whole `DS3DLISTENER`, which is how `GetAllParameters` answers.
+fn write_listener(call: &mut Call<'_>, at: u32, listener: &Listener) -> Result<()> {
+    call.write_u32(at, DS3DLISTENER_BYTES)?; // dwSize
+    write_vector(call, at + L3D_POSITION, listener.position)?;
+    write_vector(call, at + L3D_VELOCITY, listener.velocity)?;
+    write_vector(call, at + L3D_ORIENT_FRONT, listener.orientation_front)?;
+    write_vector(call, at + L3D_ORIENT_TOP, listener.orientation_top)?;
+    call.write_u32(at + L3D_DISTANCE_FACTOR, listener.distance_factor)?;
+    call.write_u32(at + L3D_ROLLOFF_FACTOR, listener.rolloff_factor)?;
+    call.write_u32(at + L3D_DOPPLER_FACTOR, listener.doppler_factor)?;
+    Ok(())
 }
 
 pub(crate) fn serve(
@@ -425,9 +757,357 @@ pub(crate) fn serve(
         ));
     }
     match (kind, name) {
-        (_, "QueryInterface") => Ok(Return(E_NOINTERFACE)),
+        (_, "QueryInterface") => query_interface(host, call),
         (_, "AddRef") => Ok(Return(add_ref(host, call.arg(0)?))),
         (_, "Release") => Ok(Return(release(host, call.arg(0)?))),
+
+        // ---- IDirectSoundNotify -------------------------------------------
+        // A notification the page never fires is a guest waiting on an event,
+        // which the trace says; accepting the positions is what keeps the run
+        // going so the next call can name itself.
+        (thunks::DSOUND_NOTIFY, "SetNotificationPositions") => Ok(Return(DS_OK)),
+
+        // ---- IDirectSound3DListener ---------------------------------------
+        // Stored and answered like the buffer's 3D twin: the ears' position and
+        // orientation are the guest's numbers until the mixer places voices.
+        (thunks::DSOUND_3D_LISTENER, "GetAllParameters") => {
+            let object = call.arg(0)?;
+            let destination = call.arg(1)?;
+            if destination != 0 {
+                let listener = listener_of(host, object);
+                write_listener(call, destination, &listener)?;
+            }
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_LISTENER, "SetAllParameters") => {
+            let object = call.arg(0)?;
+            let source = call.arg(1)?;
+            if source != 0 {
+                let listener = read_listener(call, source)?;
+                host.audio.listeners.insert(object, listener);
+            }
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_LISTENER, "GetDistanceFactor" | "GetDopplerFactor" | "GetRolloffFactor") => {
+            let object = call.arg(0)?;
+            let destination = call.arg(1)?;
+            let listener = listener_of(host, object);
+            let value = match name {
+                "GetDistanceFactor" => listener.distance_factor,
+                "GetDopplerFactor" => listener.doppler_factor,
+                _ => listener.rolloff_factor,
+            };
+            if destination != 0 {
+                call.write_u32(destination, value)?;
+            }
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_LISTENER, "SetDistanceFactor" | "SetDopplerFactor" | "SetRolloffFactor") => {
+            let object = call.arg(0)?;
+            let value = call.arg(1)?;
+            let listener = listener_of(host, object);
+            let updated = match name {
+                "SetDistanceFactor" => Listener {
+                    distance_factor: value,
+                    ..listener
+                },
+                "SetDopplerFactor" => Listener {
+                    doppler_factor: value,
+                    ..listener
+                },
+                _ => Listener {
+                    rolloff_factor: value,
+                    ..listener
+                },
+            };
+            host.audio.listeners.insert(object, updated);
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_LISTENER, "GetOrientation") => {
+            let object = call.arg(0)?;
+            let front = call.arg(1)?;
+            let top = call.arg(2)?;
+            let listener = listener_of(host, object);
+            if front != 0 {
+                write_vector(call, front, listener.orientation_front)?;
+            }
+            if top != 0 {
+                write_vector(call, top, listener.orientation_top)?;
+            }
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_LISTENER, "SetOrientation") => {
+            let object = call.arg(0)?;
+            let front = [call.arg(1)?, call.arg(2)?, call.arg(3)?];
+            let top = [call.arg(4)?, call.arg(5)?, call.arg(6)?];
+            let listener = listener_of(host, object);
+            host.audio.listeners.insert(
+                object,
+                Listener {
+                    orientation_front: front,
+                    orientation_top: top,
+                    ..listener
+                },
+            );
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_LISTENER, "GetPosition" | "GetVelocity") => {
+            let object = call.arg(0)?;
+            let destination = call.arg(1)?;
+            let listener = listener_of(host, object);
+            let vector = if name == "GetPosition" {
+                listener.position
+            } else {
+                listener.velocity
+            };
+            if destination != 0 {
+                write_vector(call, destination, vector)?;
+            }
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_LISTENER, "SetPosition" | "SetVelocity") => {
+            let object = call.arg(0)?;
+            let vector = [call.arg(1)?, call.arg(2)?, call.arg(3)?];
+            let listener = listener_of(host, object);
+            let updated = if name == "SetPosition" {
+                Listener {
+                    position: vector,
+                    ..listener
+                }
+            } else {
+                Listener {
+                    velocity: vector,
+                    ..listener
+                }
+            };
+            host.audio.listeners.insert(object, updated);
+            Ok(Return(DS_OK))
+        }
+        // A deferred parameter batch is applied by every setter already, so
+        // committing is a formality.
+        (thunks::DSOUND_3D_LISTENER, "CommitDeferredSettings") => Ok(Return(DS_OK)),
+
+        // ---- IKsPropertySet -------------------------------------------------
+        // The page's mixer applies no effect properties, so `Get` answers the
+        // flat state (everything zeroed) and `Set` accepts and forgets, the way
+        // the lighting shims accept a game's lights. Refusing them is what sent
+        // this guest down its no-EAX path, which reads a channel this host
+        // never filled; the property-set dialogue itself has to succeed for the
+        // guest to stay on the KsPropertySet road.
+        (thunks::DSOUND_PROPERTY_SET, "Set") => Ok(Return(DS_OK)),
+        (thunks::DSOUND_PROPERTY_SET, "Get") => {
+            let data = call.arg(5)?;
+            let length = call.arg(6)?;
+            let written = call.arg(7)?;
+            if data != 0 && length != 0 {
+                // EAX properties are dwords; zeroing them answers a flat reverb.
+                call.zero(data, length.min(256))?;
+            }
+            if written != 0 {
+                call.write_u32(written, if length == 0 { 0 } else { length.min(256) })?;
+            }
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_PROPERTY_SET, "QuerySupport") => {
+            let support = call.arg(3)?;
+            if support != 0 {
+                call.write_u32(
+                    support,
+                    KSPROPERTY_SUPPORT_GET | KSPROPERTY_SUPPORT_SET,
+                )?;
+            }
+            Ok(Return(DS_OK))
+        }
+
+        // ---- IDirectSound3DBuffer -----------------------------------------
+        // The page mixes with volume and pan, so these parameters are stored
+        // and answered rather than applied: a guest that sets a position and
+        // reads it back sees its own numbers, which is what keeps its book-
+        // keeping running until the mixer can place voices.
+        (thunks::DSOUND_3D_BUFFER, "GetAllParameters") => {
+            let object = call.arg(0)?;
+            let destination = call.arg(1)?;
+            if destination != 0 {
+                let spatial = spatial_of(host, object);
+                write_spatial(call, destination, &spatial)?;
+            }
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_BUFFER, "SetAllParameters") => {
+            let object = call.arg(0)?;
+            let source = call.arg(1)?;
+            if source != 0 {
+                let spatial = read_spatial(call, source)?;
+                host.audio.spatial.insert(object, spatial);
+            }
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_BUFFER, "GetConeAngles") => {
+            let object = call.arg(0)?;
+            let inside = call.arg(1)?;
+            let outside = call.arg(2)?;
+            let spatial = spatial_of(host, object);
+            if inside != 0 {
+                call.write_u32(inside, spatial.cone_inside)?;
+            }
+            if outside != 0 {
+                call.write_u32(outside, spatial.cone_outside)?;
+            }
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_BUFFER, "GetConeOrientation") => {
+            let object = call.arg(0)?;
+            let destination = call.arg(1)?;
+            let spatial = spatial_of(host, object);
+            if destination != 0 {
+                write_vector(call, destination, spatial.cone_orientation)?;
+            }
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_BUFFER, "GetConeOutsideVolume") => {
+            let object = call.arg(0)?;
+            let destination = call.arg(1)?;
+            let spatial = spatial_of(host, object);
+            if destination != 0 {
+                call.write_u32(destination, spatial.cone_outside_volume)?;
+            }
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_BUFFER, "GetMaxDistance" | "GetMinDistance") => {
+            let object = call.arg(0)?;
+            let destination = call.arg(1)?;
+            let spatial = spatial_of(host, object);
+            let value = if name == "GetMaxDistance" {
+                spatial.max_distance
+            } else {
+                spatial.min_distance
+            };
+            if destination != 0 {
+                call.write_u32(destination, value)?;
+            }
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_BUFFER, "GetMode") => {
+            let object = call.arg(0)?;
+            let destination = call.arg(1)?;
+            let spatial = spatial_of(host, object);
+            if destination != 0 {
+                call.write_u32(destination, spatial.mode)?;
+            }
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_BUFFER, "GetPosition" | "GetVelocity") => {
+            let object = call.arg(0)?;
+            let destination = call.arg(1)?;
+            let spatial = spatial_of(host, object);
+            let vector = if name == "GetPosition" {
+                spatial.position
+            } else {
+                spatial.velocity
+            };
+            if destination != 0 {
+                write_vector(call, destination, vector)?;
+            }
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_BUFFER, "SetConeAngles") => {
+            let object = call.arg(0)?;
+            let inside = call.arg(1)?;
+            let outside = call.arg(2)?;
+            let spatial = spatial_of(host, object);
+            host.audio.spatial.insert(
+                object,
+                Spatial {
+                    cone_inside: inside,
+                    cone_outside: outside,
+                    ..spatial
+                },
+            );
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_BUFFER, "SetConeOrientation") => {
+            let object = call.arg(0)?;
+            let vector = [call.arg(1)?, call.arg(2)?, call.arg(3)?];
+            let spatial = spatial_of(host, object);
+            host.audio.spatial.insert(
+                object,
+                Spatial {
+                    cone_orientation: vector,
+                    ..spatial
+                },
+            );
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_BUFFER, "SetConeOutsideVolume") => {
+            let object = call.arg(0)?;
+            let volume = call.arg(1)?;
+            let spatial = spatial_of(host, object);
+            host.audio.spatial.insert(
+                object,
+                Spatial {
+                    cone_outside_volume: volume,
+                    ..spatial
+                },
+            );
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_BUFFER, "SetMaxDistance" | "SetMinDistance") => {
+            let object = call.arg(0)?;
+            let distance = call.arg(1)?;
+            let spatial = spatial_of(host, object);
+            let updated = if name == "SetMaxDistance" {
+                Spatial {
+                    max_distance: distance,
+                    ..spatial
+                }
+            } else {
+                Spatial {
+                    min_distance: distance,
+                    ..spatial
+                }
+            };
+            host.audio.spatial.insert(object, updated);
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_BUFFER, "SetMode") => {
+            let object = call.arg(0)?;
+            let mode = call.arg(1)?;
+            let spatial = spatial_of(host, object);
+            host.audio.spatial.insert(
+                object,
+                Spatial {
+                    mode,
+                    ..spatial
+                },
+            );
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_BUFFER, "SetPosition") => {
+            let object = call.arg(0)?;
+            let vector = [call.arg(1)?, call.arg(2)?, call.arg(3)?];
+            let spatial = spatial_of(host, object);
+            host.audio.spatial.insert(
+                object,
+                Spatial {
+                    position: vector,
+                    ..spatial
+                },
+            );
+            Ok(Return(DS_OK))
+        }
+        (thunks::DSOUND_3D_BUFFER, "SetVelocity") => {
+            let object = call.arg(0)?;
+            let vector = [call.arg(1)?, call.arg(2)?, call.arg(3)?];
+            let spatial = spatial_of(host, object);
+            host.audio.spatial.insert(
+                object,
+                Spatial {
+                    velocity: vector,
+                    ..spatial
+                },
+            );
+            Ok(Return(DS_OK))
+        }
 
         // ---- IDirectSound -------------------------------------------------
         (thunks::DSOUND, "CreateSoundBuffer") => create_sound_buffer(host, call),
@@ -468,6 +1148,15 @@ pub(crate) fn serve(
             Ok(Return(DS_OK))
         }
         (thunks::DSOUND, "Compact") | (thunks::DSOUND, "SetSpeakerConfig") => Ok(Return(DS_OK)),
+        // The DX8 device answers whether the driver is certified: every normal
+        // driver is, and a guest that is told otherwise turns features off.
+        (thunks::DSOUND, "VerifyCertification") => {
+            let certified = call.arg(1)?;
+            if certified != 0 {
+                call.write_u32(certified, DS_CERTIFIED)?;
+            }
+            Ok(Return(DS_OK))
+        }
 
         // ---- IDirectSoundBuffer -------------------------------------------
         (thunks::DSOUND_BUFFER, "Lock") => lock(host, call),
@@ -498,6 +1187,9 @@ pub(crate) fn serve(
             let status = status_of(host, this);
             Ok(Return(status))
         }
+        // A buffer's samples are guest memory nothing takes away, so there is
+        // nothing lost to restore.
+        (thunks::DSOUND_BUFFER, "Restore") => Ok(Return(DS_OK)),
         (thunks::DSOUND_BUFFER, "GetCurrentPosition") => {
             let this = call.arg(0)?;
             let play = call.arg(1)?;
@@ -614,18 +1306,20 @@ pub(crate) fn serve(
             let caps = call.arg(1)?;
             if caps != 0 {
                 call.zero(caps, 20)?;
-                if let Some(buffer) = host.audio.buffers.get(&this) {
-                    call.write_u32(caps, 20)?;
-                    call.write_u32(
-                        caps + 4,
-                        if buffer.primary {
-                            DSBCAPS_PRIMARYBUFFER
-                        } else {
-                            0
-                        },
-                    )?;
-                    call.write_u32(caps + 8, buffer.size)?;
-                }
+        if let Some(buffer) = host.audio.buffers.get(&this) {
+            call.write_u32(caps, 20)?;
+            // The flags come back as the guest asked for them, which is what a
+            // real driver reports: a buffer created with control flags has them.
+            call.write_u32(
+                caps + 4,
+                if buffer.primary {
+                    DSBCAPS_PRIMARYBUFFER
+                } else {
+                    buffer.caps
+                },
+            )?;
+            call.write_u32(caps + 8, buffer.size)?;
+        }
             }
             Ok(Return(DS_OK))
         }
@@ -633,9 +1327,11 @@ pub(crate) fn serve(
             let this = call.arg(0)?;
             let destination = call.arg(1)?;
             let bytes = call.arg(2)?;
+            let written = call.arg(3)?;
             if let Some(buffer) = host.audio.buffers.get(&this) {
+                let mut wrote = 0;
                 if destination != 0 {
-                    let wanted = if bytes == 0 { WFX_BYTES } else { bytes.min(WFX_BYTES) };
+                    wrote = if bytes == 0 { WFX_BYTES } else { bytes.min(WFX_BYTES) };
                     let mut format = [0_u8; WFX_BYTES as usize];
                     format[WFX_TAG as usize..WFX_TAG as usize + 2]
                         .copy_from_slice(&WAVE_FORMAT_PCM.to_le_bytes());
@@ -647,7 +1343,12 @@ pub(crate) fn serve(
                         .copy_from_slice(&buffer.format.align.to_le_bytes());
                     format[WFX_BITS as usize..WFX_BITS as usize + 2]
                         .copy_from_slice(&buffer.format.bits.to_le_bytes());
-                    call.write(destination, &format[..wanted as usize])?;
+                    call.write(destination, &format[..wrote as usize])?;
+                }
+                // The size a guest asked for with a NULL format pointer, or the
+                // bytes a write filled, are what it sizes its next query from.
+                if written != 0 {
+                    call.write_u32(written, if destination == 0 { WFX_BYTES } else { wrote })?;
                 }
             }
             Ok(Return(DS_OK))
@@ -797,6 +1498,7 @@ fn create_sound_buffer(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let buffer = SoundBuffer {
         refs: 1,
         primary,
+        caps: flags,
         size: if primary { 0 } else { bytes },
         data,
         format,

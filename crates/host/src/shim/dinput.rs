@@ -1,4 +1,5 @@
-//! `DINPUT.dll`: the input objects the guest creates before anything is drawn.
+//! `DINPUT.dll` and `dinput8.dll`: the input objects the guest creates before
+//! anything is drawn.
 //!
 //! WinMain creates its `IDirectInput` object before it touches DirectDraw, and it
 //! has no fallback -- a non-zero `HRESULT` prints a message and the caller returns
@@ -13,8 +14,12 @@
 //! joystick object can still be created but reports nothing, because no page has
 //! a stick to offer it and the game treats its absence as optional.
 //!
-//! The image imports exactly one DirectInput entry point, `DirectInputCreateA`, so
-//! that is the only one bound here.
+//! Two entry points are bound. `DirectInputCreateA` is the one an image imports;
+//! `DirectInput8Create` is the one a guest resolves at runtime with
+//! `LoadLibraryA("...\dinput8.dll")` + `GetProcAddress`, which is how a
+//! DirectInput 8 program loads input when it imports nothing. The device vtables
+//! of 7.0 and 8.0 agree through `Initialize` (slot 17), which is every method
+//! this host models, so one table answers both.
 
 use crate::shim::{Action, Binding, Call, Host};
 use crate::thunks;
@@ -23,6 +28,7 @@ use crate::Result;
 use Action::Return;
 
 const DINPUT: &str = "DINPUT.dll";
+const DINPUT8: &str = "dinput8.dll";
 
 /// `DIRECTINPUT_VERSION` 5.0, the newest interface this host models, and 3.0,
 /// which one target asks for.
@@ -31,23 +37,43 @@ const DINPUT: &str = "DINPUT.dll";
 /// fourteen vtable entries as 5.0's -- `CreateDevice`, then `Acquire`,
 /// `GetDeviceState`, `SetDataFormat` and `SetCooperativeLevel` in the same
 /// slots -- so one table answers both. What 3.0 lacks (action mapping, effects)
-/// is above slot thirteen, and no caller of it here reaches that far.
+/// is above slot thirteen, and no caller of it here reaches that far. 8.0's
+/// factory shares the first five slots and its device the first eighteen, which
+/// is why `DirectInput8Create` can hand out the same objects.
 const DIRECTINPUT_VERSION_3: u32 = 0x0300;
 const DIRECTINPUT_VERSION_5: u32 = 0x0500;
 
 const E_NOINTERFACE: u32 = 0x8000_4002;
 
-pub const SHIMS: &[Binding] = &[Binding {
-    dll: DINPUT,
-    name: "DirectInputCreateA",
-    arg_bytes: 16,
-    shim: direct_input_create,
-}];
+pub const SHIMS: &[Binding] = &[
+    Binding {
+        dll: DINPUT,
+        name: "DirectInputCreateA",
+        arg_bytes: 16,
+        shim: direct_input_create,
+    },
+    Binding {
+        dll: DINPUT8,
+        name: "DirectInput8Create",
+        arg_bytes: 20,
+        shim: direct_input8_create,
+    },
+];
 
 fn direct_input_create(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let version = call.arg(1)?;
     let destination = call.arg(2)?;
     let outer = call.arg(3)?;
+    create(host, call, version, destination, outer)
+}
+
+/// `DirectInput8Create(hinst, dwVersion, riidltf, ppvOut, punkOuter)`: the 8.0
+/// factory, whose out parameter is the fourth argument where the 7.0 create's is
+/// the third.
+fn direct_input8_create(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let version = call.arg(1)?;
+    let destination = call.arg(3)?;
+    let outer = call.arg(4)?;
     create(host, call, version, destination, outer)
 }
 
@@ -204,6 +230,44 @@ mod tests {
             )
             .unwrap(),
             Return(0x8007_0057)
+        );
+    }
+
+    #[test]
+    fn the_eight_dot_zero_create_answers_where_the_seven_dot_one_did() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        // `DirectInput8Create(hinst, version, riidltf, ppvOut, punkOuter)`: the
+        // out parameter is the fourth argument, and the version is 0x0800.
+        let destination = STACK_BASE + 0xb500;
+        assert_eq!(
+            call_shim(
+                &mut host,
+                &mut memory,
+                "DirectInput8Create",
+                &[0x0040_0000, 0x0800, 0, destination, 0]
+            )
+            .unwrap(),
+            Return(0)
+        );
+        let object = memory.read_u32(destination).unwrap();
+        assert!(object > 0);
+        let table = memory.read_u32(object).unwrap();
+        // The 8.0 factory keeps 7.0's first five slots, so `CreateDevice` is
+        // where the 7.0 table has it.
+        let create_device = memory.read_u32(table + 12).unwrap();
+        assert_eq!(thunks::at(create_device), Some((thunks::DINPUT, 3)));
+        // Aggregation is refused the same way, at the same argument.
+        assert_eq!(
+            call_shim(
+                &mut host,
+                &mut memory,
+                "DirectInput8Create",
+                &[0x0040_0000, 0x0800, 0, STACK_BASE + 0xb600, 0x1234]
+            )
+            .unwrap(),
+            Return(E_NOINTERFACE)
         );
     }
 }

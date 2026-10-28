@@ -2,8 +2,14 @@
 # Builds the browser payload: the wasm module, and — when an install directory is
 # given — the game itself, with `artifact.json` saying what the build is.
 #
-#   tools/build-web.sh                       module only -> dist/
-#   tools/build-web.sh <install-dir> [out]   ... plus <out>/game/, loadable
+#   tools/build-web.sh                         module only -> dist/
+#   tools/build-web.sh <install-dir> [out]     ... plus <out>/game/, loadable
+#   tools/build-web.sh <install-dir>/<exe> [out]  the same, booting that exe
+#
+# The second form takes the executable itself as the entry point, which is what
+# a payload usually knows: `Madagascar/Game/Game.exe` says both where the files
+# are and which of them boots. `SHIMKIT_EXE` still overrides the choice when a
+# folder holds more than one.
 #
 # Output:
 #   <out>/host_wasm.wasm   the kit's engine and browser ABI
@@ -25,7 +31,13 @@ if [ $# -gt 0 ] && [ -z "$1" ]; then
     printf '%s\n' 'the install directory argument is empty' >&2
     exit 2
 fi
-if [ $# -gt 0 ] && [ -d "$1" ]; then
+if [ $# -gt 0 ] && [ -f "$1" ]; then
+    # An entry point names the install directory and the executable at once.
+    SHIMKIT_EXE="$(basename "$1")"
+    export SHIMKIT_EXE
+    install="$(cd "$(dirname "$1")" && pwd)"
+    shift
+elif [ $# -gt 0 ] && [ -d "$1" ]; then
     install="$(cd "$1" && pwd)"
     shift
 fi

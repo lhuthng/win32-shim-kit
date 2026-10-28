@@ -9,6 +9,8 @@
 // name and its bytes go into one allocation and anything needed later is copied
 // out before the next call.
 
+import { createRenderer } from "./webgl2.js";
+
 const EVENT_WORDS = 11;
 const EVENT_PLAY = 0;
 const EVENT_UPDATE = 1;
@@ -157,17 +159,26 @@ function storeSaves(key, files) {
 }
 
 /**
+ * The last segment of a path, lowercased.
+ *
+ * A payload names its saves the way a folder lists them, but the guest builds
+ * paths the way Windows does: `Doukutsu.exe\Profile.dat` here, and whatever
+ * directory a real install sits in elsewhere. The folder a guest puts in front
+ * of a name is its own business, so a listing compares leaves.
+ */
+export function leafName(path) {
+  return path.toLowerCase().split(/[\\/]/).pop();
+}
+
+/**
  * Whether a file is one the payload calls a save. `*` takes everything, and a
  * payload that names nothing keeps everything the guest writes -- which is the
  * case where the guest's own folder is the save.
  */
-function keptBy(patterns, name) {
+export function keptBy(patterns, name) {
   if (!patterns || patterns.length === 0) return true;
-  const lower = name.toLowerCase();
-  return patterns.some((pattern) => {
-    const wanted = pattern.toLowerCase();
-    return wanted === "*" || wanted === lower;
-  });
+  const leaf = leafName(name);
+  return patterns.some((pattern) => pattern === "*" || leafName(pattern) === leaf);
 }
 
 /**
@@ -300,6 +311,29 @@ export async function boot({
 
   const context = canvas.getContext("2d", { alpha: false });
   const palette = new Uint32Array(256);
+
+  // A Direct3D 8 payload does not blit a framebuffer: the host records what the
+  // device was asked to do and this page replays it through WebGL2. The replay
+  // goes into a canvas of its own and is copied into the frame canvas, so a 2D
+  // game keeps the `putImageData` path it has always used and neither kind of
+  // payload has to be declared up front -- the device's existence says which it
+  // is.
+  let scene = null;
+  function direct3d() {
+    const width = host.wh_render_width ? host.wh_render_width() : 0;
+    if (!width) return null;
+    if (scene === null) {
+      try {
+        scene = createRenderer({ host, onDiagnostic });
+      } catch (error) {
+        onDiagnostic(`WebGL2: ${error.message ?? error}`);
+        // A refusal is remembered as `false`, so a browser without WebGL2 is not
+        // asked again every frame.
+        scene = false;
+      }
+    }
+    return scene || null;
+  }
   let paletteVersion = -1;
   let frameSize = { width: 0, height: 0 };
 
@@ -319,6 +353,21 @@ export async function boot({
   }
 
   function present() {
+    const renderer = direct3d();
+    if (renderer) {
+      // `render` drains the stream, so it runs exactly once per presented frame:
+      // an unreplayed record is a command that never reached the screen.
+      if (!renderer.render()) return;
+      const { width, height } = renderer.size();
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      frameSize = { width, height };
+      context.drawImage(renderer.canvas, 0, 0, width, height);
+      return;
+    }
+
     const width = host.wh_framebuffer_width();
     const height = host.wh_framebuffer_height();
     const pitch = host.wh_framebuffer_pitch();
@@ -823,7 +872,14 @@ export async function boot({
     // artifact seeded: a game is free to ask for another mode, and Cave Story
     // does -- the payload says 8 and the game runs 16.
     const depth = host.wh_framebuffer_depth ? host.wh_framebuffer_depth() : 8;
-    status(`running — ${host.wh_framebuffer_width()}×${host.wh_framebuffer_height()}×${depth}`);
+    // A 3D payload presents through the device, whose back buffer is the size
+    // that matters; `ddraw` never gets one.
+    const width = host.wh_render_width ? host.wh_render_width() : 0;
+    status(
+      width
+        ? `running — ${width}×${host.wh_render_height()}×32`
+        : `running — ${host.wh_framebuffer_width()}×${host.wh_framebuffer_height()}×${depth}`,
+    );
   }
 
   present();
@@ -916,6 +972,8 @@ export async function boot({
       handle = null;
       voices.clear();
       queued = 0;
+      if (scene) scene.dispose();
+      scene = null;
       if (typeof document !== "undefined") {
         document.removeEventListener("visibilitychange", followPause);
       }

@@ -5,7 +5,12 @@
 // URLs), follows the same fetches the page's loader makes, and boots the payload
 // through the module's own ABI until the guest presents a lit frame.
 //
-//   bun tools/demo-check.ts [demo-dir] [instructions]
+//   bun tools/demo-check.ts [demo-dir] [instructions] [slug]
+//
+// With a slug, only that payload is tested, listed in `index.json` or not: a
+// payload baked beside the site for one machine is checked the same way as one
+// that is published, and `tools/build-web.sh <entry.exe> demo/payloads/<slug>`
+// is what puts it there.
 //
 // The first lit frame is the success condition: it means the baked executable
 // runs, the data files arrived intact, and the shims answer what it asks for.
@@ -14,6 +19,7 @@ import { join, resolve } from "node:path";
 
 const root = resolve(process.argv[2] ?? "demo");
 const limit = Number(process.argv[3] ?? "120000000");
+const only = process.argv[4] ?? null;
 
 let failures = 0;
 function check(condition: boolean, message: string): void {
@@ -48,13 +54,14 @@ try {
     check((await fetch(`${base}/${styles[0]}`)).ok, `the stylesheet ${styles[0]} is served`);
   }
 
-  const listed = await (await fetch(`${base}/payloads/index.json`)).json();
   // A payload may say how it boots: `instructions` is the budget one screen
   // takes to appear, and `lit` the share of the frame that screen fills. A game
   // that renders every music track at load needs far more than the default, and
   // a title screen on black does not fill a tenth of the picture.
-  const payloads: Array<{ slug: string; title: string; instructions?: number; lit?: number }> =
-    listed.payloads ?? [];
+  type Entry = { slug: string; title: string; instructions?: number; lit?: number };
+  const payloads: Entry[] = only
+    ? [{ slug: only, title: only }]
+    : ((await (await fetch(`${base}/payloads/index.json`)).json()).payloads ?? []);
   check(payloads.length > 0, `${payloads.length} demo(s) listed`);
 
   for (const payload of payloads) {
@@ -165,6 +172,13 @@ try {
       outcome = host.wh_run(2_000_000);
       ran += 2_000_000;
       if (outcome !== 0) break;
+      // A Direct3D payload has no framebuffer to measure: the picture is drawn
+      // by the page's WebGL2 backend from a command stream, so the evidence here
+      // is the draw itself and a presented frame.
+      if (host.wh_render_width && host.wh_render_width() > 0) {
+        if (host.wh_render_draws() > 0 && host.wh_flips() > 0) break;
+        continue;
+      }
       // A frame is either a `Flip` or a write to the presented surface: a guest
       // that blits straight onto the primary presents without ever flipping.
       if (host.wh_flips() > 0 || host.wh_frame_version() > 0) {
@@ -184,6 +198,21 @@ try {
       presented > 0,
       `${payload.title}: presented ${presented} frame(s) after ${ran} instructions`,
     );
+    // A 3D payload's frame is a command stream, not pixels in linear memory, so
+    // the framebuffer checks below have nothing to measure. What it must have
+    // done is draw through the device at the size the artifact declares.
+    if (host.wh_render_width && host.wh_render_width() > 0) {
+      check(
+        host.wh_render_draws() > 0,
+        `${payload.title}: drew ${host.wh_render_draws()} primitive(s) through the device`,
+      );
+      check(
+        host.wh_render_width() === artifact.screen.width &&
+          host.wh_render_height() === artifact.screen.height,
+        `${payload.title}: back buffer is ${host.wh_render_width()}x${host.wh_render_height()}`,
+      );
+      continue;
+    }
     check(
       frame.width === artifact.screen.width && frame.height === artifact.screen.height,
       `${payload.title}: frame is ${frame.width}x${frame.height}x${frame.depth}`,

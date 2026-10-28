@@ -250,6 +250,13 @@ pub enum Mnemonic {
     Fcompp,
     Fldz,
     Fld1,
+    /// `fldpi`, `fldl2t`, `fldl2e`, `fldlg2` and `fldln2`: the constants a
+    /// float-to-string routine loads instead of computing.
+    Fldpi,
+    Fldl2t,
+    Fldl2e,
+    Fldlg2,
+    Fldln2,
     Fxch,
     Fchs,
     Fabs,
@@ -257,6 +264,26 @@ pub enum Mnemonic {
     /// `fsin` and `fcos`: the sine and cosine of `st(0)`, in radians.
     Fsin,
     Fcos,
+    /// `fsincos`: the cosine on top and the sine under it, which is the order
+    /// the hardware leaves them and what a rotation matrix reads back.
+    Fsincos,
+    /// The exponential row: `f2xm1` and its inverse `fyl2x`, which together are
+    /// how the compiler spells `pow`, plus the `fyl2xp1` form it uses near zero.
+    F2xm1,
+    Fyl2x,
+    Fyl2xp1,
+    Fptan,
+    Fpatan,
+    Fxtract,
+    Fprem,
+    Fprem1,
+    Frndint,
+    Fscale,
+    /// `ftst` and `fxam`: answers in the condition codes only.
+    Ftst,
+    Fxam,
+    /// `ffree st(i)`: this FPU keeps no tag word, so the slot is only named.
+    Ffree,
     /// `fdecstp` and `fincstp`: rotate the register stack without touching data.
     Fdecstp,
     Fincstp,
@@ -272,6 +299,8 @@ pub enum Mnemonic {
     Wait,
     Pushfd,
     Popfd,
+    /// `cpuid`: the feature report a guest reads before it picks a code path.
+    Cpuid,
     Hlt,
     Int3,
     /// String operations take no operands: the address registers and the
@@ -294,6 +323,9 @@ pub struct Instruction {
     /// out of [`Size`] means no integer path ever has to consider a width it
     /// cannot produce.
     pub double: bool,
+    /// True for the x87 forms whose memory operand is 80 bits wide (`fild` and
+    /// `fistp` on a ten-byte integer), which no [`Size`] names.
+    pub extended: bool,
     /// Set by the decoder for every floating-point instruction, so the executor
     /// takes one branch instead of matching thirty-three mnemonics per step.
     pub x87: bool,
@@ -320,6 +352,7 @@ impl Instruction {
             operands,
             repeat: Repeat::None,
             double: false,
+            extended: false,
             x87: false,
             integer: false,
             len,
@@ -545,6 +578,11 @@ pub const TIMER_TRAMPOLINE: u32 = HOST_FUNCTION_BASE + 0x0100_0000;
 /// asks the guest to run. Its own address so the session can tell the two apart
 /// when both are live (a timer can fire inside a dispatched message).
 pub const CALL_TRAMPOLINE: u32 = HOST_FUNCTION_BASE + 0x0100_0004;
+
+/// Where a `CreateThread` routine returns to. Nothing is waiting on that return --
+/// the routine itself is what the thread was for -- so the session reads it as
+/// "this thread is done" and ends it, rather than as an import completing.
+pub const THREAD_TRAMPOLINE: u32 = HOST_FUNCTION_BASE + 0x0100_0008;
 
 /// The import slot a program counter points at, when it lands on a host stub.
 pub fn host_slot_at(eip: u32, table: crate::dispatch::Table) -> Option<usize> {

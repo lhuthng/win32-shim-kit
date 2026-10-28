@@ -27,8 +27,10 @@ pub fn switch(cell: &'static std::sync::OnceLock<bool>, name: &'static str) -> b
 }
 
 pub mod advapi32;
+pub mod binkw32;
 pub mod comdlg32;
 pub mod crt;
+pub mod d3d8;
 pub mod ddraw;
 pub mod dinput;
 pub mod dsound;
@@ -245,6 +247,9 @@ pub struct Host {
     pub files: files::Files,
     /// The display: surfaces, the palette and the flip counter (`ddraw`).
     pub ddraw: ddraw::DirectDraw,
+    /// The 3D device, its resources, and the command stream the page's GPU
+    /// backend drains (`d3d8`).
+    pub d3d8: d3d8::Direct3D,
     /// The audio device, its buffers and the events the page's mixer consumes.
     pub audio: dsound::DirectSound,
     /// The Miles library: its device, samples and streams (`mss32`), which mix
@@ -253,9 +258,32 @@ pub struct Host {
     /// The SDL 1.2 surface `SDL.dll` games draw into, and the state the
     /// functions around it keep (`sdl`).
     pub sdl: sdl::Sdl,
-    /// Thread-local slots `TlsAlloc` hands out. This machine has one thread, so
-    /// the slots are session state rather than a real per-thread map.
+    /// Thread-local slots `TlsAlloc` hands out. The indices are the session's,
+    /// the values belong to the thread that set them: `TlsAlloc` hands out a
+    /// number every thread shares, which is the whole point of the feature.
     pub tls: kernel32::ThreadLocals,
+    /// File mappings and their views (`CreateFileMappingA`, `MapViewOfFile`).
+    pub mappings: kernel32::Mappings,
+    /// The kernel objects the guest created and the waits parked on them
+    /// (`CreateEventA`, `WaitForSingleObject` and their neighbours).
+    pub objects: crate::objects::Objects,
+    /// How many levels deep the owner of a critical section has entered it, by
+    /// the address of the guest's structure. Windows' critical sections are
+    /// recursive, so the count is what decides when a leave really releases.
+    pub critical_depth: std::collections::HashMap<u32, u32>,
+    /// What the shim that just ran asked the session to do with the running
+    /// thread: park it, let another go first, or end it. The session takes it; a
+    /// shim never leaves this set, so the value always describes the call in
+    /// flight.
+    pub thread_want: Option<crate::sched::ThreadWant>,
+    /// A thread `CreateThread` asked for. The session creates it, because a
+    /// thread's stack is guest memory and a shim has none of its own.
+    pub spawn: Option<crate::sched::Spawn>,
+    /// Threads a shim just made runnable by signalling something, with the value
+    /// each wait answers with. The session wakes them once the shim returns.
+    pub woken: Vec<(u32, u32)>,
+    /// The id of the thread the CPU is on, which `GetCurrentThreadId` answers.
+    pub current_thread: u32,
     /// Multimedia timers the guest set, which the session calls back into
     /// (`winmm`).
     pub timers: winmm::Timers,
@@ -358,10 +386,18 @@ impl Host {
             registry: advapi32::Registry::default(),
             files: files::Files::default(),
             ddraw: ddraw::DirectDraw::with_screen(u32::from(width), u32::from(height), depth),
+            d3d8: d3d8::Direct3D::default(),
             audio: dsound::DirectSound::default(),
             mss: mss32::Mss::default(),
             sdl: sdl::Sdl::default(),
             tls: kernel32::ThreadLocals::default(),
+            mappings: kernel32::Mappings::default(),
+            objects: crate::objects::Objects::new(),
+            critical_depth: std::collections::HashMap::new(),
+            thread_want: None,
+            spawn: None,
+            woken: Vec::new(),
+            current_thread: 0,
             timers: winmm::Timers::default(),
             mmio: winmm::Mmio::default(),
             clock_ms: None,
@@ -742,8 +778,10 @@ pub const TABLES: &[&[Binding]] = &[
     gdiplus::SHIMS,
     msimg32::SHIMS,
     advapi32::SHIMS,
+    binkw32::SHIMS,
     dsound::SHIMS,
     mss32::SHIMS,
+    d3d8::SHIMS,
     ddraw::SHIMS,
     dinput::SHIMS,
     winmm::SHIMS,
@@ -767,7 +805,12 @@ pub fn is_cdecl(dll: &str, name: &str) -> bool {
     // Every entry point the C runtime exports is `__cdecl`; its ancestors and
     // descendants share the convention.
     dll.eq_ignore_ascii_case("SDL.dll")
+        // Both formatters are `WINAPIV`, which is `__cdecl`: the caller pops the
+        // arguments. Popping them here as well leaves every caller's frame 52
+        // bytes too high, and the routine it returns into pops whatever the
+        // formatter's arguments left on the stack.
         || name.eq_ignore_ascii_case("wsprintfA")
+        || name.eq_ignore_ascii_case("wsprintfW")
         || is_c_runtime(dll)
         // The C++ runtime's member functions are `__thiscall`, but the operators
         // declared at namespace scope -- `std::operator+`, `operator==` and the
@@ -971,6 +1014,17 @@ mod tests {
         assert_eq!(undecorated("_AIL_shutdown@0"), "AIL_shutdown");
         assert_eq!(undecorated("AIL_shutdown"), "AIL_shutdown");
         assert_eq!(undecorated("??0Foo@@QAE@XZ"), "??0Foo@@QAE@XZ");
+    }
+
+    /// A formatter is `WINAPIV`, which is `__cdecl`: the caller pops its
+    /// arguments. Answering `wsprintfW` as stdcall pops 52 bytes the caller pops
+    /// again, and the frame it returns into comes apart -- `Magascar` returned
+    /// into a heap address and died there.
+    #[test]
+    fn both_formatters_leave_their_arguments_to_the_caller() {
+        assert!(is_cdecl("USER32.dll", "wsprintfA"));
+        assert!(is_cdecl("USER32.dll", "wsprintfW"));
+        assert!(!is_cdecl("USER32.dll", "MessageBoxA"));
     }
 
     #[test]

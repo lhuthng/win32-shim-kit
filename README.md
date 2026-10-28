@@ -73,7 +73,12 @@ body is copied verbatim, so the generator scaffolds but does not check meaning.
 
 ```bash
 tools/build-web.sh <install-dir>     # -> dist/: module, game, artifact.json
+tools/build-web.sh <install-dir>/<exe>  # the same, booting that executable
 ```
+
+The executable form is the usual one: a path to the game's own `.exe` names both
+the folder the payload is built from and the entry point it boots, so the loader
+never has to guess between two executables in one install.
 
 `dist/` holds `host_wasm.wasm`, `game/` (the install plus a `files.json`), and
 `artifact.json` with the executable name, size, entry address and import count.
@@ -93,9 +98,14 @@ It is what GitHub Pages serves, and everything in it is generated — the site f
 `demo-site/`, the payloads from `tools/build-web.sh`:
 
 ```bash
-tools/build-web.sh <install-dir> demo/payloads/<slug>   # a payload
-cd demo-site && bun install && bun run build            # the page -> demo/
+tools/build-web.sh <install-dir>/<exe> demo/payloads/<slug>   # a payload
+cd demo-site && bun install && bun run build                  # the page -> demo/
+bun tools/demo-check.ts demo 120000000 <slug>                 # just that payload
 ```
+
+A payload whose game files are not in the repository is baked into the same
+folder and stays out of `index.json`: the page plays it by name, `?game=<slug>`,
+without the list mentioning it.
 
 `demo/payloads/index.json` is the list the page reads. Add an entry after a bake,
 and list a second demo the same way; the player boots whichever one is picked.

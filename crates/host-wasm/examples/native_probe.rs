@@ -77,10 +77,33 @@ fn collect(
     }
 }
 
-/// Whether the guest reached the budget without presenting a frame, which is the
-/// shape of a stall rather than a slow machine.
-fn ddraw_is_stalled(session: &Session) -> bool {
-    session.host.ddraw.flips() == 0
+/// What the Direct3D device recorded over the whole run: a guest that never
+/// presents has not reached its frame loop, however busy it was. The stream is
+/// never drained here, so these are totals rather than one frame's worth.
+fn tally_render(session: &Session) -> (u32, u32, u32) {
+    let (mut presents, mut clears, mut draws) = (0, 0, 0);
+    let mut histogram: std::collections::BTreeMap<u32, u32> = Default::default();
+    let mut cursor = host::render::Cursor::new(session.host.d3d8.stream.bytes());
+    while let Some(Ok((op, _))) = cursor.next() {
+        *histogram.entry(op).or_default() += 1;
+        match op {
+            host::render::op::PRESENT => presents += 1,
+            host::render::op::CLEAR => clears += 1,
+            host::render::op::DRAW
+            | host::render::op::DRAW_INDEXED
+            | host::render::op::DRAW_UP
+            | host::render::op::DRAW_INDEXED_UP => draws += 1,
+            _ => {}
+        }
+    }
+    // `PROBE_OPS` names every operation the guest asked the device for: the
+    // shape of a frame that never draws is in which calls it does make.
+    if std::env::var("PROBE_OPS").is_ok() {
+        for (op, count) in &histogram {
+            println!("  op {op:3} x {count}");
+        }
+    }
+    (presents, clears, draws)
 }
 
 /// Writes the presented pixels as a 24-bit `.bmp`, which is the one format this
@@ -208,6 +231,12 @@ fn main() -> ExitCode {
     }));
 
     let mut session = Session::load_for(bytes, target).expect("the session loads");
+    // `PROBE_WATCH=<hex>` reports every arrival at one address, with the
+    // registers and the words the caller pushed: a call site read exactly
+    // rather than sampled.
+    session.watch = std::env::var("PROBE_WATCH")
+        .ok()
+        .and_then(|text| u32::from_str_radix(text.trim_start_matches("0x"), 16).ok());
     // `PROBE_SKIP=<substring,...>` withholds files, which tells a game that
     // waits on one apart from a game that is stuck for its own reasons.
     let skip: Vec<String> = std::env::var("PROBE_SKIP")
@@ -228,6 +257,9 @@ fn main() -> ExitCode {
     // timing in the same range as the page's.
     let mut ran = 0;
     let mut samples: std::collections::BTreeMap<(u32, String), u32> = Default::default();
+    // Counted by the outermost frame a sample sits under, which names the
+    // routine that owns the work rather than the instruction doing it.
+    let mut owns: std::collections::BTreeMap<u32, u32> = Default::default();
     let mut frames: std::collections::HashSet<u64> = Default::default();
     let mut walk_printed = 0;
     // Notices are printed at the end by default; a run long enough to be
@@ -296,11 +328,12 @@ fn main() -> ExitCode {
         }
         let outcome = session.run(chunk as u32);
         if sampling {
+            let stack = session.call_stack(3);
+            *owns.entry(*stack.last().unwrap_or(&0)).or_default() += 1;
             *samples
                 .entry((
                     session.pc(),
-                    session
-                        .call_stack(3)
+                    stack
                         .iter()
                         .map(|frame| format!("{frame:#x}"))
                         .collect::<Vec<_>>()
@@ -346,10 +379,24 @@ fn main() -> ExitCode {
         // is how a run that neither stops nor presents a frame is read.
         if std::env::var("PROBE_TRACE").is_ok() && ran % (chunk * 100) == 0 {
             println!(
-                "{ran:12} pc {:#010x} {}",
+                "{ran:12} pc {:#010x} heap {} freed {} allocs {} {}",
                 session.pc(),
+                session.host.heap_used(),
+                session.host.heap_free(),
+                session.host.allocation_count(),
                 session.last_import.clone().unwrap_or_default()
             );
+            // `PROBE_STACKS` names the routine the sample sits under: a frame
+            // loop that never draws is read from what owns it, not from the
+            // instruction it happened to stop on.
+            if std::env::var("PROBE_STACKS").is_ok() {
+                let frames: Vec<String> = session
+                    .call_stack(8)
+                    .iter()
+                    .map(|pc| format!("{pc:#010x}"))
+                    .collect();
+                println!("             under {}", frames.join("<-"));
+            }
         }
         if std::env::var("PROBE_WALK").is_ok() && samples.len() + walk_printed < 200 {
             walk_printed += 1;
@@ -363,23 +410,117 @@ fn main() -> ExitCode {
             // Why it stopped is the whole point of the probe: a fault names the
             // instruction, a host call names the import the shims did not answer.
             println!("stopped at {ran}: {}", outcome.describe(target.table));
+            session.dump_tail();
             if let Some(last) = &session.last_import {
                 println!("  last import: {last}");
             }
             println!(
-                "  pc {:#010x}, {} instructions",
+                "  pc {:#010x}, {} instructions, called from {:x?}",
                 session.pc(),
-                session.instructions()
+                session.instructions(),
+                session.call_stack(12)
             );
+            // The registers decide what a wild read was made of: a bad base and
+            // a sane offset is a corrupt pointer, the two the other way round is
+            // a walker that ran off the end of a buffer.
+            for (index, value) in session.cpu.registers() {
+                println!("  reg {index} {value:#010x}");
+            }
             break;
         }
         ran += chunk;
     }
+    session.dump_watch();
+    session.dump_tail();
     for notice in &session.host.notices {
         println!("notice {notice}");
     }
 
+    // A run that neither faults nor moves is read from its threads: which one
+    // holds the CPU, which are parked, on what, and how much each has run.
+    let threads = session.thread_summaries();
+    if threads.len() > 1 {
+        println!("  {} threads:", threads.len());
+        for thread in threads {
+            let state = if thread.current {
+                "running".to_string()
+            } else {
+                match thread.state {
+                    host::sched::State::Waiting => "waiting".to_string(),
+                    host::sched::State::Exited => "exited".to_string(),
+                    host::sched::State::Runnable => "runnable".to_string(),
+                }
+            };
+            let waits = if thread.waits.is_empty() {
+                String::new()
+            } else {
+                let handles: Vec<String> = thread
+                    .waits
+                    .iter()
+                    .map(|handle| format!("{handle:#x}"))
+                    .collect();
+                format!(", waits on {}", handles.join(", "))
+            };
+            let stack = if thread.stack.is_empty() {
+                String::new()
+            } else {
+                let frames: Vec<String> = thread
+                    .stack
+                    .iter()
+                    .map(|pc| format!("{pc:#010x}"))
+                    .collect();
+                format!(", at {}", frames.join("<-"))
+            };
+            println!(
+                "    thread {} {state}, pc {:#010x}, {} instructions{waits}{stack}",
+                thread.id, thread.pc, thread.instructions
+            );
+        }
+    }
+
     println!("  {} distinct frames", frames.len());
+
+    // `PROBE_CALLERS` walks the guest's frame chain at the end: the routine that
+    // owns the work is a call, not a register, and this names it.
+    if std::env::var("PROBE_CALLERS").is_ok() {
+        println!(
+            "  pc {:#010x} esp {:#010x} ebp {:#010x}",
+            session.pc(),
+            session.cpu.regs.esp,
+            session.cpu.regs.ebp
+        );
+        let mut frame = session.cpu.regs.ebp;
+        for depth in 0..24 {
+            if frame < 0x0100_0000 || frame > 0x4000_0000 {
+                break;
+            }
+            let caller = session.memory.read_u32(frame + 4).unwrap_or(0);
+            let next = session.memory.read_u32(frame).unwrap_or(0);
+            println!("    frame {depth}: caller {caller:#010x} entry {frame:#010x}");
+            if caller < 0x0040_0000 || caller > 0x0060_0000 {
+                break;
+            }
+            frame = next;
+        }
+        // The frame chain breaks wherever a routine was entered without one, so
+        // the stack itself is scanned as well: every word that is a code address
+        // is a return address somebody is sitting on.
+        let base = session.cpu.regs.esp;
+        let mut hits = 0;
+        for index in 0..1024 {
+            let at = base + index * 4;
+            let Ok(value) = session.memory.read_u32(at) else {
+                break;
+            };
+            if (0x0040_1000..0x0060_0000).contains(&value) {
+                println!("    stack +{:#06x}: {value:#010x}", index * 4);
+                hits += 1;
+                if hits > 24 {
+                    break;
+                }
+            }
+        }
+    }
 
     // What the page would have shown, written out as a bitmap so a run can be
     // looked at rather than only measured.
@@ -464,6 +605,11 @@ fn main() -> ExitCode {
     }
 
     if std::env::var("PROBE_SAMPLES").is_ok() {
+        let mut owners: Vec<_> = owns.iter().collect();
+        owners.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
+        for (frame, count) in owners.iter().take(12) {
+            println!("  {count:5} x under {frame:#010x}");
+        }
         let mut top: Vec<_> = samples.iter().collect();
         top.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
         let total: u32 = samples.values().sum();
@@ -473,9 +619,14 @@ fn main() -> ExitCode {
         }
     }
 
-    if ddraw_is_stalled(&session) {
+    let (presents, clears, draws) = tally_render(&session);
+    println!(
+        "  d3d8: {presents} presents, {clears} clears, {draws} draws, {} stream bytes",
+        session.host.d3d8.stream.len()
+    );
+    if session.host.ddraw.flips() == 0 && presents == 0 {
         println!(
-            "  stalled at {:#010x}, called from {:x?} after {}",
+            "  no frame in {ran}: at {:#010x}, called from {:x?} after {}",
             session.pc(),
             session.call_stack(8),
             session.last_import.clone().unwrap_or_else(|| "no import".to_string())

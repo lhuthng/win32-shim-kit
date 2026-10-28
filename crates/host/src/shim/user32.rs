@@ -76,6 +76,28 @@ const WNDCLASS_NAME: u32 = 36;
 /// `SPI_GETWORKAREA`: the area the game centres itself against.
 const SPI_GETWORKAREA: u32 = 0x0030;
 
+/// `DEVMODEA`'s display fields at their documented offsets: the structure is
+/// 156 bytes and every member after `dmFields` lands where the `union` in the
+/// middle puts it, so the offsets are named rather than derived.
+const DEVMODE_FIELDS: u32 = 40;
+const DEVMODE_BITS_PER_PEL: u32 = 104;
+const DEVMODE_PELS_WIDTH: u32 = 108;
+const DEVMODE_PELS_HEIGHT: u32 = 112;
+const DEVMODE_DISPLAY_FREQUENCY: u32 = 120;
+
+/// The `dmFields` bits for the four values above.
+const DM_BITSPERPEL: u32 = 0x0004_0000;
+const DM_PELSWIDTH: u32 = 0x0008_0000;
+const DM_PELSHEIGHT: u32 = 0x0010_0000;
+const DM_DISPLAYFREQUENCY: u32 = 0x0040_0000;
+
+/// `ENUM_CURRENT_SETTINGS`: ask for the mode in use rather than the nth one.
+const ENUM_CURRENT_SETTINGS: u32 = 0xffff_ffff;
+/// The rate a browser canvas is presented at, which is the one mode's.
+const DISPLAY_FREQUENCY: u32 = 60;
+/// `DISP_CHANGE_SUCCESSFUL`.
+const DISP_CHANGE_SUCCESSFUL: u32 = 0;
+
 /// `GWL_STYLE` and `GWL_EXSTYLE`, which are negative selectors, not indices.
 const GWL_STYLE: i32 = -16;
 const GWL_EXSTYLE: i32 = -20;
@@ -110,7 +132,10 @@ const SURFACE_WIDTH: i32 = 640;
 const SURFACE_HEIGHT: i32 = 480;
 
 pub const SHIMS: &[Binding] = &[
+    Binding { dll: USER32, name: "AdjustWindowRect", arg_bytes: 12, shim: adjust_window_rect },
     Binding { dll: USER32, name: "AdjustWindowRectEx", arg_bytes: 16, shim: adjust_window_rect },
+    Binding { dll: USER32, name: "ChangeDisplaySettingsA", arg_bytes: 8, shim: change_display_settings },
+    Binding { dll: USER32, name: "EnumDisplaySettingsA", arg_bytes: 12, shim: enum_display_settings },
     Binding { dll: USER32, name: "CreateWindowExA", arg_bytes: 48, shim: create_window_ex },
     Binding { dll: USER32, name: "DefWindowProcA", arg_bytes: 16, shim: def_window_proc },
     Binding { dll: USER32, name: "DispatchMessageA", arg_bytes: 4, shim: dispatch_message },
@@ -121,6 +146,7 @@ pub const SHIMS: &[Binding] = &[
     Binding { dll: USER32, name: "GetCursorPos", arg_bytes: 4, shim: get_cursor_pos },
     Binding { dll: USER32, name: "GetDC", arg_bytes: 4, shim: get_dc },
     Binding { dll: USER32, name: "GetDesktopWindow", arg_bytes: 0, shim: get_desktop_window },
+    Binding { dll: USER32, name: "GetForegroundWindow", arg_bytes: 0, shim: get_foreground_window },
     Binding { dll: USER32, name: "GetMenu", arg_bytes: 4, shim: get_menu },
     Binding { dll: USER32, name: "GetMessageA", arg_bytes: 16, shim: get_message },
     Binding { dll: USER32, name: "GetWindowDC", arg_bytes: 4, shim: get_dc },
@@ -153,11 +179,16 @@ pub const SHIMS: &[Binding] = &[
     Binding { dll: USER32, name: "GetClientRect", arg_bytes: 8, shim: get_client_rect },
     Binding { dll: USER32, name: "ClientToScreen", arg_bytes: 8, shim: client_to_screen },
     Binding { dll: USER32, name: "InvalidateRect", arg_bytes: 12, shim: invalidate_rect },
+    Binding { dll: USER32, name: "IsIconic", arg_bytes: 4, shim: is_iconic },
     Binding { dll: USER32, name: "GetKeyState", arg_bytes: 4, shim: get_key_state },
+    Binding { dll: USER32, name: "MapVirtualKeyA", arg_bytes: 8, shim: map_virtual_key },
+    Binding { dll: USER32, name: "PtInRect", arg_bytes: 12, shim: pt_in_rect },
+    Binding { dll: USER32, name: "SendMessageA", arg_bytes: 16, shim: send_message },
     Binding { dll: USER32, name: "SetCursor", arg_bytes: 4, shim: set_cursor },
     Binding { dll: USER32, name: "DestroyWindow", arg_bytes: 4, shim: destroy_window },
     Binding { dll: USER32, name: "GetClipboardData", arg_bytes: 4, shim: get_clipboard_data },
     Binding { dll: USER32, name: "CharNextA", arg_bytes: 4, shim: char_next },
+    Binding { dll: USER32, name: "CharUpperA", arg_bytes: 4, shim: char_upper },
     Binding { dll: USER32, name: "GetKeyboardType", arg_bytes: 4, shim: get_keyboard_type },
     Binding { dll: USER32, name: "GetSystemMetrics", arg_bytes: 4, shim: get_system_metrics },
     Binding { dll: USER32, name: "OpenClipboard", arg_bytes: 4, shim: open_clipboard },
@@ -169,6 +200,7 @@ pub const SHIMS: &[Binding] = &[
     // `wsprintfA` is variadic and declared `WINAPIV`, so it is cdecl: the shim's
     // declared bytes are how far its arguments may extend, and the caller pops.
     Binding { dll: USER32, name: "wsprintfA", arg_bytes: 52, shim: wsprintf_a },
+    Binding { dll: USER32, name: "wsprintfW", arg_bytes: 52, shim: wsprintf_w },
 ];
 
 /// `WNDCLASSEXA`: the class name and procedure, four bytes further along than in
@@ -192,6 +224,11 @@ fn destroy_window(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
     // The page owns the one window the guest sees; destroying it does not make
     // the machine invisible, and the guest uses the answer only to check success.
     Ok(Return(1))
+}
+
+/// `IsIconic(hwnd)`: the canvas is never minimised, whatever the tab is doing.
+fn is_iconic(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(0))
 }
 
 /// `GetSystemMetrics(index)`: the screen the target presents for the two sizes,
@@ -230,6 +267,46 @@ fn get_system_metrics(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     }))
 }
 
+/// `EnumDisplaySettingsA(device, mode, devmode)`: the one mode this machine has.
+///
+/// The page presents a fixed surface, so the list holds exactly the session's
+/// screen at 32 bits: mode 0 and `ENUM_CURRENT_SETTINGS` fill it in, and every
+/// later index answers FALSE -- which is how a guest learns the list ended rather
+/// than that the call failed.
+fn enum_display_settings(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let mode = call.arg(1)?;
+    let devmode = call.arg(2)?;
+    if devmode == 0 || !(mode == 0 || mode == ENUM_CURRENT_SETTINGS) {
+        return Ok(Return(0));
+    }
+    let (width, height) = host.windows.screen();
+    let fields = DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+    call.write_u32(devmode.wrapping_add(DEVMODE_FIELDS), fields)?;
+    call.write_u32(devmode.wrapping_add(DEVMODE_BITS_PER_PEL), 32)?;
+    call.write_u32(devmode.wrapping_add(DEVMODE_PELS_WIDTH), width as u32)?;
+    call.write_u32(devmode.wrapping_add(DEVMODE_PELS_HEIGHT), height as u32)?;
+    call.write_u32(
+        devmode.wrapping_add(DEVMODE_DISPLAY_FREQUENCY),
+        DISPLAY_FREQUENCY,
+    )?;
+    Ok(Return(1))
+}
+
+/// `ChangeDisplaySettingsA(mode, flags)`: success without changing anything.
+///
+/// A page cannot take the visitor's desktop, and the surface the game draws into
+/// is already the size it asked for, so the mode change is a no-op that reports
+/// the success a guest needs to carry on rather than fall back to windowed mode.
+fn change_display_settings(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    if std::env::var("SHIMKIT_LOG_USER").is_ok() && host.notices.len() < 600 {
+        host.notice(
+            "ChangeDisplaySettingsA: the canvas is already the requested mode".to_string(),
+        );
+    }
+    let _ = call.arg(0)?;
+    Ok(Return(DISP_CHANGE_SUCCESSFUL))
+}
+
 /// `CharNextA(text)`: the next character, which in the single-byte codepage this
 /// host reports is one byte on. A lead byte would be two, and nothing here
 /// claims a DBCS codepage.
@@ -239,6 +316,32 @@ fn char_next(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         return Ok(Return(text));
     }
     Ok(Return(text + 1))
+}
+
+/// `CharUpperA(text)`: ASCII uppercase, in place.
+///
+/// Win32 overloads the one entry point: a value below `0x10000` is a character
+/// to uppercase rather than a pointer to a string, and the answer is that
+/// character either way.
+fn char_upper(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let text = call.arg(0)?;
+    if text < 0x0001_0000 {
+        let character = (text & 0xff) as u8;
+        return Ok(Return(u32::from(character.to_ascii_uppercase())));
+    }
+    let mut at = text;
+    loop {
+        let character = call.memory.read_u8(at)?;
+        if character == 0 {
+            break;
+        }
+        let upper = character.to_ascii_uppercase();
+        if upper != character {
+            call.write(at, &[upper])?;
+        }
+        at = at.wrapping_add(1);
+    }
+    Ok(Return(text))
 }
 
 /// `GetKeyboardType(flag)`: an enhanced 101-key PC, which is the keyboard every
@@ -255,6 +358,17 @@ fn get_keyboard_type(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
 fn post_message(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     host.input.post(call.arg(0)?, call.arg(1)?, call.arg(2)?, call.arg(3)?);
     Ok(Return(1))
+}
+
+/// `SendMessageA(hwnd, message, wparam, lparam)`: zero.
+///
+/// A message sent to a window runs the window procedure before the call returns.
+/// Nothing here re-enters the guest from inside a shim -- the procedure runs when
+/// the pump reaches the message -- so the synchronous answer does not exist and
+/// the caller gets the zero a window it does not own answers with.
+fn send_message(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let _ = (call.arg(0)?, call.arg(1)?);
+    Ok(Return(0))
 }
 
 fn set_window_text(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
@@ -287,29 +401,43 @@ fn get_clipboard_data(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
 }
 
 /// `wsprintfA(buffer, format, ...)`: the CRT's small formatter, used for window
-/// titles and scores.
+/// titles and scores. `wsprintfW` is the same formatter writing UTF-16.
 ///
 /// The arguments are read straight from the guest stack, which is why this shim
 /// declares a window rather than a signature: how many there are is written in
 /// the format itself. Widths and the integer/signed/string conversions are
 /// supported; floating point is not, and a `%f` leaves the value unread rather
 /// than guessing at a guest's stack layout.
-fn wsprintf_a(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+fn wsprintf_a(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    format_into(host, call, false)
+}
+
+fn wsprintf_w(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    format_into(host, call, true)
+}
+
+/// The body both `wsprintfA` and `wsprintfW` run: the same format language and
+/// the same argument window, with only the width of a character changing -- and
+/// with it the width of the `%s` and `%c` it formats.
+fn format_into(_: &mut Host, call: &mut Call<'_>, wide: bool) -> Result<Action> {
     let destination = call.arg(0)?;
-    let format = call.cstr(1)?;
-    let mut output: Vec<u8> = Vec::new();
+    let format = if wide {
+        call.wstr(call.arg(1)?)?
+    } else {
+        call.cstr(1)?
+    };
+    let mut output = String::new();
     let mut argument = 2_u32;
     let mut characters = format.chars().peekable();
 
     while let Some(character) = characters.next() {
         if character != '%' {
-            let mut encoded = [0_u8; 4];
-            output.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+            output.push(character);
             continue;
         }
         if characters.peek() == Some(&'%') {
             characters.next();
-            output.push(b'%');
+            output.push('%');
             continue;
         }
         let mut left = false;
@@ -341,10 +469,18 @@ fn wsprintf_a(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
                 characters.next();
             }
         }
-        while characters
-            .peek()
-            .is_some_and(|modifier| matches!(modifier, 'l' | 'h' | 'L' | 'w' | 'I' | '6' | '4'))
-        {
+        // The modifier decides how wide a `%s` or `%c` is, not the format: in a
+        // wide format `%hs` names an ANSI string and `%s` a wide one, and in an
+        // ANSI format it is the other way round. Ignoring it reads a path as
+        // UTF-16 and formats it as mojibake.
+        let mut hinted = None;
+        while let Some(&modifier) = characters.peek() {
+            match modifier {
+                'l' | 'w' => hinted = Some(true),
+                'h' => hinted = Some(false),
+                'L' | 'I' | '6' | '4' => {}
+                _ => break,
+            }
             characters.next();
         }
         let Some(specifier) = characters.next() else {
@@ -357,33 +493,65 @@ fn wsprintf_a(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
             'u' => value.to_string(),
             'x' => format!("{value:x}"),
             'X' => format!("{value:X}"),
-            'c' => char::from_u32(value & 0xff).unwrap_or('?').to_string(),
-            's' => {
+            'c' => {
+                let unit = hinted.unwrap_or(wide);
+                char::from_u32(value & if unit { 0xffff } else { 0xff })
+                    .unwrap_or('?')
+                    .to_string()
+            }
+            // A capital `%S` is the opposite width to the format's own.
+            's' | 'S' => {
                 // A null string formats as the empty string, as the CRT does.
                 if value == 0 {
                     String::new()
                 } else {
-                    call.memory.read_cstr(value)?
+                    let string_is_wide = if specifier == 'S' {
+                        !wide
+                    } else {
+                        hinted.unwrap_or(wide)
+                    };
+                    if string_is_wide {
+                        call.wstr(value)?
+                    } else {
+                        call.memory.read_cstr(value)?
+                    }
                 }
             }
             _ => continue,
         };
-        if text.len() >= width {
-            output.extend_from_slice(text.as_bytes());
+        // A field's width counts characters, which differs from the byte count
+        // for anything outside ASCII.
+        let length = text.chars().count();
+        if length >= width {
+            output.push_str(&text);
         } else if left {
-            output.extend_from_slice(text.as_bytes());
-            output.extend(std::iter::repeat_n(b' ', width - text.len()));
+            output.push_str(&text);
+            output.extend(std::iter::repeat_n(' ', width - length));
         } else {
-            output.extend(std::iter::repeat_n(if zero { b'0' } else { b' ' }, width - text.len()));
-            output.extend_from_slice(text.as_bytes());
+            output.extend(std::iter::repeat_n(if zero { '0' } else { ' ' }, width - length));
+            output.push_str(&text);
         }
     }
 
     if destination != 0 {
-        call.write(destination, &output)?;
-        call.write(destination.wrapping_add(output.len() as u32), &[0])?;
+        if wide {
+            let mut at = destination;
+            for unit in output.encode_utf16() {
+                call.write_u16(at, unit)?;
+                at = at.wrapping_add(2);
+            }
+            call.write_u16(at, 0)?;
+        } else {
+            call.write(destination, output.as_bytes())?;
+            call.write(destination.wrapping_add(output.len() as u32), &[0])?;
+        }
     }
-    Ok(Return(output.len() as u32))
+    // The count is characters, which for the ANSI form is also bytes.
+    Ok(Return(if wide {
+        output.encode_utf16().count() as u32
+    } else {
+        output.len() as u32
+    }))
 }
 
 /// A window the guest created.
@@ -627,7 +795,11 @@ fn create(host: &mut Host, call: &mut Call<'_>, class: String, title: String) ->
 
 /// Queues the messages a window receives when it becomes the one the user is
 /// looking at, once per session.
-fn activate(host: &mut Host, handle: u32) {
+///
+/// `pub(crate)` because a full-screen Direct3D device takes the display over,
+/// and the runtime showing the window is how a full-screen game learns it has
+/// the user's attention.
+pub(crate) fn activate(host: &mut Host, handle: u32) {
     if host.windows.activated || handle == 0 {
         return;
     }
@@ -778,6 +950,12 @@ fn get_desktop_window(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
     Ok(Return(DESKTOP_WINDOW))
 }
 
+/// `GetForegroundWindow()`: the window the visitor is looking at, which here is
+/// the one the page's input belongs to.
+fn get_foreground_window(host: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(host.windows.main_window()))
+}
+
 fn get_window_rect(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let handle = call.arg(0)?;
     let destination = call.arg(1)?;
@@ -925,6 +1103,25 @@ fn get_client_rect(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     Ok(Return(1))
 }
 
+/// `PtInRect(rect, point)`: Windows' half-open test, in which the left and top
+/// edges belong to the rectangle and the right and bottom do not -- so a point on
+/// a shared edge is inside exactly one of two adjacent rectangles.
+fn pt_in_rect(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let rect = call.arg(0)?;
+    let x = call.arg(1)? as i32;
+    let y = call.arg(2)? as i32;
+    if rect == 0 {
+        return Ok(Return(0));
+    }
+    let left = call.memory.read_u32(rect)? as i32;
+    let top = call.memory.read_u32(rect.wrapping_add(4))? as i32;
+    let right = call.memory.read_u32(rect.wrapping_add(8))? as i32;
+    let bottom = call.memory.read_u32(rect.wrapping_add(12))? as i32;
+    Ok(Return(u32::from(
+        left <= x && x < right && top <= y && y < bottom,
+    )))
+}
+
 /// `ClientToScreen(hwnd, &point)`: the client's origin added to the point.
 fn client_to_screen(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let handle = call.arg(0)?;
@@ -958,6 +1155,14 @@ fn invalidate_rect(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
 fn get_key_state(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let key = call.arg(0)? as u8;
     Ok(Return(u32::from(host.input.keyboard_state(key))))
+}
+
+/// `MapVirtualKeyA(code, map)`: zero, because this machine has no scan-code
+/// table. The browser reports which key it was, not where it sat on a board, so
+/// a translation to a scan code or a virtual key has no honest answer.
+fn map_virtual_key(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let _ = call.arg(0)?;
+    Ok(Return(0))
 }
 
 /// `SetCursor(cursor)`: the cursor that was set before it.
@@ -1318,6 +1523,63 @@ mod tests {
         host.pointer_move(-40, 0);
         assert_eq!(host.windows.cursor(), (280, 240));
         assert_eq!(host.input.mouse, (280, 240));
+    }
+
+    /// The width modifier decides how wide an argument string is, not the
+    /// format: `%hs` in a wide format names an ANSI string. Reading it as UTF-16
+    /// turned the save path into mojibake, and the guest then asked the
+    /// filesystem for a directory that cannot exist.
+    #[test]
+    fn a_format_takes_the_string_width_from_its_modifier() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let mut format = Vec::new();
+        for unit in "%hs".encode_utf16() {
+            format.extend_from_slice(&unit.to_le_bytes());
+        }
+        format.extend_from_slice(&[0, 0]);
+        let format_at = STACK_BASE + 0x3700;
+        memory.write_bytes(format_at, &format).unwrap();
+        let path = STACK_BASE + 0x3740;
+        memory.write_bytes(path, b"C:\\Save\\\0").unwrap();
+
+        let destination = STACK_BASE + 0x3780;
+        assert_eq!(
+            call_shim(
+                &mut host,
+                &mut memory,
+                "wsprintfW",
+                &[destination, format_at, path, 0, 0, 0, 0]
+            )
+            .unwrap(),
+            Return(8),
+            "eight characters, not the four a UTF-16 read would find"
+        );
+        let mut wide = Vec::new();
+        for index in 0..8 {
+            wide.push(memory.read_u16(destination + index * 2).unwrap());
+        }
+        assert_eq!(String::from_utf16(&wide).unwrap(), "C:\\Save\\");
+        assert_eq!(memory.read_u16(destination + 16).unwrap(), 0);
+
+        // And the other way round: `%ls` in an ANSI format names a wide string.
+        memory.write_bytes(format_at, b"%ls\0").unwrap();
+        let wide_path = STACK_BASE + 0x37c0;
+        for (index, unit) in "Hi".encode_utf16().chain([0]).enumerate() {
+            memory.write_u16(wide_path + index as u32 * 2, unit).unwrap();
+        }
+        assert_eq!(
+            call_shim(
+                &mut host,
+                &mut memory,
+                "wsprintfA",
+                &[destination, format_at, wide_path, 0, 0, 0, 0]
+            )
+            .unwrap(),
+            Return(2)
+        );
+        assert_eq!(memory.read_bytes(destination, 3).unwrap(), b"Hi\0");
     }
 
     #[test]

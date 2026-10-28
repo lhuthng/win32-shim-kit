@@ -1,4 +1,4 @@
-//! The `ADVAPI32.dll` registry the boot needs: four calls over one in-memory
+//! The `ADVAPI32.dll` registry the boot needs: six calls over one in-memory
 //! tree.
 //!
 //! A guest keeps its installed settings in `HKLM\SOFTWARE\Vendor\Product`,
@@ -9,7 +9,9 @@
 //! opening a missing key succeeds when the guest asks for write access and fails
 //! with `ERROR_FILE_NOT_FOUND` when it asks read-only. That is the one deviation
 //! from Windows in this file, and it stands in for the installer rather than for
-//! the registry.
+//! the registry. `RegCreateKeyA` is how a guest that was told the key is missing
+//! makes it, and `RegOpenKeyA` -- which has no access mask to read -- is always
+//! the read-only open.
 //!
 //! The tree is per session and never touches the disk. Saving across sessions is
 //! the M6 save/load work: the page will put this tree in `localStorage` or OPFS
@@ -86,6 +88,8 @@ impl Registry {
 
 pub const SHIMS: &[Binding] = &[
     Binding { dll: ADVAPI32, name: "RegCloseKey", arg_bytes: 4, shim: reg_close_key },
+    Binding { dll: ADVAPI32, name: "RegCreateKeyA", arg_bytes: 12, shim: reg_create_key },
+    Binding { dll: ADVAPI32, name: "RegOpenKeyA", arg_bytes: 12, shim: reg_open_key },
     Binding { dll: ADVAPI32, name: "RegOpenKeyExA", arg_bytes: 20, shim: reg_open_key_ex },
     Binding { dll: ADVAPI32, name: "RegQueryValueExA", arg_bytes: 24, shim: reg_query_value_ex },
     Binding { dll: ADVAPI32, name: "RegSetValueExA", arg_bytes: 24, shim: reg_set_value_ex },
@@ -96,12 +100,45 @@ fn reg_open_key_ex(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let subkey = optional_cstr(call, 1)?;
     let access = call.arg(3)?;
     let destination = call.arg(4)?;
+    open(host, call, parent, subkey, access & KEY_WRITE != 0, destination)
+}
+
+/// `RegOpenKeyA(hkey, subkey, phkResult)`, which is `RegOpenKeyExA` with no
+/// access mask: the guest asked to read, so a key the installer never wrote is
+/// reported missing instead of being conjured.
+fn reg_open_key(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let parent = call.arg(0)?;
+    let subkey = optional_cstr(call, 1)?;
+    let destination = call.arg(2)?;
+    open(host, call, parent, subkey, false, destination)
+}
+
+/// `RegCreateKeyA(hkey, subkey, phkResult)`: opening that makes the key when it
+/// is absent, which is what the guest's own first run does in place of an
+/// installer.
+fn reg_create_key(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let parent = call.arg(0)?;
+    let subkey = optional_cstr(call, 1)?;
+    let destination = call.arg(2)?;
+    open(host, call, parent, subkey, true, destination)
+}
+
+/// The one path all three open calls take: resolve the parent, join the subkey,
+/// and hand the guest a handle on the result.
+fn open(
+    host: &mut Host,
+    call: &mut Call<'_>,
+    parent: u32,
+    subkey: String,
+    create: bool,
+    destination: u32,
+) -> Result<Action> {
     if destination == 0 {
         return Ok(Return(ERROR_INVALID_HANDLE));
     }
 
     // A parent is either a predefined hive or a key this host handed out, which
-    // is how `RegOpenKeyExA` on an open key is written.
+    // is how an open on an open key is written.
     let base = match hive(parent) {
         Some(name) => name.to_string(),
         None => match host.registry.path_of(parent) {
@@ -116,7 +153,6 @@ fn reg_open_key_ex(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     };
     let path = path.to_lowercase();
 
-    let create = access & KEY_WRITE != 0;
     match host.registry.open(path, create) {
         Some(handle) => {
             call.write_u32(destination, handle)?;
@@ -387,6 +423,42 @@ mod tests {
             )
             .unwrap(),
             Return(ERROR_FILE_NOT_FOUND)
+        );
+    }
+
+    #[test]
+    fn reg_open_key_reports_a_missing_key_and_create_key_makes_it() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let subkey = STACK_BASE + 0x6c00;
+        let destination = STACK_BASE + 0x6d00;
+        memory
+            .write_bytes(subkey, b"SOFTWARE\\Example\\Settings\0")
+            .unwrap();
+
+        // No installer ran, so the read-only open is told the key is absent.
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "RegOpenKeyA", &[0x8000_0002, subkey, destination])
+                .unwrap(),
+            Return(ERROR_FILE_NOT_FOUND)
+        );
+
+        // The guest's first run creates it, and the same open then succeeds.
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "RegCreateKeyA", &[0x8000_0002, subkey, destination])
+                .unwrap(),
+            Return(ERROR_SUCCESS)
+        );
+        assert!(host
+            .registry
+            .path_of(memory.read_u32(destination).unwrap())
+            .unwrap()
+            .ends_with("settings"));
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "RegOpenKeyA", &[0x8000_0002, subkey, destination])
+                .unwrap(),
+            Return(ERROR_SUCCESS)
         );
     }
 

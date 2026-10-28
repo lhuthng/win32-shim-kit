@@ -8,7 +8,9 @@
 use crate::cpu::{self, Cpu, HostCall, Step};
 use crate::dispatch::Table;
 use crate::memory::GuestMemory;
+use crate::objects::WAIT_OBJECT_0;
 use crate::pe::Image;
+use crate::sched::{CallFrame, Spawn, ThreadSummary, ThreadWant, Threads};
 use crate::shim::{self, Action, GuestCall, Host};
 use crate::target::{self, Target};
 use crate::Result;
@@ -40,6 +42,10 @@ pub struct Session {
     /// part of it: the guest can hold a live value in `ecx` across the call the
     /// timer landed in, and a callback that clobbered it would corrupt the frame
     /// it interrupted.
+    ///
+    /// This is the *running* thread's frame. When the CPU changes threads it
+    /// moves into that thread's record and the next thread's moves here, so
+    /// everything below reads exactly as it did when this host had one thread.
     timer_frame: Option<(cpu::Registers, cpu::Fpu)>,
     /// Instruction count and timer id when the running timer callback was entered,
     /// so the callback's cost can be separated from the game's own work and
@@ -56,8 +62,39 @@ pub struct Session {
     /// `DispatchMessageA` started, with the import's own frame suspended under
     /// it. A stack because a dispatched procedure can call another import that
     /// dispatches again; each [`cpu::CALL_TRAMPOLINE`] arrival finishes the top
-    /// one with the routine's `eax`.
+    /// one with the routine's `eax`. Like the timer frame, this is the running
+    /// thread's and moves with it.
     call_frames: Vec<CallFrame>,
+    /// The guest's threads, one of which the CPU is on. A payload with a single
+    /// thread never leaves thread 0, and then nothing here changes what the run
+    /// loop does.
+    threads: Threads,
+    /// The instruction count at which the running thread is given up to another
+    /// thread that wants the CPU, when there is one.
+    slice_at: u64,
+    /// The instruction count when the running thread was entered, so the dump a
+    /// stalled run prints can attribute the instructions to the right thread.
+    thread_start: u64,
+    /// Whether a stall has been reported, so an embedder's log gets one line
+    /// about it however many times the guest spins back into the same state.
+    stall_reported: bool,
+    /// An address to report every time the guest reaches it, for a run that has
+    /// to be read at one exact instruction rather than sampled. Set by a
+    /// diagnostic harness, never by the page.
+    pub watch: Option<u32>,
+    watch_hits: u32,
+    /// The last few arrivals at [`Self::watch`], printed when the run dies: the
+    /// state that led to a fault, which sampling cannot show.
+    watch_recent: std::collections::VecDeque<String>,
+    /// The instructions that ran just before a fault, when `SHIMKIT_TRACE_TAIL`
+    /// asks for them. A wrap that sampling sees as one step is a sequence here.
+    tail: std::collections::VecDeque<String>,
+    /// How many instructions [`Self::tail`] keeps, or 0 for none.
+    tail_len: usize,
+    /// The instruction count at which [`Self::tail`] starts recording, so a run
+    /// that takes billions of instructions does not pay for the trace until the
+    /// part that matters.
+    tail_from: u64,
     /// The instruction count at which timers are looked at again. Timers only
     /// move when guest time does, so a run checks them every
     /// [`TIMER_CHECK_INSTRUCTIONS`] instead of on every instruction.
@@ -75,24 +112,20 @@ pub struct Session {
 /// a millisecond of guest time and keeps the check off the hot path.
 const TIMER_CHECK_INSTRUCTIONS: u64 = 256;
 
-/// A host call suspended while the guest runs a routine for it.
-struct CallFrame {
-    /// Everything but `eax`, which the routine's return value replaces.
-    regs: cpu::Registers,
-    fpu: cpu::Fpu,
-    /// Where the import's own arguments start, so the call can be popped when the
-    /// routine returns.
-    args: u32,
-    arg_bytes: u32,
-    /// The value the import returns instead of the routine's own, when the shim
-    /// said so: `LoadLibraryA` answers with a module handle, not `DllMain`'s.
-    answer: Option<u32>,
-    /// The import to run again when the routine returns, when the shim asked to be
-    /// resumed (`_initterm` and `exit` walk a list one entry per pass). The
-    /// routine's frame was pushed over the import's arguments, so a resumed shim
-    /// reads its state from the host instead.
-    resume: Option<&'static shim::Binding>,
-}
+/// How long one thread may keep the CPU before another thread that wants it gets
+/// a turn, in instructions.
+///
+/// Every other switch in this host happens where the guest asked for one -- a
+/// wait, a sleep, a signal -- and that is still all a guest needs for the usual
+/// producer/consumer handshake. It is not enough for the other shape a Windows
+/// game is written in: a main thread that spins on a flag its worker sets, with
+/// no call to the host anywhere in the loop. There is no switch point in that
+/// loop to take, so the worker would never run, and the spinning thread would
+/// give up on a flag that was only ever late. Windows takes the CPU away at a
+/// timer tick, so this does the same at an instruction count -- and only when
+/// there is another thread that can run, which is why a single-threaded payload
+/// behaves exactly as it did before threads existed.
+const THREAD_SLICE: u64 = 200_000;
 
 /// What [`Session::serve`] did with a host call.
 enum Served {
@@ -103,6 +136,9 @@ enum Served {
     /// The guest is now running a routine the shim asked for; `eax` is the
     /// routine's to fill.
     Call,
+    /// The thread that made the call handed the CPU over -- a wait, a sleep or its
+    /// own end -- and the scheduler picks what runs next at the top of the loop.
+    Switched,
 }
 
 /// Why a run stopped. `Steps` means the budget ran out with the guest still
@@ -190,6 +226,10 @@ impl Session {
                 "supplied marker: {name} ({size} bytes) stands in for a device the browser cannot have"
             ));
         }
+        // The thread the loader enters `WinMainCRTStartup` on, which is the only
+        // one until the guest asks for another.
+        let mut threads = Threads::new();
+        threads.start(cpu.regs, cpu.fpu.clone());
         Ok(Self {
             target,
             bindings: target
@@ -209,6 +249,22 @@ impl Session {
             timer_instructions: 0,
             timer_by_id: [0; 16],
             call_frames: Vec::new(),
+            threads,
+            slice_at: THREAD_SLICE,
+            thread_start: 0,
+            stall_reported: false,
+            watch: None,
+            watch_hits: 0,
+            watch_recent: Default::default(),
+            tail: Default::default(),
+            tail_len: std::env::var("SHIMKIT_TRACE_TAIL")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+            tail_from: std::env::var("SHIMKIT_TRACE_FROM")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
             timer_check_at: 0,
             lzw: crate::hle::Lzw::new(),
             blitter: crate::hle::Blitter::new(),
@@ -233,14 +289,91 @@ impl Session {
         self.cpu.instructions
     }
 
+    /// Every guest thread as it stands: where it is, what it is parked on, and
+    /// how many instructions it has retired.
+    ///
+    /// A run that neither faults nor presents anything is read from here. The
+    /// thread the CPU is on has not been accounted yet, so the slice in progress
+    /// is added to it; the counts then add up to [`Session::instructions`].
+    pub fn thread_summaries(&self) -> Vec<ThreadSummary> {
+        let mut waits: std::collections::HashMap<u32, Vec<u32>> =
+            self.host.objects.waiting().into_iter().collect();
+        let current = self.threads.current_id();
+        self.threads
+            .all()
+            .iter()
+            .map(|thread| {
+                let running = thread.id == current;
+                let in_progress = if running {
+                    self.cpu.instructions.saturating_sub(self.thread_start)
+                } else {
+                    0
+                };
+                ThreadSummary {
+                    id: thread.id,
+                    state: thread.state,
+                    pc: thread.regs.eip,
+                    instructions: thread.instructions + in_progress,
+                    waits: waits.remove(&thread.id).unwrap_or_default(),
+                    stack: self.frames_from(thread.regs.ebp, 8),
+                    current: running,
+                }
+            })
+            .collect()
+    }
+
+    /// One line for each arrival at [`Self::watch`], with the registers and the
+    /// eight stack words a caller pushed. An argument is that stack word, which
+    /// is how a call site says what it passes without being traced.
+    fn report_watch(&mut self) {
+        self.watch_hits += 1;
+        let registers = self
+            .cpu
+            .registers()
+            .iter()
+            .map(|(name, value)| format!("{name}={value:#010x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let stack = (0..8)
+            .map(|index| {
+                format!(
+                    "{:#010x}",
+                    self.memory
+                        .read_u32(self.cpu.regs.esp.wrapping_add(4 * index))
+                        .unwrap_or(0)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let line = format!(
+            "watch {:#010x} at {}: {registers} zf={} cf={}\n  stack+0..8: {stack}",
+            self.cpu.regs.eip,
+            self.cpu.instructions,
+            u8::from(self.cpu.regs.flags.zf),
+            u8::from(self.cpu.regs.flags.cf)
+        );
+        if self.watch_hits <= 64 {
+            println!("{line}");
+        }
+        self.watch_recent.push_back(line);
+        if self.watch_recent.len() > 64 {
+            self.watch_recent.pop_front();
+        }
+    }
+
     /// The return addresses on the guest's frame chain, innermost first.
     ///
     /// A guest that spins without calling the host is otherwise a mystery: the
     /// chain names the routine that is spinning and the calls that led to it,
     /// which no import name can.
     pub fn call_stack(&self, depth: usize) -> Vec<u32> {
+        self.frames_from(self.cpu.regs.ebp, depth)
+    }
+
+    /// The frame chain that starts at `ebp`, innermost first. Every thread has
+    /// one, which is what lets a stalled one name the routine it is in.
+    fn frames_from(&self, mut frame: u32, depth: usize) -> Vec<u32> {
         let mut stack = Vec::new();
-        let mut frame = self.cpu.regs.ebp;
         for _ in 0..depth {
             if frame == 0 {
                 break;
@@ -297,10 +430,41 @@ impl Session {
     /// call or a fault.
     pub fn run(&mut self, budget: u32) -> Outcome {
         for _ in 0..budget {
+            // The thread the CPU is on may have parked itself at the end of the
+            // host call that just completed, or given way to another one, so a
+            // thread that can run takes over here. With one thread this is one
+            // compare per instruction and there is never anyone else to pick.
+            if self.threads.switch_wanted() {
+                if let Some(outcome) = self.schedule() {
+                    return outcome;
+                }
+            } else if self.threads.len() > 1 && self.cpu.instructions >= self.slice_at {
+                // The quantum. A thread that is spinning on something another
+                // thread is meant to set has no switch point of its own, so the
+                // CPU is taken away here the way an operating system takes it.
+                //
+                // The switch is taken now, not after one more instruction: the
+                // parked record holds the instruction that has not run yet, so
+                // running it here would run it twice when the thread is entered
+                // again -- a `dec` of a loop counter executes twice, skips zero
+                // and turns the loop into a march through unmapped memory.
+                self.slice_at = self.cpu.instructions + THREAD_SLICE;
+                self.park(ThreadWant::Yield);
+                continue;
+            }
             // Both trampolines live above the host-call base, and no guest code
             // does, so one compare keeps the two checks out of the common path.
             let eip = self.cpu.regs.eip;
+            if self.watch == Some(eip) {
+                self.report_watch();
+            }
             if eip >= cpu::HOST_FUNCTION_BASE {
+                if eip == cpu::THREAD_TRAMPOLINE {
+                    // A `CreateThread` routine returned, which is this thread
+                    // asking to be ended: there was never an import under it.
+                    self.end_thread(self.cpu.regs.eax);
+                    continue;
+                }
                 // A timer callback is a guest routine the host calls on an
                 // interval. Its return comes back through the trampoline, which
                 // is not code the guest can reach, so the frame it interrupted is
@@ -342,7 +506,7 @@ impl Session {
                             binding.arg_bytes
                         };
                         match self.finish(action, frame.args, popped, Some(binding)) {
-                            Ok(Served::Call) => continue,
+                            Ok(Served::Call | Served::Switched) => continue,
                             Ok(Served::Return(value)) => {
                                 self.cpu.regs.eax = value;
                                 continue;
@@ -417,6 +581,27 @@ impl Session {
                     return Outcome::Fault(fault);
                 }
             }
+            if self.tail_len != 0 && self.cpu.instructions >= self.tail_from {
+                let regs = &self.cpu.regs;
+                self.tail.push_back(format!(
+                    "{:#012x} eip={:#010x} esp={:#010x} ebp={:#010x} eax={:#010x} ebx={:#010x} ecx={:#010x} edx={:#010x} esi={:#010x} edi={:#010x} zf={} lf={}",
+                    self.cpu.instructions,
+                    regs.eip,
+                    regs.esp,
+                    regs.ebp,
+                    regs.eax,
+                    regs.ebx,
+                    regs.ecx,
+                    regs.edx,
+                    regs.esi,
+                    regs.edi,
+                    u8::from(regs.flags.zf),
+                    u8::from(regs.flags.sf != regs.flags.of),
+                ));
+                if self.tail.len() > self.tail_len {
+                    self.tail.pop_front();
+                }
+            }
             match cpu::step(&mut self.memory, &mut self.cpu, &mut self.decodes) {
                 Ok(Step::Continue) => {}
                 Ok(Step::Halt) => return Outcome::Halted,
@@ -434,15 +619,53 @@ impl Session {
                         // The shim asked the guest to run a routine first; the
                         // program counter is already on it.
                         Ok(Some(Served::Call)) => {}
+                        // The thread handed the CPU over; the top of the loop
+                        // picks who runs next.
+                        Ok(Some(Served::Switched)) => {}
                         // No shim yet: this is the diagnostic, not a failure.
                         Ok(None) => return Outcome::HostCall(call),
-                        Err(error) => return Outcome::Fault(error),
+                        Err(error) => return self.fault(error),
                     }
                 }
-                Err(error) => return Outcome::Fault(error),
+                Err(error) => return self.fault(error),
             }
         }
         Outcome::Steps
+    }
+
+    /// A fault that names the thread it happened on. Which thread a fault belongs
+    /// to is the first thing to know about it once the guest runs more than one,
+    /// and a single-threaded guest is not told, because it has only one.
+    fn fault(&self, error: String) -> Outcome {
+        self.dump_tail();
+        // The arrivals at a watched address that came just before the fault, so
+        // the call that produced a bad value is in the log rather than guessable.
+        for line in &self.watch_recent {
+            println!("{line}");
+        }
+        if self.threads.len() > 1 {
+            Outcome::Fault(format!("thread {}: {error}", self.threads.current_id()))
+        } else {
+            Outcome::Fault(error)
+        }
+    }
+
+    /// Prints the instructions [`Self::tail`] kept. An embedder calls this when
+    /// a run ends however it ends, because a guest that leaves through a shim --
+    /// `_purecall` exiting, for one -- never reaches [`Self::fault`].
+    pub fn dump_tail(&self) {
+        for line in &self.tail {
+            println!("{line}");
+        }
+    }
+
+    /// Prints the last arrivals at [`Self::watch`]. A run that ends without a
+    /// fault still needs them: which addresses the guest reaches at the *end* is
+    /// what says whether it is looping inside the work it started with.
+    pub fn dump_watch(&self) {
+        for line in &self.watch_recent {
+            println!("{line}");
+        }
     }
 
     /// Starts a due timer callback, if one is waiting and none is running.
@@ -514,6 +737,7 @@ impl Session {
                 call.args,
                 action_value(action)
             ));
+            self.log_call(call.return_address);
             return self.finish(action, call.args, popped, Some(binding)).map(Some);
         }
         // A call through a host object carries its own interface and method, and
@@ -533,6 +757,7 @@ impl Session {
                 call.args,
                 action_value(action)
             ));
+            self.log_call(call.return_address);
             return self.finish(action, call.args, arg_bytes, None).map(Some);
         }
         let Some(slot) = self.target.table.slots.get(call.slot) else {
@@ -576,22 +801,41 @@ impl Session {
             call.args,
             action_value(action)
         ));
-        if std::env::var("SHIMKIT_LOG_CALLS").is_ok() {
-            // The caller's own address, from the stack the call pushed: a name and
-            // an argument count say which import a game is stuck on, but not which
-            // of its routines asked, which is what a disassembly is read from.
-            let caller = self
-                .memory
-                .read_u32(call.args.wrapping_sub(4))
-                .unwrap_or(0);
-            println!(
-                "{:14} {:#010x} {}",
-                self.cpu.instructions,
-                caller,
-                self.last_import.as_deref().unwrap_or_default()
-            );
-        }
+        self.log_call(call.return_address);
         self.finish(action, call.args, popped, Some(binding)).map(Some)
+    }
+
+    /// Prints one host call under `SHIMKIT_LOG_CALLS`, with the address of the
+    /// guest routine that asked for it.
+    ///
+    /// A name and an argument count say which import a game is stuck on, but not
+    /// which of its routines asked, which is what a disassembly is read from. The
+    /// address comes from the `call` itself: this host does not push a return
+    /// address for an import, so the stack below the arguments is not one.
+    /// Interface methods go through the same line as imports: a draw that never
+    /// happens is read from the calls around it, not from the import names alone.
+    fn log_call(&self, return_address: u32) {
+        if std::env::var("SHIMKIT_LOG_CALLS").is_err() {
+            return;
+        }
+        // A run of billions of instructions cannot have every call printed, and
+        // the calls that matter are the ones around the stop. `SHIMKIT_LOG_CALLS_AFTER`
+        // starts the log at that instruction count.
+        if let Some(after) = std::env::var("SHIMKIT_LOG_CALLS_AFTER")
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+        {
+            if self.cpu.instructions < after {
+                return;
+            }
+        }
+        println!(
+            "{:14} t{} {:#010x} {}",
+            self.cpu.instructions,
+            self.host.current_thread,
+            return_address,
+            self.last_import.as_deref().unwrap_or_default()
+        );
     }
 
     /// Completes a host call whose shim has run.
@@ -611,32 +855,287 @@ impl Session {
         arg_bytes: u32,
         resumable: Option<&'static shim::Binding>,
     ) -> Result<Served> {
+        // Whatever this shim signalled is released first, before any of the ways
+        // below can return: a thread that signalled something while another
+        // routine was being run for it still has to be woken.
+        self.release_woken();
         if let Some(request) = self.host.guest_call.take() {
             let resume = if request.resume { resumable } else { None };
             self.enter_guest_call(request, args, arg_bytes, resume)?;
             return Ok(Served::Call);
         }
+        // A thread the shim asked for. It is created here -- its stack is guest
+        // memory -- and it runs as soon as this call finishes, because that is
+        // what the guest assumes: the code after `CreateThread` returns may count
+        // on the new thread having started.
+        let started = match self.host.spawn.take() {
+            Some(spawn) => {
+                self.start_thread(spawn)?;
+                true
+            }
+            None => false,
+        };
         // stdcall: the callee pops its arguments.
         self.cpu.regs.esp = args.wrapping_add(arg_bytes);
-        Ok(match action {
-            Action::Return(value) => Served::Return(value),
+        let (served, value) = match action {
+            Action::Return(value) => (Served::Return(value), Some(value)),
             Action::Return64(value) => {
                 // A 64-bit result is `edx:eax`, and a caller that ignores the
                 // high half must still see it zeroed rather than whatever the
                 // previous call left.
                 self.cpu.regs.edx = (value >> 32) as u32;
-                Served::Return(value as u32)
+                (Served::Return(value as u32), Some(value as u32))
             }
-            Action::Exit(code) => Served::Exit(code),
+            Action::Exit(code) => (Served::Exit(code), None),
             Action::Float(op) => {
                 let (value, high) = self.cpu.fpu.apply(op);
                 // `_ftol` answers in `edx:eax`, and a `double` return leaves the
                 // high word zero because the caller only reads `eax` when it does
                 // not take the float stack.
                 self.cpu.regs.edx = high;
-                Served::Return(value)
+                (Served::Return(value), Some(value))
             }
-        })
+        };
+        // A shim that parked the calling thread stops it here. The value the shim
+        // returned is what that thread sees when it runs again, unless the wait it
+        // parked in has a result of its own.
+        if let Some(want) = self.host.thread_want.take() {
+            if let Some(value) = value {
+                self.cpu.regs.eax = value;
+            }
+            self.park(want);
+            return Ok(Served::Switched);
+        }
+        if started {
+            // The thread that was just created gets the CPU, and this one waits
+            // its turn: `CreateThread` returning is the guest asking for that
+            // thread to be started.
+            if let Some(value) = value {
+                self.cpu.regs.eax = value;
+            }
+            self.park(ThreadWant::Yield);
+            return Ok(Served::Switched);
+        }
+        Ok(served)
+    }
+
+    /// Wakes the threads a shim released by signalling, releasing or ending
+    /// something. Their own waits decide whether they are awake yet.
+    fn release_woken(&mut self) {
+        for (id, answer) in std::mem::take(&mut self.host.woken) {
+            self.threads.wake(id, answer);
+        }
+    }
+
+    /// Creates a guest thread: a stack of its own in guest memory, the routine's
+    /// parameter pushed under a return address the run loop recognises, and the
+    /// register set the scheduler enters it with.
+    ///
+    /// Nothing runs here. The new thread is runnable from now on, and the caller
+    /// gives way to it as soon as this import finishes.
+    fn start_thread(&mut self, spawn: Spawn) -> Result<()> {
+        const DEFAULT_STACK: u32 = 0x0004_0000;
+        let size = spawn
+            .stack_size
+            .unwrap_or(DEFAULT_STACK)
+            .clamp(0x4000, crate::memory::STACK_SIZE);
+        let base = self.host.allocate(size, 16)?;
+        let mut esp = base + size;
+        // `ThreadProc(parameter)`, entered the way Windows enters it: the argument
+        // pushed, then the address that ends the thread when the routine returns.
+        for value in [spawn.parameter, cpu::THREAD_TRAMPOLINE] {
+            esp = esp.wrapping_sub(4);
+            self.memory.write_u32(esp, value)?;
+        }
+        let regs = cpu::Registers {
+            eip: spawn.entry,
+            esp,
+            ..cpu::Registers::default()
+        };
+        self.threads
+            .spawn(spawn.id, spawn.handle, regs, cpu::Fpu::default());
+        if let Some(thread) = self.threads.thread_mut(spawn.id) {
+            thread.stack = base;
+        }
+        self.host.notice(format!(
+            "CreateThread at {:#010x} starts thread {} with {size} bytes of stack ({} thread(s))",
+            spawn.entry,
+            spawn.id,
+            self.threads.len()
+        ));
+        Ok(())
+    }
+
+    /// Ends the running thread: `ExitThread`, or a `CreateThread` routine returning
+    /// to the thread trampoline. Its handle is signalled, so a join returns.
+    fn end_thread(&mut self, code: u32) {
+        let id = self.threads.current_id();
+        // A thread that is over holds no call frames and no callback.
+        self.call_frames.clear();
+        self.timer_frame = None;
+        self.timer_started = None;
+        let (regs, fpu) = (self.cpu.regs, self.cpu.fpu.clone());
+        self.threads.park(regs, fpu, &ThreadWant::Exit(code));
+        self.release_stack();
+        for handle in self.host.objects.thread_exited(id, code) {
+            self.host.woken.extend(self.host.objects.wake(handle));
+        }
+        self.release_woken();
+    }
+
+    /// Hands a dead thread's stack back to the arena. The main thread's is not
+    /// the arena's to take, and is marked with zero.
+    fn release_stack(&mut self) {
+        let stack = self.threads.current_thread_mut().stack;
+        if stack != 0 {
+            self.threads.current_thread_mut().stack = 0;
+            self.host.release(stack);
+        }
+    }
+
+    /// Parks the running thread: its machine state moves into its own record and
+    /// the scheduler picks what runs next at the top of the loop.
+    fn park(&mut self, want: ThreadWant) {
+        let id = self.threads.current_id();
+        // The host calls suspended on this thread's stack, and a timer callback
+        // that interrupted it, belong to it rather than to the session.
+        let thread = self.threads.current_thread_mut();
+        std::mem::swap(&mut self.call_frames, &mut thread.frames);
+        std::mem::swap(&mut self.timer_frame, &mut thread.timer_frame);
+        std::mem::swap(&mut self.timer_started, &mut thread.timer_started);
+        let (regs, fpu) = (self.cpu.regs, self.cpu.fpu.clone());
+        self.threads.park(regs, fpu, &want);
+        match want {
+            ThreadWant::Wait { timeout: Some(ms) } => {
+                // The deadline is the guest's own clock: the embedder's while it
+                // supplies one, and the instruction count when it does not.
+                let now = self.host.guest_time_ms(self.cpu.instructions);
+                self.host.objects.set_deadline(id, now + u64::from(ms));
+                if std::env::var("SHIMKIT_LOG_TIMEOUTS").is_ok() {
+                    println!("deadline thread {id} at {now} until {}", now + u64::from(ms));
+                }
+            }
+            ThreadWant::Exit(code) => {
+                self.release_stack();
+                for handle in self.host.objects.thread_exited(id, code) {
+                    self.host.woken.extend(self.host.objects.wake(handle));
+                }
+                self.release_woken();
+            }
+            ThreadWant::Wait { timeout: None } | ThreadWant::Yield => {}
+        }
+    }
+
+    /// Moves the CPU onto a thread: its registers, its x87 stack, the host calls
+    /// and timer callback suspended on its stack, and its thread-local slots.
+    fn enter(&mut self, index: usize) {
+        // The thread being left keeps the instructions it retired, which is what
+        // makes a stuck thread's share of the run visible.
+        let spent = self.cpu.instructions.saturating_sub(self.thread_start);
+        self.threads.current_thread_mut().instructions += spent;
+        self.thread_start = self.cpu.instructions;
+        let (id, regs, fpu) = self.threads.run_on(index);
+        self.cpu.regs = regs;
+        self.cpu.fpu = fpu;
+        // Every thread is entered with a whole quantum: a thread that was
+        // switched in at the end of someone else's slice has not had its own yet.
+        self.slice_at = self.cpu.instructions + THREAD_SLICE;
+        if let Some(answer) = self.threads.current_thread_mut().answer.take() {
+            self.cpu.regs.eax = answer;
+        }
+        let thread = self.threads.current_thread_mut();
+        std::mem::swap(&mut self.call_frames, &mut thread.frames);
+        std::mem::swap(&mut self.timer_frame, &mut thread.timer_frame);
+        std::mem::swap(&mut self.timer_started, &mut thread.timer_started);
+        self.host.current_thread = id;
+        self.host.tls.switch_to(id);
+        if std::env::var("SHIMKIT_LOG_THREADS").is_ok() {
+            println!(
+                "{:14} thread {id} on at {:#010x}",
+                self.cpu.instructions, self.cpu.regs.eip
+            );
+        }
+    }
+
+    /// Hands the CPU to a thread that can run, answering why the run has to stop
+    /// when none can.
+    fn schedule(&mut self) -> Option<Outcome> {
+        // A timed wait whose deadline has passed answers itself first: no more of
+        // that time is coming, and the guest should not have to care that the CPU
+        // was somewhere else while it went by.
+        let now = self.host.guest_time_ms(self.cpu.instructions);
+        let expired = self.host.objects.expire(now);
+        if std::env::var("SHIMKIT_LOG_TIMEOUTS").is_ok() && !expired.is_empty() {
+            println!("expired at {now}: {expired:?}");
+        }
+        for (id, answer) in expired {
+            self.threads.wake(id, answer);
+        }
+        if let Some(index) = self.threads.schedule() {
+            self.enter(index);
+            return None;
+        }
+        if self.threads.all_exited() {
+            return Some(Outcome::Halted);
+        }
+        // Every thread is parked. Nothing this host can do will release them, so
+        // the waits are answered rather than left to hang the page.
+        self.force_waits();
+        match self.threads.schedule() {
+            Some(index) => {
+                self.enter(index);
+                None
+            }
+            None => Some(Outcome::Steps),
+        }
+    }
+
+    /// Answers every parked wait, because nothing can run and nothing will.
+    ///
+    /// Windows would sit here for as long as it took, which a page with a frame
+    /// budget cannot. Before this host ran threads at all, every wait was answered
+    /// the moment it was asked, so this is that behaviour held in reserve: the
+    /// guest goes on with the result the old host would have given it, and one
+    /// notice names what was waiting, because that is the evidence a missing
+    /// signal is found from.
+    fn force_waits(&mut self) {
+        let parked = self.host.objects.waiting();
+        if parked.is_empty() {
+            return;
+        }
+        if std::env::var("SHIMKIT_LOG_STALLS").is_ok() {
+            println!(
+                "{:14} stall: {:?}",
+                self.cpu.instructions,
+                parked.iter()
+                    .map(|(id, handles)| (*id, handles.clone()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        if !self.stall_reported {
+            self.stall_reported = true;
+            let who = parked
+                .iter()
+                .map(|(id, handles)| {
+                    if handles.is_empty() {
+                        format!("thread {id} is asleep")
+                    } else {
+                        let list: Vec<String> =
+                            handles.iter().map(|handle| format!("{handle:#010x}")).collect();
+                        format!("thread {id} waits on {}", list.join(", "))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.host.notice(format!(
+                "every thread is parked ({who}) and nothing can release them, so the waits were \
+                 answered to let the guest go on"
+            ));
+        }
+        for (id, _) in parked {
+            self.host.objects.forget(id);
+            self.threads.wake(id, WAIT_OBJECT_0);
+        }
     }
 
     /// Pushes a guest routine's arguments and enters it, saving the frame the

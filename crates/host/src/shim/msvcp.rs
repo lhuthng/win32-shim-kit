@@ -872,8 +872,9 @@ fn write_to(host: &mut Host, object: u32, bytes: &[u8]) -> Result<()> {
 
 // ---- the rest -----------------------------------------------------------
 
-/// `_Lockit`'s constructor and destructor: the runtime's own lock, which a
-/// single-threaded machine never contends.
+/// `_Lockit`'s constructor and destructor: the C++ runtime's own lock. It answers
+/// at once, like every other lock this host is asked for: nothing here makes a
+/// guest block on a lock of its own.
 fn lockit(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
     Ok(Return(0))
 }

@@ -1,0 +1,32 @@
+{
+  "default": "triangle.exe",
+  "executables": [
+    {
+      "bytes": 9855,
+      "entry": 4198544,
+      "entry_hex": "0x00401090",
+      "image_bytes": 24576,
+      "imports": 7,
+      "name": "triangle.exe"
+    }
+  ],
+  "format": 2,
+  "game": {
+    "bytes": 20411,
+    "files": 3,
+    "root": "game"
+  },
+  "kit": {
+    "abi": 1,
+    "version": "0.1.0"
+  },
+  "module": {
+    "bytes": 1262368,
+    "name": "host_wasm.wasm"
+  },
+  "screen": {
+    "depth": 8,
+    "height": 480,
+    "width": 640
+  }
+}

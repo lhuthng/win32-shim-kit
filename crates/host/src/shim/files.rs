@@ -47,6 +47,7 @@ const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_FILE_EXISTS: u32 = 80;
 const ERROR_INVALID_HANDLE: u32 = 6;
+const ERROR_IO_PENDING: u32 = 997;
 
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const FILE_WRITE_DATA: u32 = 0x0000_0002;
@@ -275,6 +276,13 @@ impl Files {
     pub fn contents(&self, path: &str) -> Option<&[u8]> {
         let (table, key) = self.resolve(path)?;
         self.entry(table, &key).map(|entry| entry.bytes.as_slice())
+    }
+
+    /// The whole contents of an open file, which `CreateFileMappingA` maps: the
+    /// guest may hand the mapping a handle rather than a path.
+    pub fn open_contents(&self, handle: u32) -> Option<Vec<u8>> {
+        let (entry, _) = self.file(handle)?;
+        Some(entry.bytes.clone())
     }
 
     /// Reads up to `count` bytes at the cursor and advances it, which is what a
@@ -868,11 +876,38 @@ fn read_file(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let destination = call.arg(1)?;
     let requested = call.arg(2)?;
     let copied_out = call.arg(3)?;
+    let overlapped = call.arg(4)?;
 
+    // An overlapped read takes its offset from the `OVERLAPPED` structure and
+    // leaves the file pointer where it was: the guest that posted it is free to
+    // seek or post the next buffer while this one is in flight. Reading from the
+    // file pointer instead both returns the wrong bytes and moves a position the
+    // guest thinks it owns.
+    let at = if overlapped != 0 {
+        let low = call.memory.read_u32(overlapped.wrapping_add(8))?;
+        let high = call.memory.read_u32(overlapped.wrapping_add(12))?;
+        if high != 0 {
+            host.last_error = 87; // ERROR_INVALID_PARAMETER
+            return Ok(Return(0));
+        }
+        Some(low)
+    } else {
+        None
+    };
+
+    if std::env::var("SHIMKIT_LOG_FILES").is_ok() && (overlapped != 0 || requested > 1024) {
+        host.notice(format!(
+            "read {handle:#x} {requested} bytes (overlapped {overlapped:#x}, offset {at:?})"
+        ));
+    }
     let Some((entry, position)) = host.files.file(handle) else {
         host.last_error = ERROR_INVALID_HANDLE;
         return Ok(Return(0));
     };
+    // A read at or past the end of the file transfers nothing, which a guest
+    // that seeked past the end (or posted an overlapped read there) is allowed to
+    // ask for: the position is clamped so the slice below stays inside the bytes.
+    let position = at.unwrap_or(position).min(entry.length);
     // Short reads are legal: the guest reads in chunks and stops at zero.
     let available = entry.length.saturating_sub(position);
     let count = requested.min(available);
@@ -892,7 +927,26 @@ fn read_file(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     if copied_out != 0 {
         call.write_u32(copied_out, count)?;
     }
-    host.files.seek(handle, position.saturating_add(count));
+    if overlapped != 0 {
+        // The bytes are in the buffer and the completion is written where
+        // `GetOverlappedResult` and an event wait look for it, but the call still
+        // answers ERROR_IO_PENDING: a guest that streams files posts these reads
+        // and runs the completion from whoever waits for the event, never from
+        // the calling frame. Reporting success here makes it run that completion
+        // inside the frame that holds the stream's lock, which deadlocks the
+        // dispatcher against its own semaphore.
+        call.write_u32(overlapped, 0)?; // Internal: STATUS_SUCCESS
+        call.write_u32(overlapped.wrapping_add(4), count)?; // InternalHigh: transferred
+        let event = call.memory.read_u32(overlapped.wrapping_add(16))?;
+        if event != 0 {
+            host.objects.signal(event);
+            host.woken.extend(host.objects.wake(event));
+        }
+        host.last_error = ERROR_IO_PENDING;
+        return Ok(Return(0));
+    } else {
+        host.files.seek(handle, position.saturating_add(count));
+    }
     host.files.bytes_read += u64::from(count);
     Ok(Return(1))
 }

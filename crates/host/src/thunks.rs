@@ -38,9 +38,14 @@ use Action::Return;
 /// maps, so a program counter there is unambiguous.
 pub const THUNK_BASE: u32 = 0x00e0_0000;
 
-/// Sixteen interface kinds of up to 64 methods each is 4 KB of address space.
-pub const KIND_LIMIT: u8 = 16;
-pub const SLOT_LIMIT: u8 = 64;
+/// Thirty-two interface kinds of up to 256 slots each is 32 KB of address space.
+///
+/// The width is the encoding (`kind << 8 | slot`), so a kind is a byte and a slot
+/// is a byte; the limits only say how much of that space is walked. Direct3D 8
+/// needs the room: `IDirect3DDevice8` is 97 methods, and the twelve interfaces
+/// take the kinds after DirectShow's.
+pub const KIND_LIMIT: u8 = 32;
+pub const SLOT_LIMIT: u8 = 128;
 
 /// Interface kinds.
 pub const DINPUT: u8 = 0;
@@ -58,6 +63,38 @@ pub const QUARTZ_EVENT: u8 = 10;
 pub const QUARTZ_POSITION: u8 = 11;
 pub const QUARTZ_VIDEO_WINDOW: u8 = 12;
 pub const QUARTZ_BASIC_AUDIO: u8 = 13;
+
+/// Direct3D 8: `Direct3DCreate8` hands out an `IDirect3D8`, which hands out an
+/// `IDirect3DDevice8`, which hands out every resource. One kind per interface,
+/// because a thunk's address has to say which interface was called as well as
+/// which method: `Release` is slot 2 on all of them.
+pub const D3D8: u8 = 14;
+pub const D3D8_DEVICE: u8 = 15;
+pub const D3D8_RESOURCE: u8 = 16;
+pub const D3D8_VERTEX_BUFFER: u8 = 17;
+pub const D3D8_INDEX_BUFFER: u8 = 18;
+pub const D3D8_BASE_TEXTURE: u8 = 19;
+pub const D3D8_TEXTURE: u8 = 20;
+pub const D3D8_VOLUME_TEXTURE: u8 = 21;
+pub const D3D8_CUBE_TEXTURE: u8 = 22;
+pub const D3D8_SURFACE: u8 = 23;
+pub const D3D8_VOLUME: u8 = 24;
+pub const D3D8_SWAP_CHAIN: u8 = 25;
+/// The two auxiliaries a DirectSound buffer hands out through `QueryInterface`:
+/// the 3D positioning twin a game drives instead of volume and pan, and the
+/// notification twin a game pins play events to. One kind per interface,
+/// because a call's slot means a different method on each.
+pub const DSOUND_NOTIFY: u8 = 26;
+pub const DSOUND_3D_BUFFER: u8 = 27;
+/// The property-set interface a buffer hands out. Two interfaces share their
+/// place in a guest's probing: this one is asked what effects it supports,
+/// and the notify twin is asked to pin play events.
+pub const DSOUND_PROPERTY_SET: u8 = 28;
+/// The listener half of the 3D pair: the primary buffer hands it out, and it
+/// carries where the ears are instead of where a sound is.
+pub const DSOUND_3D_LISTENER: u8 = 29;
+/// The last kind this build knows, so the tests walk the same range the tables do.
+pub const LAST_KIND: u8 = DSOUND_3D_LISTENER;
 
 const S_OK: u32 = 0;
 /// The object exists but does not implement the requested interface.
@@ -143,6 +180,18 @@ const DINPUT_DEVICE_METHODS: &[Option<Method>] = &[
     Some(Method { name: "GetDeviceInfo", pop: 8 }),
     Some(Method { name: "RunControlPanel", pop: 12 }),
     Some(Method { name: "Initialize", pop: 16 }),
+    // The 8.0 device appends the force-feedback block, which nothing here can
+    // answer; the slots stay unmodelled so a guest that reaches one is told
+    // what it reached. `Poll` after them is the call every 8.0 game makes
+    // before it reads its devices.
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    m("Poll", 4),
 ];
 
 /// The thunk address for a method.
@@ -177,12 +226,28 @@ pub fn kind_name(kind: u8) -> &'static str {
         DDRAW_CLIPPER => "IDirectDrawClipper",
         DSOUND => "IDirectSound",
         DSOUND_BUFFER => "IDirectSoundBuffer",
+        DSOUND_NOTIFY => "IDirectSoundNotify",
+        DSOUND_3D_BUFFER => "IDirectSound3DBuffer",
+        DSOUND_PROPERTY_SET => "IKsPropertySet",
+        DSOUND_3D_LISTENER => "IDirectSound3DListener",
         QUARTZ_GRAPH => "IGraphBuilder",
         QUARTZ_CONTROL => "IMediaControl",
         QUARTZ_EVENT => "IMediaEvent",
         QUARTZ_POSITION => "IMediaPosition",
         QUARTZ_VIDEO_WINDOW => "IVideoWindow",
         QUARTZ_BASIC_AUDIO => "IBasicAudio",
+        D3D8 => "IDirect3D8",
+        D3D8_DEVICE => "IDirect3DDevice8",
+        D3D8_RESOURCE => "IDirect3DResource8",
+        D3D8_VERTEX_BUFFER => "IDirect3DVertexBuffer8",
+        D3D8_INDEX_BUFFER => "IDirect3DIndexBuffer8",
+        D3D8_BASE_TEXTURE => "IDirect3DBaseTexture8",
+        D3D8_TEXTURE => "IDirect3DTexture8",
+        D3D8_VOLUME_TEXTURE => "IDirect3DVolumeTexture8",
+        D3D8_CUBE_TEXTURE => "IDirect3DCubeTexture8",
+        D3D8_SURFACE => "IDirect3DSurface8",
+        D3D8_VOLUME => "IDirect3DVolume8",
+        D3D8_SWAP_CHAIN => "IDirect3DSwapChain8",
         _ => "unknown interface",
     }
 }
@@ -197,6 +262,10 @@ fn methods(kind: u8) -> Option<&'static [Option<Method>]> {
         DDRAW_CLIPPER => Some(crate::shim::ddraw::CLIPPER_METHODS),
         DSOUND => Some(crate::shim::dsound::SOUND_METHODS),
         DSOUND_BUFFER => Some(crate::shim::dsound::BUFFER_METHODS),
+        DSOUND_NOTIFY => Some(crate::shim::dsound::NOTIFY_METHODS),
+        DSOUND_3D_BUFFER => Some(crate::shim::dsound::THREE_D_METHODS),
+        DSOUND_PROPERTY_SET => Some(crate::shim::dsound::PROPERTY_SET_METHODS),
+        DSOUND_3D_LISTENER => Some(crate::shim::dsound::LISTENER_METHODS),
         kind => crate::shim::quartz::methods(kind),
     }
 }
@@ -220,11 +289,19 @@ fn method(kind: u8, slot: u8) -> Result<&'static Method> {
 /// Argument bytes the method pops, `this` included. The step loop needs this
 /// before the shim runs, exactly as it does for an import.
 pub fn arg_bytes(kind: u8, slot: u8) -> u32 {
+    // Direct3D's tables are names only: a method this kit has not answered is
+    // refused, and a refused call never returns to the guest to pop anything.
+    if crate::shim::d3d8::handles(kind) {
+        return crate::shim::d3d8::arg_bytes(kind, slot);
+    }
     method(kind, slot).map_or(4, |method| method.pop)
 }
 
 /// `Interface.Method` for a call, for logs.
 pub fn label(kind: u8, slot: u8) -> String {
+    if crate::shim::d3d8::handles(kind) {
+        return crate::shim::d3d8::label(kind, slot);
+    }
     match method(kind, slot) {
         Ok(method) => format!("{}.{}", kind_name(kind), method.name),
         Err(_) => format!("{}.slot {slot}", kind_name(kind)),
@@ -233,14 +310,19 @@ pub fn label(kind: u8, slot: u8) -> String {
 
 /// Answers one method call.
 pub fn serve(host: &mut Host, call: &mut Call<'_>, kind: u8, slot: u8) -> Result<Action> {
+    if crate::shim::d3d8::handles(kind) {
+        return crate::shim::d3d8::serve(host, call, kind, slot);
+    }
     let method = method(kind, slot)?;
     match (kind, method.name) {
         // DirectSound buffers are reference counted for real: the last Release
         // frees the guest's sample memory. `dsound::serve` owns every method of
         // its two interfaces, including the reference count.
-        (DSOUND | DSOUND_BUFFER, name) => {
-            crate::shim::dsound::serve(host, call, kind, name)
-        }
+        (
+            DSOUND | DSOUND_BUFFER | DSOUND_NOTIFY | DSOUND_3D_BUFFER | DSOUND_PROPERTY_SET
+            | DSOUND_3D_LISTENER,
+            name,
+        ) => crate::shim::dsound::serve(host, call, kind, name),
 
         // The filter graph owns its own reference counting and interface
         // answering: `QueryInterface` on it hands back a different interface
@@ -312,6 +394,9 @@ pub fn serve(host: &mut Host, call: &mut Call<'_>, kind: u8, slot: u8) -> Result
         }
         (DINPUT_DEVICE, "SetProperty") => Ok(Return(S_OK)),
         (DINPUT_DEVICE, "Acquire") | (DINPUT_DEVICE, "Unacquire") => Ok(Return(S_OK)),
+        // `Poll` reads the device once more before the guest's `GetDeviceState`;
+        // the state is already current, so answering success is the truth.
+        (DINPUT_DEVICE, "Poll") => Ok(Return(S_OK)),
         (DINPUT_DEVICE, "GetDeviceState") => {
             host.device_state_reads += 1;
             let device = call.arg(0)?;
@@ -515,7 +600,7 @@ mod tests {
         // Four bytes per entry: an address inside one is not a method.
         assert_eq!(at(address + 2), None);
         assert_eq!(at(THUNK_BASE - 4), None);
-        assert_eq!(at(THUNK_BASE + 4 * 4096), None);
+        assert_eq!(at(THUNK_BASE + 4 * (u32::from(KIND_LIMIT) << 8)), None);
     }
 
     #[test]

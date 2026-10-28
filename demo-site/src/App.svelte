@@ -15,7 +15,14 @@
       if (!response.ok) throw new Error(`payloads/index.json: HTTP ${response.status}`);
       const data = await response.json();
       payloads = Array.isArray(data) ? data : (data.payloads ?? []);
-      selected = payloads.find((entry) => entry.slug === asked) ?? payloads[0] ?? null;
+      // `?game=` names a payload the page will play even when the list does not
+      // mention it: a payload baked next to the site for one machine is how a
+      // game is checked before it is published, and the list is what is
+      // published. Without a name there is nothing to fetch, so the list still
+      // decides.
+      selected =
+        payloads.find((entry) => entry.slug === asked) ??
+        (asked ? { slug: asked, title: asked } : payloads[0] ?? null);
     } catch (error) {
       problem = error.message;
     } finally {

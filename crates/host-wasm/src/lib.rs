@@ -237,7 +237,13 @@ pub extern "C" fn wh_run(budget: u32) -> i32 {
         }
         Outcome::Fault(_) => {
             LAST_SLOT.with(|slot| slot.set(-1));
-            set_message(&outcome.describe(target().table));
+            // The message names the access, which on its own does not say which
+            // instruction made it; the program counter does.
+            let pc = SESSION.with(|cell| cell.borrow().as_ref().map(|session| session.pc()));
+            set_message(&match pc {
+                Some(pc) => format!("{} at pc {pc:#010x}", outcome.describe(target().table)),
+                None => outcome.describe(target().table),
+            });
         }
         Outcome::Halted => {
             LAST_SLOT.with(|slot| slot.set(-1));
@@ -621,6 +627,76 @@ pub extern "C" fn wh_palette(index: u32) -> u32 {
             let [red, green, blue] = session.host.ddraw.palette()[index as usize];
             (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue)
         })
+    })
+}
+
+/// The Direct3D 8 command stream, as bytes: see `host::render` for the record
+/// format. The page replays them against its own mirror of the device state and
+/// then calls [`wh_render_clear`], because the records are deltas rather than a
+/// full frame.
+///
+/// The stream lives in the host, not in linear memory: the guest can write
+/// anywhere in the arena, and a guest write into the command stream would be a
+/// page drawing whatever the game's heap happened to hold.
+#[no_mangle]
+pub extern "C" fn wh_render_ptr() -> *const u8 {
+    SESSION.with(|cell| {
+        cell.borrow().as_ref().map_or(std::ptr::null(), |session| {
+            session.host.d3d8.stream.bytes().as_ptr()
+        })
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn wh_render_len() -> u32 {
+    SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(0, |session| session.host.d3d8.stream.len() as u32)
+    })
+}
+
+/// Empties the stream. Called once the page has replayed every record, never
+/// before: an unreplayed record is a command that never reaches the screen.
+#[no_mangle]
+pub extern "C" fn wh_render_clear() {
+    SESSION.with(|cell| {
+        if let Some(session) = cell.borrow_mut().as_mut() {
+            session.host.d3d8.stream.clear();
+        }
+    });
+}
+
+/// Draws the guest has issued, which is how a page tells a 3D target from one
+/// that only blits: zero after a frame of executing means the guest is not using
+/// Direct3D at all.
+#[no_mangle]
+pub extern "C" fn wh_render_draws() -> f64 {
+    SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(0.0, |session| session.host.d3d8.draws as f64)
+    })
+}
+
+/// Back buffer width the device was created with, or 0 when there is no device.
+#[no_mangle]
+pub extern "C" fn wh_render_width() -> u32 {
+    SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|session| session.host.d3d8.device.as_ref())
+            .map_or(0, |device| device.width)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn wh_render_height() -> u32 {
+    SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|session| session.host.d3d8.device.as_ref())
+            .map_or(0, |device| device.height)
     })
 }
 

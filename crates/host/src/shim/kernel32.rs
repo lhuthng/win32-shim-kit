@@ -24,7 +24,11 @@
 //! Anything missing stays unimplemented on purpose: the session stops and names
 //! the slot, which is the diagnostic that drives this file's growth.
 
+use std::collections::HashMap;
+
+use crate::objects::{Object, NO_OWNER, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use crate::pe::IMAGE_BASE;
+use crate::sched::{Spawn, ThreadWant};
 use crate::shim::{Action, Binding, Call, Host};
 use crate::Result;
 
@@ -43,6 +47,21 @@ const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_RESOURCE_NAME_NOT_FOUND: u32 = 1813;
 /// `GetLastError` after a call was given a handle that is not open.
 const ERROR_INVALID_HANDLE: u32 = 6;
+/// `CreateThread` and `WaitForMultipleObjects` reject a null routine or a count
+/// of zero with this rather than starting a thread that runs nowhere.
+const ERROR_INVALID_PARAMETER: u32 = 87;
+
+/// `INFINITE`: a wait with no deadline.
+const INFINITE: u32 = u32::MAX;
+/// `MAXIMUM_WAIT_OBJECTS`, the most handles one wait may name.
+const MAXIMUM_WAIT_OBJECTS: u32 = 64;
+/// `WAIT_FAILED`: the wait itself was refused, which is not the same as timing
+/// out and is the only value a guest is expected to check for.
+const WAIT_FAILED: u32 = u32::MAX;
+/// The tick rate [`query_performance_counter`] reports: 1024 ticks per
+/// millisecond of page clock.
+const QPC_FREQUENCY: u32 = 1_024_000;
+
 /// `GetFileSize`'s failure value.
 const INVALID_FILE_SIZE: u32 = 0xffff_ffff;
 
@@ -65,27 +84,45 @@ const C1_CNTRL: u16 = 0x0020;
 const C1_BLANK: u16 = 0x0040;
 const C1_ALPHA: u16 = 0x0100;
 
-/// The thread-local slots `TlsAlloc` hands out.
+/// The thread-local slots `TlsAlloc` hands out: `TlsSetValue` writes a value and
+/// `TlsGetValue` reads it back, which is exactly what the CRT's
+/// `__declspec(thread)` emulation and an SDL build's thread-local error state do
+/// with it.
 ///
-/// A browser page has one thread, so a slot is a ["session", value] pair rather
-/// than a per-thread table: `TlsSetValue` writes it and `TlsGetValue` reads it
-/// back, which is exactly what the CRT's `__declspec(thread)` emulation and an
-/// SDL build's thread-local error state do with it.
+/// The indices belong to the session and the values to the thread: `TlsAlloc`
+/// hands out one index every thread shares -- that is what makes a TLS variable
+/// usable across threads at all -- while the value at that index is a thread's
+/// own. The running thread's values are in [`ThreadLocals::slots`] and every
+/// other thread's wait in `by_thread`, put there when the CPU leaves it.
 pub struct ThreadLocals {
     slots: Vec<Option<u32>>,
+    /// The values of the threads that are not running, by thread id.
+    by_thread: HashMap<u32, Vec<Option<u32>>>,
+    /// The thread whose values are in `slots`.
+    current: u32,
 }
 
 impl Default for ThreadLocals {
     fn default() -> Self {
-        Self { slots: Vec::new() }
+        Self {
+            slots: Vec::new(),
+            by_thread: HashMap::new(),
+            current: 0,
+        }
     }
 }
 
 impl ThreadLocals {
     /// Allocates a slot and returns its index. Windows grows its table the same
     /// way, one index at a time, and never reuses one until it is freed.
+    ///
+    /// Every thread's set grows, not just the running one's: an index means the
+    /// same variable in each of them.
     pub fn alloc(&mut self) -> u32 {
         self.slots.push(None);
+        for values in self.by_thread.values_mut() {
+            values.push(None);
+        }
         (self.slots.len() - 1) as u32
     }
 
@@ -109,6 +146,24 @@ impl ThreadLocals {
             *slot = None;
         }
     }
+
+    /// Hands the slots over to another thread: the running thread's values are
+    /// put away and `thread`'s are picked up. A thread this has not seen starts
+    /// with every slot zero, as a fresh thread does on Windows.
+    pub fn switch_to(&mut self, thread: u32) {
+        if self.current == thread {
+            return;
+        }
+        let running = std::mem::take(&mut self.slots);
+        self.by_thread.insert(self.current, running);
+        self.current = thread;
+        // The sets are kept the same length, so the slot count is whatever the
+        // threads this host has already seen agreed on.
+        let count = self.by_thread.values().map(Vec::len).max().unwrap_or(0);
+        let mut values = self.by_thread.remove(&thread).unwrap_or_default();
+        values.resize(count, None);
+        self.slots = values;
+    }
 }
 
 const LCMAP_LOWERCASE: u32 = 0x0000_0100;
@@ -119,6 +174,9 @@ pub const SHIMS: &[Binding] = &[
     Binding { dll: KERNEL32, name: "AreFileApisANSI", arg_bytes: 0, shim: are_file_apis_ansi },
     Binding { dll: KERNEL32, name: "Beep", arg_bytes: 8, shim: beep },
     Binding { dll: KERNEL32, name: "CloseHandle", arg_bytes: 4, shim: close_handle },
+    Binding { dll: KERNEL32, name: "CreateFileMappingA", arg_bytes: 24, shim: create_file_mapping_a },
+    Binding { dll: KERNEL32, name: "MapViewOfFile", arg_bytes: 20, shim: map_view_of_file },
+    Binding { dll: KERNEL32, name: "UnmapViewOfFile", arg_bytes: 4, shim: unmap_view_of_file },
     Binding { dll: KERNEL32, name: "CompareStringA", arg_bytes: 24, shim: compare_string_a },
     Binding { dll: KERNEL32, name: "CompareStringW", arg_bytes: 24, shim: compare_string_w },
     Binding { dll: KERNEL32, name: "CreateDirectoryA", arg_bytes: 8, shim: create_directory },
@@ -200,6 +258,7 @@ pub const SHIMS: &[Binding] = &[
     Binding { dll: KERNEL32, name: "LoadLibraryW", arg_bytes: 4, shim: load_library_w },
     Binding { dll: KERNEL32, name: "MultiByteToWideChar", arg_bytes: 24, shim: multi_byte_to_wide },
     Binding { dll: KERNEL32, name: "QueryPerformanceCounter", arg_bytes: 4, shim: query_performance_counter },
+    Binding { dll: KERNEL32, name: "QueryPerformanceFrequency", arg_bytes: 4, shim: query_performance_frequency },
     Binding { dll: KERNEL32, name: "RaiseException", arg_bytes: 16, shim: raise_exception },
     Binding { dll: KERNEL32, name: "CreateEventA", arg_bytes: 16, shim: create_event },
     Binding { dll: KERNEL32, name: "CreateMutexA", arg_bytes: 12, shim: create_mutex },
@@ -221,8 +280,8 @@ pub const SHIMS: &[Binding] = &[
     Binding { dll: KERNEL32, name: "GlobalSize", arg_bytes: 4, shim: global_size },
     Binding { dll: KERNEL32, name: "SetCurrentDirectoryA", arg_bytes: 4, shim: set_current_directory },
     Binding { dll: KERNEL32, name: "SetEvent", arg_bytes: 4, shim: set_event },
-    Binding { dll: KERNEL32, name: "WaitForMultipleObjects", arg_bytes: 16, shim: wait_for_object },
-    Binding { dll: KERNEL32, name: "WaitForSingleObject", arg_bytes: 8, shim: wait_for_object },
+    Binding { dll: KERNEL32, name: "WaitForMultipleObjects", arg_bytes: 16, shim: wait_for_multiple_objects },
+    Binding { dll: KERNEL32, name: "WaitForSingleObject", arg_bytes: 8, shim: wait_for_single_object },
     Binding { dll: KERNEL32, name: "lstrlenA", arg_bytes: 4, shim: lstrlen },
     Binding { dll: KERNEL32, name: "GetConsoleMode", arg_bytes: 8, shim: get_console_mode },
     Binding { dll: KERNEL32, name: "OutputDebugStringW", arg_bytes: 4, shim: output_debug_string_w },
@@ -254,6 +313,23 @@ pub const SHIMS: &[Binding] = &[
     Binding { dll: KERNEL32, name: "InterlockedCompareExchange", arg_bytes: 12, shim: interlocked_compare_exchange },
     Binding { dll: KERNEL32, name: "InterlockedExchange", arg_bytes: 8, shim: interlocked_exchange },
     Binding { dll: KERNEL32, name: "OutputDebugStringA", arg_bytes: 4, shim: output_debug_string },
+    // The start-up path a 2005 Direct3D 8 game takes: a worker semaphore it never
+    // waits on, the sizing and drive questions an installer asks, and the two
+    // memory calls its allocator makes before the device exists.
+    Binding { dll: KERNEL32, name: "CancelIo", arg_bytes: 4, shim: succeed },
+    Binding { dll: KERNEL32, name: "CreateSemaphoreA", arg_bytes: 16, shim: create_semaphore },
+    Binding { dll: KERNEL32, name: "FreeLibrary", arg_bytes: 4, shim: succeed },
+    Binding { dll: KERNEL32, name: "GetDiskFreeSpaceExA", arg_bytes: 16, shim: get_disk_free_space_ex },
+    Binding { dll: KERNEL32, name: "GetDriveTypeA", arg_bytes: 4, shim: get_drive_type },
+    Binding { dll: KERNEL32, name: "GetFileAttributesExA", arg_bytes: 12, shim: get_file_attributes_ex },
+    Binding { dll: KERNEL32, name: "GetOverlappedResult", arg_bytes: 16, shim: get_overlapped_result },
+    Binding { dll: KERNEL32, name: "GetSystemDirectoryA", arg_bytes: 8, shim: get_system_directory },
+    Binding { dll: KERNEL32, name: "GetSystemInfo", arg_bytes: 4, shim: get_system_info },
+    Binding { dll: KERNEL32, name: "ReleaseSemaphore", arg_bytes: 12, shim: release_semaphore },
+    Binding { dll: KERNEL32, name: "ResumeThread", arg_bytes: 4, shim: resume_thread },
+    Binding { dll: KERNEL32, name: "SetThreadPriority", arg_bytes: 8, shim: succeed },
+    Binding { dll: KERNEL32, name: "VirtualProtect", arg_bytes: 16, shim: virtual_protect },
+    Binding { dll: KERNEL32, name: "VirtualQuery", arg_bytes: 12, shim: virtual_query },
 ];
 
 // ---- process and version -------------------------------------------------
@@ -309,6 +385,211 @@ fn local_size(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
 
 fn local_lock(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     Ok(Return(call.arg(0)?))
+}
+
+/// An import whose whole answer is "done": the handle it was given is a number
+/// with no resource behind it, so there is nothing to do and nothing to refuse.
+fn succeed(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(1))
+}
+
+/// `CreateSemaphoreA(attributes, initial, maximum, name)`: a count, which a
+/// wait lowers and `ReleaseSemaphore` raises. A worker that waits for a job
+/// hangs off exactly this.
+fn create_semaphore(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let count = call.arg(1)?;
+    let maximum = call.arg(2)?;
+    let handle = host.objects.insert(Object::Semaphore { count, maximum });
+    if std::env::var("SHIMKIT_LOG_OBJECTS").is_ok() {
+        println!("CreateSemaphoreA initial={count} max={maximum} -> {handle}");
+    }
+    Ok(Return(handle))
+}
+
+/// `ReleaseSemaphore(handle, count, previous)`: raises the count, and hands it
+/// to whoever has been waiting on it longest.
+fn release_semaphore(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let handle = call.arg(0)?;
+    let count = call.arg(1)?;
+    let previous = call.arg(2)?;
+    let before = match host.objects.get(handle) {
+        Some(Object::Semaphore { count, .. }) => count,
+        // Windows itself fails this call on anything that is not a semaphore, but
+        // the guest's own bookkeeping handles are not this host's to judge: the
+        // count is raised where there is one and the call succeeds.
+        _ => 0,
+    };
+    if previous != 0 {
+        call.write_u32(previous, before)?;
+    }
+    if std::env::var("SHIMKIT_LOG_OBJECTS").is_ok() {
+        println!("ReleaseSemaphore {handle} +{count} (was {before})");
+    }
+    host.objects.raise(handle, count);
+    host.woken.extend(host.objects.wake(handle));
+    Ok(Return(1))
+}
+
+/// `ResumeThread` and `SuspendThread`: a thread this host starts runs from the
+/// moment it is created, so the previous suspend count was the only one.
+fn resume_thread(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(1))
+}
+
+/// `GetDriveTypeA(root)`: the payload is a folder on a fixed disk, which is the
+/// answer that keeps an installer's "where should this go" path on its normal
+/// branch.
+fn get_drive_type(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    const DRIVE_FIXED: u32 = 3;
+    Ok(Return(DRIVE_FIXED))
+}
+
+/// `GetDiskFreeSpaceExA(dir, &available, &total, &free)`: a gigabyte free.
+///
+/// The real number would be the browser's storage quota, which no guest can
+/// query; a game that checks for room to save decides on this alone.
+fn get_disk_free_space_ex(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    for index in 1..=3 {
+        let at = call.arg(index)?;
+        if at != 0 {
+            call.write_u32(at, GIB as u32)?;
+            call.write_u32(at.wrapping_add(4), (GIB >> 32) as u32)?;
+        }
+    }
+    Ok(Return(1))
+}
+
+fn get_system_directory(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    const DIRECTORY: &str = "C:\\WINDOWS\\system32";
+    let buffer = call.arg(0)?;
+    let capacity = call.arg(1)? as usize;
+    if buffer == 0 || capacity == 0 {
+        return Ok(Return(0));
+    }
+    let written = (capacity - 1).min(DIRECTORY.len());
+    call.write(buffer, &DIRECTORY.as_bytes()[..written])?;
+    call.write(buffer.wrapping_add(written as u32), &[0])?;
+    Ok(Return(written as u32))
+}
+
+/// `GetFileAttributesExA(name, level, &data)`: the file table's answer as a
+/// `WIN32_FILE_ATTRIBUTE_DATA`.
+///
+/// The times are left zero, because a payload's files have no dates of their own
+/// until the browser reports one; the size is what a guest actually reads from
+/// here, and a name the table does not hold is the call's own failure.
+fn get_file_attributes_ex(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    let path = call.cstr(0)?;
+    let data = call.arg(2)?;
+    if data == 0 {
+        host.last_error = ERROR_INVALID_HANDLE;
+        return Ok(Return(0));
+    }
+    // A name that names a folder is one a saved path ends in.
+    let directory = path.ends_with('\\') || host.files.exists(&format!("{path}\\"));
+    let Some(length) = host.files.contents(&path).map(|bytes| bytes.len() as u32) else {
+        if !directory {
+            host.last_error = ERROR_FILE_NOT_FOUND;
+            return Ok(Return(0));
+        }
+        let attributes = FILE_ATTRIBUTE_DIRECTORY;
+        call.zero(data, 36)?;
+        call.write_u32(data, attributes)?;
+        return Ok(Return(1));
+    };
+    call.zero(data, 36)?;
+    call.write_u32(data, FILE_ATTRIBUTE_NORMAL)?;
+    call.write_u32(data.wrapping_add(28), 0)?;
+    call.write_u32(data.wrapping_add(32), length)?;
+    Ok(Return(1))
+}
+
+/// `GetOverlappedResult(handle, &overlapped, &transferred, wait)`: every read
+/// this host performs finishes before it returns, so the result is already in
+/// the structure and the call reports the byte count the transfer wrote there.
+fn get_overlapped_result(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let overlapped = call.arg(1)?;
+    let transferred = call.arg(2)?;
+    let count = if overlapped != 0 {
+        call.memory.read_u32(overlapped.wrapping_add(4))?
+    } else {
+        0
+    };
+    if transferred != 0 {
+        call.write_u32(transferred, count)?;
+    }
+    Ok(Return(1))
+}
+
+/// `GetSystemInfo(&info)`: one Intel processor.
+///
+/// A game asks this to size its worker threads and to find the address range it
+/// may allocate in; both answers are this host's real ones.
+fn get_system_info(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    const PROCESSOR_INTEL_PENTIUM: u32 = 586;
+    let info = call.arg(0)?;
+    if info == 0 {
+        return Ok(Return(0));
+    }
+    call.zero(info, 36)?;
+    // wProcessorArchitecture stays zero: PROCESSOR_ARCHITECTURE_INTEL.
+    call.write_u32(info.wrapping_add(4), 4096)?; // dwPageSize
+    call.write_u32(info.wrapping_add(8), 0x0001_0000)?; // lpMinimumApplicationAddress
+    call.write_u32(info.wrapping_add(12), crate::memory::MEMORY_TOP)?;
+    call.write_u32(info.wrapping_add(16), 1)?; // dwActiveProcessorMask
+    call.write_u32(info.wrapping_add(20), 1)?; // dwNumberOfProcessors
+    call.write_u32(info.wrapping_add(24), PROCESSOR_INTEL_PENTIUM)?;
+    call.write_u32(info.wrapping_add(28), 0x0001_0000)?; // dwAllocationGranularity
+    call.write_u16(info.wrapping_add(32), 6)?; // wProcessorLevel
+    call.write_u16(info.wrapping_add(34), 0x0a00)?; // wProcessorRevision
+    let _ = host;
+    Ok(Return(1))
+}
+
+/// `VirtualProtect(address, size, new, &old)`: the guest's own allocation is
+/// already writable, and the old protection it is told is the one it had.
+fn virtual_protect(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    const PAGE_READWRITE: u32 = 0x04;
+    let previous = call.arg(3)?;
+    if previous != 0 {
+        call.write_u32(previous, PAGE_READWRITE)?;
+    }
+    Ok(Return(1))
+}
+
+/// `VirtualQuery(address, &info, length)`: one committed private page range
+/// covering the address asked about.
+///
+/// A guest uses this to walk what is mapped before it decides where to put an
+/// allocation; the shape of the answer matters more than its size.
+fn virtual_query(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_PRIVATE: u32 = 0x2_0000;
+    const PAGE_READWRITE: u32 = 0x04;
+    const INFO_BYTES: u32 = 28;
+    let address = call.arg(0)?;
+    let info = call.arg(1)?;
+    let length = call.arg(2)?;
+    if info == 0 || length < INFO_BYTES {
+        return Ok(Return(0));
+    }
+    let base = address & !0xfff;
+    call.zero(info, INFO_BYTES)?;
+    for (offset, value) in [
+        (0, base),               // BaseAddress
+        (4, base),               // AllocationBase
+        (8, PAGE_READWRITE),     // AllocationProtect
+        (12, 0x10_0000),         // RegionSize
+        (16, MEM_COMMIT),        // State
+        (20, PAGE_READWRITE),    // Protect
+        (24, MEM_PRIVATE),       // Type
+    ] {
+        call.write_u32(info.wrapping_add(offset), value)?;
+    }
+    Ok(Return(INFO_BYTES))
 }
 
 fn local_unlock(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
@@ -612,8 +893,10 @@ fn get_current_process_id(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
     Ok(Return(1))
 }
 
-fn get_current_thread_id(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
-    Ok(Return(1))
+/// `GetCurrentThreadId`: the id of the thread the CPU is on, which is the one
+/// `CreateThread` wrote out of its `threadId` argument.
+fn get_current_thread_id(host: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(host.current_thread))
 }
 
 fn is_debugger_present(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
@@ -654,6 +937,18 @@ fn query_performance_counter(host: &mut Host, call: &mut Call<'_>) -> Result<Act
     Ok(Return(1))
 }
 
+fn query_performance_frequency(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let at = call.arg(0)?;
+    // The counter is the page's clock in milliseconds scaled by 1024, so one
+    // second is 1024 readings per millisecond. A guest divides one by the other
+    // and gets the seconds it is after.
+    if at != 0 {
+        call.write_u32(at, QPC_FREQUENCY)?;
+        call.write_u32(at.wrapping_add(4), 0)?;
+    }
+    Ok(Return(1))
+}
+
 fn interlocked_increment(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let at = call.arg(0)?;
     let value = call.memory.read_u32(at)?.wrapping_add(1);
@@ -668,17 +963,23 @@ fn interlocked_decrement(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     Ok(Return(value))
 }
 
-/// `CreateEventA(attributes, manualReset, initialState, name)`: a handle with no
-/// waiters behind it. Nothing in this machine runs two threads, so an event is
-/// only ever a name the guest waits on and finds signalled.
-fn create_event(host: &mut Host, _: &mut Call<'_>) -> Result<Action> {
-    Ok(Return(host.new_heap()))
+/// `CreateEventA(attributes, manualReset, initialState, name)`: a flag that a
+/// wait can clear and `SetEvent` can raise again.
+fn create_event(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let manual = call.arg(1)? != 0;
+    let signalled = call.arg(2)? != 0;
+    Ok(Return(host.objects.insert(Object::Event { manual, signalled })))
 }
 
-/// `CreateMutexA(attributes, initialOwner, name)`: a handle that is never
-/// contended, which is all a single-instance check needs.
-fn create_mutex(host: &mut Host, _: &mut Call<'_>) -> Result<Action> {
-    Ok(Return(host.new_heap()))
+/// `CreateMutexA(attributes, initialOwner, name)`: owned by the creating thread
+/// when the guest asked for that, which is what a single-instance check does.
+fn create_mutex(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let owner = if call.arg(1)? != 0 {
+        host.current_thread
+    } else {
+        NO_OWNER
+    };
+    Ok(Return(host.objects.insert(Object::Mutex { owner })))
 }
 
 /// `OpenMutexA(access, inherit, name)`: no mutex of that name exists, so a
@@ -688,41 +989,138 @@ fn open_mutex(host: &mut Host, _: &mut Call<'_>) -> Result<Action> {
     Ok(Return(0))
 }
 
-fn release_mutex(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+/// `ReleaseMutex(handle)`: the owning thread gives it up, and the longest wait
+/// takes it.
+fn release_mutex(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let handle = call.arg(0)?;
+    if !host.objects.release(handle, host.current_thread) {
+        host.last_error = ERROR_INVALID_HANDLE;
+        return Ok(Return(0));
+    }
+    host.woken.extend(host.objects.wake(handle));
     Ok(Return(1))
 }
 
-/// `CreateThread`: the handle is real, the thread is not.
+/// `CreateThread(attributes, stackSize, startAddress, parameter, flags, threadId)`:
+/// a thread this host runs, entered only when the thread that is running cannot
+/// go on.
 ///
-/// This host runs one program counter, so a thread procedure would never be
-/// entered. A guest that starts a worker and joins it sees it finish immediately
-/// (`WaitForSingleObject` answers signalled); a guest that expects the worker to
-/// have done anything needs a different host, and the notice says so instead of
-/// letting the join look like success.
+/// The handle and the id are made here, because the guest reads the id back out
+/// of this very call; the stack and the register set are the session's to build,
+/// since a thread's stack is guest memory and a shim has none. The routine is not
+/// entered here either: a shim runs on the calling thread's stack, and the new
+/// thread starts on its own.
 fn create_thread(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let stack_size = call.arg(1)?;
     let entry = call.arg(2)?;
-    let handle = host.new_heap();
-    host.notice(format!(
-        "CreateThread at {entry:#010x}: this machine runs one thread, so it returns without running"
-    ));
+    let parameter = call.arg(3)?;
+    if entry == 0 {
+        host.last_error = ERROR_INVALID_PARAMETER;
+        return Ok(Return(0));
+    }
+    let (handle, id) = host.objects.insert_thread();
     let thread_id = call.arg(5)?;
     if thread_id != 0 {
-        call.write_u32(thread_id, 1)?;
+        call.write_u32(thread_id, id)?;
     }
+    host.spawn = Some(Spawn {
+        id,
+        handle,
+        entry,
+        parameter,
+        stack_size: if stack_size == 0 {
+            None
+        } else {
+            Some(stack_size)
+        },
+    });
     Ok(Return(handle))
 }
 
-fn exit_thread(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+/// `ExitThread(code)`: the running thread ends here, and whoever waits on its
+/// handle is released with this code.
+fn exit_thread(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    host.thread_want = Some(ThreadWant::Exit(call.arg(0)?));
     Ok(Return(0))
 }
 
-fn wait_for_object(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
-    // WAIT_OBJECT_0: whatever the guest waits on is already signalled, because
-    // nothing else in this machine can be running to clear it.
-    Ok(Return(0))
+/// `WaitForSingleObject(handle, milliseconds)`.
+fn wait_for_single_object(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let handle = call.arg(0)?;
+    let timeout = call.arg(1)?;
+    wait(host, &[handle], false, timeout)
 }
 
-fn set_event(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+/// `WaitForMultipleObjects(count, handles, waitAll, milliseconds)`.
+fn wait_for_multiple_objects(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let count = call.arg(0)?;
+    let list = call.arg(1)?;
+    let all = call.arg(2)? != 0;
+    let timeout = call.arg(3)?;
+    if count == 0 || count > MAXIMUM_WAIT_OBJECTS {
+        host.last_error = ERROR_INVALID_PARAMETER;
+        return Ok(Return(WAIT_FAILED));
+    }
+    let handles: Vec<u32> = (0..count)
+        .map(|index| call.memory.read_u32(list.wrapping_add(index * 4)))
+        .collect::<Result<_>>()?;
+    wait(host, &handles, all, timeout)
+}
+
+/// The one place a wait is decided: answered here when the object is already
+/// signalled, and parked on the calling thread when it is not.
+///
+/// A handle this host keeps no object for is answered as signalled. That is what
+/// it was before threads existed -- nothing here can clear it -- and it is right
+/// for the handles a file, a console or a device event hands out, which this host
+/// never blocks on anyway.
+fn wait(host: &mut Host, handles: &[u32], all: bool, timeout: u32) -> Result<Action> {
+    let log = std::env::var("SHIMKIT_LOG_OBJECTS").is_ok();
+    if log {
+        println!(
+            "wait thread {} on {handles:?} timeout {timeout}",
+            host.current_thread
+        );
+    }
+    if !host.objects.known(handles) {
+        return Ok(Return(WAIT_OBJECT_0));
+    }
+    let thread = host.current_thread;
+    if let Some(answer) = host.objects.take_now(thread, handles, all) {
+        if log {
+            println!("  answered {answer:#x}");
+        }
+        return Ok(Return(answer));
+    }
+    if timeout == 0 {
+        return Ok(Return(WAIT_TIMEOUT));
+    }
+    // The thread is parked and the scheduler runs someone else; the session
+    // answers the wait, so the value returned here is only what a guest would see
+    // if the wait had been satisfied at once.
+    if log {
+        println!("  parked");
+    }
+    host.objects.park(thread, handles.to_vec(), all);
+    host.thread_want = Some(ThreadWant::Wait {
+        timeout: (timeout != INFINITE).then_some(timeout),
+    });
+    Ok(Return(WAIT_OBJECT_0))
+}
+
+/// `SetEvent(handle)`: raises the flag and releases what waits on it. The
+/// automatic kind clears itself as the wait takes it.
+fn set_event(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let handle = call.arg(0)?;
+    if std::env::var("SHIMKIT_LOG_OBJECTS").is_ok() {
+        println!("SetEvent {handle}");
+    }
+    if !host.objects.signal(handle) {
+        // Not an event this host knows; the guest's own numbering, so the call
+        // succeeds the way the rest of this file's "done" imports do.
+        return Ok(Return(1));
+    }
+    host.woken.extend(host.objects.wake(handle));
     Ok(Return(1))
 }
 
@@ -789,23 +1187,67 @@ fn lstrlen(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
 
 // ---- critical sections and thread-local storage --------------------------
 
-// One thread, so a critical section is never contended and never has to
-// remember anything: the guest's own `CRITICAL_SECTION` bytes stay untouched,
-// and enter/leave are the no-ops the single-threaded case makes them.
+// A critical section is the guest's own 24-byte structure, so the lock behind
+// it is kept here, named by the address of that structure: the guest never sees
+// a handle for it. Windows' critical sections are recursive and owned by a
+// thread, and both matter once there is more than one -- a list the guest guards
+// with one is exactly what a worker thread reads while the main thread builds.
 
-fn initialize_critical_section(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+/// `InitializeCriticalSection(critical)`: the structure stays the guest's, and
+/// an unowned lock is put behind its address.
+fn initialize_critical_section(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let address = call.arg(0)?;
+    host.critical_depth.remove(&address);
+    host.objects.hold(address, Object::Mutex { owner: NO_OWNER });
     Ok(Return(1))
 }
 
-fn enter_critical_section(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+/// `EnterCriticalSection(critical)`: the owning thread enters again without
+/// waiting, and any other thread is parked until the owner leaves. The wait is a
+/// real one, so the session can see the thread standing still and answer it if
+/// nothing can ever release it.
+fn enter_critical_section(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let address = call.arg(0)?;
+    let thread = host.current_thread;
+    // A guest that enters one it never initialised still gets exclusion: the
+    // lock is created where it is first wanted, which is the only honest guess.
+    if !host.objects.known(&[address]) {
+        host.objects.hold(address, Object::Mutex { owner: NO_OWNER });
+    }
+    if host.objects.take(address, thread) {
+        *host.critical_depth.entry(address).or_insert(0) += 1;
+        return Ok(Return(0));
+    }
+    host.objects.park(thread, vec![address], false);
+    host.thread_want = Some(ThreadWant::Wait { timeout: None });
+    Ok(Return(WAIT_OBJECT_0))
+}
+
+/// `LeaveCriticalSection(critical)`: one level of the owner's nesting goes, and
+/// the last one hands the lock to the thread that has waited longest.
+fn leave_critical_section(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let address = call.arg(0)?;
+    let thread = host.current_thread;
+    if let Some(depth) = host.critical_depth.get_mut(&address) {
+        if *depth > 1 {
+            *depth -= 1;
+            return Ok(Return(0));
+        }
+    }
+    host.critical_depth.remove(&address);
+    host.objects.release(address, thread);
+    let woken = host.objects.wake(address);
+    if !woken.is_empty() {
+        *host.critical_depth.entry(address).or_insert(0) = 1;
+        host.woken.extend(woken);
+    }
     Ok(Return(0))
 }
 
-fn leave_critical_section(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
-    Ok(Return(0))
-}
-
-fn delete_critical_section(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+fn delete_critical_section(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let address = call.arg(0)?;
+    host.critical_depth.remove(&address);
+    host.objects.close(address);
     Ok(Return(0))
 }
 
@@ -899,17 +1341,21 @@ const ERROR_PROC_NOT_FOUND: u32 = 127;
 
 /// The handle for a DLL name, allocated on first use so two calls agree.
 fn module_handle(host: &mut Host, name: &str) -> Option<u32> {
-    if !crate::shim::module_known(host.target.shims, name) {
+    // A path loads the file it names, and what this host answers for is the
+    // file's basename: `C:\Game\dinput8.dll` is the same DLL as `dinput8.dll`,
+    // because the host has no files, only names it keeps tables for.
+    let leaf = name.rsplit(['\\', '/']).next().unwrap_or(name);
+    if !crate::shim::module_known(host.target.shims, leaf) {
         return None;
     }
     if let Some(index) = host
         .modules
         .iter()
-        .position(|known| known.eq_ignore_ascii_case(name))
+        .position(|known| known.eq_ignore_ascii_case(leaf))
     {
         return Some(MODULE_BASE + index as u32);
     }
-    host.modules.push(name.to_string());
+    host.modules.push(leaf.to_string());
     Some(MODULE_BASE + (host.modules.len() - 1) as u32)
 }
 
@@ -1023,10 +1469,30 @@ fn is_bad_pointer(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
 /// Nothing is moved. The embedder is the clock, it pushes real time before every
 /// chunk, and the guest spins until that clock says the wait is over -- the same
 /// loop, reading the same time, just no longer lied to.
+///
+/// A sleeping thread now has somewhere to put the time: it hands the CPU over to
+/// whatever else can run, exactly as this import always did, and comes back when
+/// the others are done or have stopped. It is deliberately not a park with a
+/// deadline: a guest that sleeps a millisecond per frame would then wait for the
+/// embedder's next chunk instead, and every one of those loops is written against
+/// a clock this host does not own.
+/// `Sleep(milliseconds)`: the thread stands still for that much of the guest's
+/// clock. A worker that polls on a sleep needs it: answered at once, a 17 ms
+/// poll becomes a spin that runs its work thousands of times before the thread
+/// that posted it has moved, which is a race the real kernel never has. Zero
+/// milliseconds only gives way, as Windows does.
 fn sleep(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
-    if std::env::var("SHIMKIT_LOG_SLEEP").is_ok() && call.arg(0)? > 1 && host.notices.len() < 100_000 {
-        host.notice(format!("Sleep({})", call.arg(0)?));
+    let milliseconds = call.arg(0)?;
+    if milliseconds == 0 {
+        host.thread_want = Some(ThreadWant::Yield);
+        return Ok(Return(0));
     }
+    // A waiter with no handle is a sleep: nothing can signal it, and its
+    // deadline is what ends it.
+    host.objects.park(host.current_thread, Vec::new(), false);
+    host.thread_want = Some(ThreadWant::Wait {
+        timeout: Some(milliseconds),
+    });
     Ok(Return(0))
 }
 
@@ -1128,11 +1594,117 @@ fn get_file_size(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     Ok(Return(length))
 }
 
+/// File mappings (`CreateFileMappingA` + `MapViewOfFile`): the objects the
+/// guest created and the views it holds, so `UnmapViewOfFile` frees what a view
+/// borrowed. A mapping of a real file carries the file's bytes; a page-file
+/// mapping (`INVALID_HANDLE_VALUE`) is a zeroed region the guest shares.
+#[derive(Default)]
+pub struct Mappings {
+    mappings: HashMap<u32, Mapping>,
+    views: HashMap<u32, u32>,
+    next: u32,
+}
+
+struct Mapping {
+    /// The file's bytes, or empty for a page-file mapping.
+    bytes: Vec<u8>,
+    /// The bytes the mapping covers, which a view of zero length takes whole.
+    size: u32,
+}
+
+/// The handle range file mappings live in: distinct from files, objects and
+/// everything else that hands out numbers.
+const FIRST_MAPPING: u32 = 0x0071_0000;
+
+impl Mappings {
+    /// Drops a mapping handle, which `CloseHandle` asks for. Any view already
+    /// taken stays mapped until `UnmapViewOfFile` releases it.
+    pub fn close(&mut self, handle: u32) -> bool {
+        self.mappings.remove(&handle).is_some()
+    }
+}
+
+fn create_file_mapping_a(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let file = call.arg(0)?;
+    let size_high = call.arg(3)?;
+    let size_low = call.arg(4)?;
+    let requested = ((size_high as u64) << 32) | u64::from(size_low);
+    let (bytes, size) = if file == INVALID_HANDLE_VALUE {
+        (Vec::new(), u32::try_from(requested).unwrap_or(u32::MAX))
+    } else {
+        let contents = host
+            .files
+            .open_contents(file)
+            .ok_or_else(|| "CreateFileMappingA on a file this host never opened".to_string())?;
+        // A zero maximum size maps the file as it stands, which is how a caller
+        // says "the whole thing" without knowing its length.
+        let size = if requested == 0 {
+            contents.len() as u32
+        } else {
+            u32::try_from(requested)
+                .unwrap_or(contents.len() as u32)
+                .min(contents.len() as u32)
+        };
+        (contents, size)
+    };
+    host.mappings.next += 1;
+    let handle = FIRST_MAPPING + host.mappings.next * 4;
+    host.mappings
+        .mappings
+        .insert(handle, Mapping { bytes, size });
+    Ok(Return(handle))
+}
+
+fn map_view_of_file(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let mapping_handle = call.arg(0)?;
+    let offset_high = call.arg(2)?;
+    let offset_low = call.arg(3)?;
+    let bytes = call.arg(4)?;
+    let Some(mapping) = host.mappings.mappings.get(&mapping_handle) else {
+        return Err("MapViewOfFile on a mapping this host never made".into());
+    };
+    let offset = ((offset_high as u64) << 32) | u64::from(offset_low);
+    let (contents, mapped) = (mapping.bytes.clone(), mapping.size);
+    drop(mapping);
+    let view = if bytes == 0 {
+        mapped.saturating_sub(offset as u32)
+    } else {
+        bytes
+    };
+    let address = host.allocate(view, 0x1000)?;
+    // A fresh view reads as zeroes past the file's end, which is what Windows
+    // answers; the arena recycles bytes, so the tail is written explicitly.
+    let from = offset as usize;
+    let take = contents.len().saturating_sub(from).min(view as usize);
+    if take > 0 {
+        call.memory.write_bytes(address, &contents[from..from + take])?;
+    }
+    if (take as u32) < view {
+        call.zero(address + take as u32, view - take as u32)?;
+    }
+    host.mappings.views.insert(address, view);
+    Ok(Return(address))
+}
+
+fn unmap_view_of_file(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let address = call.arg(0)?;
+    let Some(view) = host.mappings.views.remove(&address) else {
+        return Err("UnmapViewOfFile on an address this host never mapped".into());
+    };
+    host.release(address);
+    let _ = view;
+    Ok(Return(1))
+}
+
 fn close_handle(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
-    // Closing a file handle drops it from the table. Every other handle in this
-    // host is a number with no resource behind it, so the close succeeds and the
-    // number is simply forgotten.
-    crate::shim::files::close(host, call.arg(0)?);
+    // Closing a file handle drops it from the table, and closing a kernel object
+    // drops it and everything parked on it. Every other handle in this host is a
+    // number with no resource behind it, so the close succeeds and the number is
+    // simply forgotten.
+    let handle = call.arg(0)?;
+    crate::shim::files::close(host, handle);
+    host.objects.close(handle);
+    host.mappings.close(handle);
     Ok(Return(1))
 }
 
@@ -1183,8 +1755,24 @@ fn refuse(host: &mut Host, call: &Call<'_>, what: &str, size: u32, error: String
 }
 
 fn heap_free(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
-    host.release(call.arg(2)?);
+    let pointer = call.arg(2)?;
+    // `SHIMKIT_LOG_FREE=<hex>` names a region: every block released inside it is
+    // printed with the call site that released it, which is how a structure a
+    // guest is still walking gets noticed.
+    if let Some(base) = watched_free_region() {
+        if pointer.wrapping_sub(base) < 0x2_0000 {
+            let caller = call.memory.read_u32(call.args.wrapping_sub(4)).unwrap_or(0);
+            println!("free {pointer:#010x} from {caller:#010x}");
+        }
+    }
+    host.release(pointer);
     Ok(Return(1))
+}
+
+/// The base of the region `SHIMKIT_LOG_FREE` names, or `None` when it is unset.
+fn watched_free_region() -> Option<u32> {
+    let text = std::env::var("SHIMKIT_LOG_FREE").ok()?;
+    u32::from_str_radix(text.trim_start_matches("0x"), 16).ok()
 }
 
 fn heap_size(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
@@ -1858,6 +2446,55 @@ mod tests {
     }
 
     #[test]
+    fn a_mapped_file_reads_where_the_view_points() {
+        let mut memory = GuestMemory::empty(crate::memory::HEAP_BASE as usize + 0x1000)
+            .expect("blank memory");
+        let mut host = Host::new();
+        // A file the guest opened, which the mapping then covers.
+        host.files.provide(r"data\map.bin", b"file bytes here".to_vec());
+        let handle = host.files.open(r"data\map.bin").expect("the file opens");
+
+        // A file handle is a value the guest passes straight through, not a
+        // pointer into its stack.
+        let Return(mapping) =
+            blank_call(&mut host, &mut memory, "CreateFileMappingA", &[handle, 0, 0, 0, 0])
+                .unwrap()
+        else {
+            panic!("the file maps")
+        };
+        assert_ne!(mapping, 0);
+
+        let view = STACK_BASE - 0x160;
+        let Return(address) = blank_call(
+            &mut host,
+            &mut memory,
+            "MapViewOfFile",
+            &[mapping, 0, 0, 0, 0],
+        )
+        .unwrap()
+        else {
+            panic!("the view maps")
+        };
+        // The view holds the file's bytes, and unmapping releases them.
+        let mut bytes = Vec::new();
+        for index in 0..15 {
+            bytes.push(memory.read_u8(address + index).unwrap());
+        }
+        assert_eq!(bytes, b"file bytes here");
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "UnmapViewOfFile", &[address]).unwrap(),
+            Return(1)
+        );
+        assert!(host.allocate(address, 4).is_ok(), "the view's bytes went back");
+
+        // Closing the mapping handle drops it.
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "CloseHandle", &[mapping]).unwrap(),
+            Return(1)
+        );
+    }
+
+    #[test]
     fn a_program_that_resolves_its_own_imports_gets_addresses_it_can_call() {
         let mut memory = GuestMemory::empty(crate::memory::HEAP_BASE as usize + 0x1000)
             .expect("blank memory");
@@ -1891,6 +2528,16 @@ mod tests {
             Return(0)
         );
         assert_eq!(host.last_error, ERROR_MOD_NOT_FOUND);
+
+        // A path loads the file it names, and the file this host answers for is
+        // its basename: the same handle the bare name gets.
+        let path = STACK_BASE - 0x1c0;
+        memory.write_bytes(path, b"C:\\Game\\USER32.dll\0").unwrap();
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "LoadLibraryA", &[path]).unwrap(),
+            blank_call(&mut host, &mut memory, "GetModuleHandleA", &[module]).unwrap(),
+            "a path and its basename are the same module"
+        );
 
         // A name in that module is an address in the resolved-name range, where
         // the step loop runs the binding rather than fetching instructions.
@@ -2359,5 +3006,245 @@ mod tests {
         let error = call_shim(&mut host, &mut memory, "RaiseException", &[0xc000_0005, 0, 0, 0])
             .unwrap_err();
         assert!(error.contains("0xc0000005"), "{error}");
+    }
+
+    /// A machine with no image, for the calls a guest makes before it has one: a
+    /// blank window is memory enough for the handles and the ids they write.
+    fn blank() -> Option<(Host, GuestMemory)> {
+        let memory = GuestMemory::empty(crate::memory::HEAP_BASE as usize + 0x1000).ok()?;
+        Some((Host::new(), memory))
+    }
+
+    #[test]
+    fn a_worker_waits_for_a_release_and_a_join_comes_back_when_it_ends() {
+        let Some((mut host, mut memory)) = blank() else {
+            return;
+        };
+        let id_at = STACK_BASE + 0x3000;
+
+        // A semaphore with no count, and a worker that waits on it. The thread is
+        // the session's to make -- its stack is guest memory -- so the shim only
+        // says what it would be.
+        let Return(semaphore) =
+            blank_call(&mut host, &mut memory, "CreateSemaphoreA", &[0, 0, 4, 0]).unwrap()
+        else {
+            panic!("a semaphore is a handle")
+        };
+        let Return(worker) = blank_call(
+            &mut host,
+            &mut memory,
+            "CreateThread",
+            &[0, 0, 0x0040_1000, 7, 0, id_at],
+        )
+        .unwrap()
+        else {
+            panic!("a thread is a handle")
+        };
+        let spawn = host.spawn.take().expect("a thread is created");
+        assert_eq!(
+            (spawn.id, spawn.handle, spawn.entry, spawn.parameter),
+            (1, worker, 0x0040_1000, 7)
+        );
+        assert_eq!(
+            memory.read_u32(id_at).unwrap(),
+            1,
+            "the guest is told the id under the same call"
+        );
+
+        // Waiting on a count that was never raised parks the thread that asked,
+        // and tells the session why.
+        host.current_thread = spawn.id;
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "WaitForSingleObject", &[semaphore, INFINITE])
+                .unwrap(),
+            Return(WAIT_OBJECT_0)
+        );
+        assert_eq!(host.thread_want, Some(ThreadWant::Wait { timeout: None }));
+        assert_eq!(host.objects.waiting(), vec![(spawn.id, vec![semaphore])]);
+
+        // A wait that has already run out does not park at all.
+        host.thread_want = None;
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "WaitForSingleObject", &[semaphore, 0]).unwrap(),
+            Return(WAIT_TIMEOUT)
+        );
+        assert_eq!(host.thread_want, None);
+
+        // The main thread releases it: the count goes to the waiting thread, and
+        // the session is told which one to make runnable.
+        host.current_thread = 0;
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "ReleaseSemaphore", &[semaphore, 1, 0]).unwrap(),
+            Return(1)
+        );
+        assert_eq!(host.woken, vec![(spawn.id, WAIT_OBJECT_0)]);
+
+        // The worker ends, which is what a join waits for.
+        host.current_thread = spawn.id;
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "ExitThread", &[3]).unwrap(),
+            Return(0)
+        );
+        assert_eq!(host.thread_want.take(), Some(ThreadWant::Exit(3)));
+        assert_eq!(host.objects.thread_exited(spawn.id, 3), vec![worker]);
+        assert!(
+            host.objects.take(worker, 0),
+            "a thread that has exited is signalled"
+        );
+        assert_eq!(
+            host.objects.get(worker),
+            Some(Object::Thread {
+                id: 1,
+                exited: true,
+                exit_code: 3
+            })
+        );
+    }
+
+    #[test]
+    fn an_automatic_event_clears_itself_for_the_wait_that_takes_it() {
+        let Some((mut host, mut memory)) = blank() else {
+            return;
+        };
+        // `CreateEventA(attributes, manualReset, initialState, name)`.
+        let Return(event) =
+            blank_call(&mut host, &mut memory, "CreateEventA", &[0, 0, 1, 0]).unwrap()
+        else {
+            panic!("an event is a handle")
+        };
+
+        // It was created set, so the first wait takes it and the second parks.
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "WaitForSingleObject", &[event, INFINITE]).unwrap(),
+            Return(WAIT_OBJECT_0)
+        );
+        assert_eq!(host.thread_want, None, "a wait that can be answered does not park");
+        host.thread_want = None;
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "WaitForSingleObject", &[event, INFINITE]).unwrap(),
+            Return(WAIT_OBJECT_0)
+        );
+        assert_eq!(host.thread_want, Some(ThreadWant::Wait { timeout: None }));
+
+        // `SetEvent` raises it again and hands it to whoever was waiting.
+        host.thread_want = None;
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "SetEvent", &[event]).unwrap(),
+            Return(1)
+        );
+        assert_eq!(host.woken, vec![(0, WAIT_OBJECT_0)]);
+    }
+
+    #[test]
+    fn a_mutex_goes_to_the_waiting_thread_when_its_owner_releases_it() {
+        let Some((mut host, mut memory)) = blank() else {
+            return;
+        };
+        host.current_thread = 1;
+        let Return(mutex) =
+            blank_call(&mut host, &mut memory, "CreateMutexA", &[0, 1, 0]).unwrap()
+        else {
+            panic!("a mutex is a handle")
+        };
+        assert_eq!(host.objects.get(mutex), Some(Object::Mutex { owner: 1 }));
+
+        // Another thread cannot have it, so its wait parks until the owner gives
+        // it up.
+        host.current_thread = 2;
+        host.objects.park(2, vec![mutex], false);
+        host.current_thread = 1;
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "ReleaseMutex", &[mutex]).unwrap(),
+            Return(1)
+        );
+        assert_eq!(host.woken, vec![(2, WAIT_OBJECT_0)]);
+        assert_eq!(host.objects.get(mutex), Some(Object::Mutex { owner: 2 }));
+
+        // A release from a thread that does not own it leaves the owner where it
+        // is: that is a guest bug, and taking the mutex from its owner over it
+        // would be this host inventing one.
+        host.current_thread = 3;
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "ReleaseMutex", &[mutex]).unwrap(),
+            Return(1)
+        );
+        assert_eq!(host.objects.get(mutex), Some(Object::Mutex { owner: 2 }));
+    }
+
+    #[test]
+    fn a_critical_section_is_recursive_and_parks_another_thread() {
+        let Some((mut host, mut memory)) = blank() else {
+            return;
+        };
+        let section = 0x0040_2000;
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "InitializeCriticalSection", &[section]).unwrap(),
+            Return(1)
+        );
+
+        // The owner enters twice without waiting, and thread 0 is an owner like
+        // any other: zero is the main thread's id, not "nobody".
+        host.current_thread = 0;
+        for _ in 0..2 {
+            assert_eq!(
+                blank_call(&mut host, &mut memory, "EnterCriticalSection", &[section]).unwrap(),
+                Return(0)
+            );
+            assert_eq!(host.thread_want, None, "the owner never waits");
+        }
+
+        // Another thread is parked on the guest's own structure address, because
+        // that is the only name the two calls share.
+        host.current_thread = 1;
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "EnterCriticalSection", &[section]).unwrap(),
+            Return(0)
+        );
+        assert_eq!(host.thread_want.take(), Some(ThreadWant::Wait { timeout: None }));
+        assert_eq!(host.objects.waiting(), vec![(1, vec![section])]);
+
+        // The first leave only drops the owner's nesting; the second hands the
+        // lock to the thread that was waiting.
+        host.current_thread = 0;
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "LeaveCriticalSection", &[section]).unwrap(),
+            Return(0)
+        );
+        assert_eq!(host.woken, Vec::new());
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "EnterCriticalSection", &[section]).unwrap(),
+            Return(0),
+            "still the owner's: a nested leave must not unlock it"
+        );
+        host.woken.clear();
+        blank_call(&mut host, &mut memory, "LeaveCriticalSection", &[section]).unwrap();
+        blank_call(&mut host, &mut memory, "LeaveCriticalSection", &[section]).unwrap();
+        assert_eq!(host.woken, vec![(1, WAIT_OBJECT_0)]);
+    }
+
+    #[test]
+    fn sleep_parks_the_thread_until_its_deadline() {
+        let Some((mut host, mut memory)) = blank() else {
+            return;
+        };
+        host.current_thread = 1;
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "Sleep", &[17]).unwrap(),
+            Return(0)
+        );
+        assert_eq!(
+            host.thread_want.take(),
+            Some(ThreadWant::Wait { timeout: Some(17) })
+        );
+        // A sleeper is a waiter with nothing to wait on: the session's clock is
+        // what ends it, and no signal can.
+        assert_eq!(host.objects.waiting(), vec![(1, Vec::new())]);
+
+        // Zero only gives way, so a guest that yields in a loop keeps running.
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "Sleep", &[0]).unwrap(),
+            Return(0)
+        );
+        assert_eq!(host.thread_want.take(), Some(ThreadWant::Yield));
     }
 }
