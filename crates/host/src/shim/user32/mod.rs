@@ -20,11 +20,12 @@
 //! calls the window procedure the class registered, through the session's guest
 //! call mechanism ([`crate::shim::GuestCall`]).
 //!
-//! `GetMessageA` cannot block: the page cannot interrupt a call, so a real block
-//! would freeze the tab. Instead of the `WM_QUIT` this host used to answer, it
-//! now hands back `WM_NULL` when the queue is empty -- a message every window
-//! ignores, which keeps the guest alive long enough for the next event instead of
-//! ending the process.
+//! `GetMessageA` blocks the way Windows does: an empty queue parks the thread on
+//! the message queue until a producer queues a message, with a short deadline so
+//! a pump that drives its frame from this loop still wakes on time alone. The
+//! page cannot interrupt a parked call, but its frame loop re-enters the session
+//! every frame and its input exports wake the queue, which is the same shape as
+//! a blocked pump the OS wakes with events.
 //!
 //! The dialog calls (`DialogBoxParamA`, `EndDialog`, `SendDlgItemMessageA`,
 //! `GetDlgItemTextA`, `SetDlgItemTextA`) still have no shim: they need a drawn
@@ -45,6 +46,22 @@ use crate::Result;
 
 use Action::Return;
 
+/// The rest of the module is split by subject.
+///
+/// A game from this era imports around a hundred and sixty entry points from
+/// `USER32.dll`, and a delta that size is unreadable in one file. Each submodule
+/// files its own [`Binding`] table under the same `USER32.dll`, so a function
+/// lives next to the code that answers it and the dispatch table is still one
+/// DLL's. What they share -- the windows themselves, menus, scroll state, timers
+/// -- is [`Windows`], defined below.
+pub mod dialog;
+pub mod menu;
+pub mod misc;
+pub mod paint;
+pub mod rect;
+pub mod state;
+pub mod window;
+
 const USER32: &str = "USER32.dll";
 
 /// Handles this module hands out. They are small, aligned, and disjoint from
@@ -53,6 +70,23 @@ const DESKTOP_WINDOW: u32 = 0x0001_0000;
 const FIRST_WINDOW: u32 = 0x0001_0100;
 const ARROW_CURSOR: u32 = 0x0001_0300;
 const APPLICATION_ICON: u32 = 0x0001_0400;
+
+/// Menu handles, above the window handles.
+const FIRST_MENU: u32 = 0x0001_0800;
+
+/// Hook handles, above the menus: a `SetWindowsHookExA` handle is an index into
+/// the installed list, so a log line can say which hook a guest unhooks.
+const FIRST_HOOK: u32 = 0x0001_0900;
+
+/// The selector a window's menu bar is filed under in the extra-bytes table.
+///
+/// `GWL_*` selectors are the negative numbers Windows documents, so this one is
+/// outside them on purpose: it only has to be a value no guest asks for, and a
+/// guest that did would be storing a number under it anyway.
+const GWL_MENU: i32 = -1000;
+
+/// `WM_TIMER`: what a due `SetTimer` timer posts.
+const WM_TIMER: u32 = 0x0113;
 
 /// Handles for bitmaps loaded out of the image's resource tree.
 const FIRST_BITMAP: u32 = 0x0001_0500;
@@ -101,6 +135,26 @@ const DISP_CHANGE_SUCCESSFUL: u32 = 0;
 /// `GWL_STYLE` and `GWL_EXSTYLE`, which are negative selectors, not indices.
 const GWL_STYLE: i32 = -16;
 const GWL_EXSTYLE: i32 = -20;
+
+/// `GWL_WNDPROC`: the selector a window procedure is stored under. A window's
+/// own procedure, once something subclasses it, is what every message goes to.
+const GWL_WNDPROC: i32 = -4;
+
+/// `WH_CBT` and `HCBT_CREATEWND`: the hook kind Windows calls before a window is
+/// created, and the code it is called with. MFC installs one for exactly one
+/// reason -- the class it registers carries `DefWindowProcA`, and the hook is
+/// what puts `AfxWndProc` in its place -- so without it a frame's `CreateEx`
+/// fails and the application quits before it has a window.
+const WH_CBT: i32 = 5;
+const HCBT_CREATEWND: u32 = 3;
+
+/// `WM_NCCREATE` and `WM_CREATE`: delivered, in that order, before
+/// `CreateWindowExA` returns, to the window's own procedure.
+const WM_NCCREATE: u32 = 0x0081;
+const WM_CREATE: u32 = 0x0001;
+
+/// A 32-bit `CREATESTRUCT`: twelve members, every one a `DWORD`, so 48 bytes.
+const CREATESTRUCT_BYTES: u32 = 48;
 
 /// `IDOK`, the only message-box result the guest can get back for now.
 const IDOK: u32 = 1;
@@ -236,12 +290,6 @@ fn is_iconic(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
 /// width, and the rest) -- the same zeroes a bare display reports.
 fn get_system_metrics(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let (width, height) = host.windows.screen();
-    if std::env::var("SHIMKIT_LOG_USER").is_ok() && host.notices.len() < 600 {
-        host.notice(format!(
-            "GetSystemMetrics({}) with a screen of {width}x{height}",
-            call.arg(0)?
-        ));
-    }
     // The metrics a windowed guest measures itself with. A zero is never a real
     // answer to any of them: a program that asks how tall a caption is and is
     // told zero lays its client area out as if the window had no frame.
@@ -357,21 +405,43 @@ fn get_keyboard_type(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
 
 fn post_message(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     host.input.post(call.arg(0)?, call.arg(1)?, call.arg(2)?, call.arg(3)?);
+    host.wake_message_waiters();
     Ok(Return(1))
 }
 
-/// `SendMessageA(hwnd, message, wparam, lparam)`: zero.
+/// `SendMessageA(hwnd, message, wparam, lparam)`: the window procedure's own
+/// answer, because the procedure runs before this import returns.
 ///
-/// A message sent to a window runs the window procedure before the call returns.
-/// Nothing here re-enters the guest from inside a shim -- the procedure runs when
-/// the pump reaches the message -- so the synchronous answer does not exist and
-/// the caller gets the zero a window it does not own answers with.
-fn send_message(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
-    let _ = (call.arg(0)?, call.arg(1)?);
+/// The routine is entered through the session's guest-call mechanism, and the
+/// shim is resumed when it returns so the answer is the import's answer. A
+/// window with no guest procedure -- one whose class still holds the default
+/// procedure -- answers zero, which is what `DefWindowProcA` says for the
+/// messages a guest sends to a window it did not subclass.
+fn send_message(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    if host.resumed {
+        return Ok(Return(host.guest_result));
+    }
+    let window = call.arg(0)?;
+    let message = call.arg(1)?;
+    let wparam = call.arg(2)?;
+    let lparam = call.arg(3)?;
+    let entry = host.windows.proc_address(window).unwrap_or(0);
+    if !is_guest_code(host, entry) {
+        return Ok(Return(0));
+    }
+    host.guest_call = Some(GuestCall {
+        entry,
+        args: [window, message, wparam, lparam],
+        answer: None,
+        resume: true,
+    });
     Ok(Return(0))
 }
 
-fn set_window_text(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+fn set_window_text(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let window = call.arg(0)?;
+    let text = call.cstr(1)?;
+    host.windows.set_text(window, text);
     Ok(Return(1))
 }
 
@@ -563,6 +633,115 @@ struct Window {
     style: u32,
     /// `left, top, right, bottom`, in the guest's coordinate space.
     rect: [i32; 4],
+    /// The caption, or a control's label: what `GetWindowTextA` answers and
+    /// `SetWindowTextA` writes.
+    text: String,
+    /// The control's owner, when the window is one: a dialog's item is a child
+    /// of the dialog, which is what `GetParent` and `IsChild` read.
+    parent: Option<u32>,
+    /// Whether the window is on screen. This host has one visible surface, so a
+    /// window is visible when it is shown and the page is looking at it; the
+    /// flag exists because `IsWindowVisible` and `ShowWindow` must agree.
+    visible: bool,
+    /// Whether the window accepts input, which `EnableWindow` moves and
+    /// `IsWindowEnabled` reads. A game greys an option out by disabling it.
+    enabled: bool,
+}
+
+/// One entry of a menu, in the order it is shown.
+#[derive(Clone, Debug, Default)]
+pub struct MenuItem {
+    /// The command id `WM_COMMAND` carries; zero for a separator.
+    pub id: u32,
+    /// `MF_*` flags: checked, enabled, greyed, the separator bit, and whether
+    /// the item opens a submenu.
+    pub flags: u32,
+    pub text: String,
+    /// The submenu this item opens, when it opens one.
+    pub submenu: Option<u32>,
+}
+
+/// A menu: its items, and the resource it was loaded from.
+#[derive(Clone, Debug, Default)]
+pub struct Menu {
+    pub items: Vec<MenuItem>,
+    /// The resource id `LoadMenuA` was asked for; zero for a menu the guest
+    /// built itself.
+    pub resource: u32,
+}
+
+/// One scroll bar's state: the range, the page, and where the thumb is.
+///
+/// A window has two (`SB_HORZ` and `SB_VERT`), and `SetScrollInfo` may set both
+/// at once, so the state is kept as a pair rather than one bar per window.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScrollBar {
+    pub min: i32,
+    pub max: i32,
+    pub page: u32,
+    pub position: i32,
+    /// Whether the guest gave the bar a range or asked for it to be shown: a bar
+    /// with no range has nothing to scroll and is not one a `WM_*SCROLL` could
+    /// come from.
+    pub live: bool,
+}
+
+/// A `SetTimer` timer, which the message pump turns into `WM_TIMER`.
+#[derive(Clone, Copy, Debug)]
+pub struct WindowTimer {
+    /// The id `WM_TIMER` carries: the guest's, or one this host handed out when
+    /// the guest asked for zero.
+    pub id: u32,
+    /// The window the timer belongs to; zero is the thread's own, which is the
+    /// same window here because there is one thread that pumps.
+    pub window: u32,
+    /// How often it fires, in milliseconds. Zero fires once.
+    pub interval: u32,
+    /// The `TIMERPROC` the guest passed, which it wants called instead of a
+    /// `WM_TIMER` being queued.
+    pub proc_address: u32,
+    /// The guest time it is next due at.
+    pub due: u64,
+}
+
+/// A hook `SetWindowsHookExA` installed. This host has no other process to hook,
+/// so a hook is remembered and `CallNextHookEx` answers as the last one does.
+#[derive(Clone, Copy, Debug)]
+pub struct Hook {
+    pub kind: i32,
+    pub thread: u32,
+    pub proc_address: u32,
+    pub module: u32,
+}
+
+/// One control of a dialog, as `CreateDialogIndirectParamA` found it in the
+/// template.
+#[derive(Clone, Debug)]
+pub struct DialogItem {
+    /// The handle `GetDlgItem` answers for this id.
+    pub handle: u32,
+    pub text: String,
+    pub enabled: bool,
+    pub visible: bool,
+}
+
+/// A dialog: the window it created, and the controls its template named.
+#[derive(Clone, Debug, Default)]
+pub struct Dialog {
+    pub window: u32,
+    /// The controls, by the id the template gave them, in template order.
+    pub items: Vec<(u32, DialogItem)>,
+}
+
+/// The caret, when the guest made one visible.
+#[derive(Clone, Copy, Debug)]
+pub struct Caret {
+    pub window: u32,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub visible: bool,
 }
 
 /// Everything `user32` remembers between calls: the registered classes, the
@@ -593,6 +772,40 @@ pub struct Windows {
     /// does; the value exists so `SetCapture` and `ReleaseCapture` can answer with
     /// the previous holder.
     capture: u32,
+    /// Menus the guest loaded or built, by handle.
+    pub menus: HashMap<u32, Menu>,
+    next_menu: u32,
+    /// Window properties by window and name: `SetPropA`'s table, which a game
+    /// uses in place of a member variable it has no room for.
+    pub props: HashMap<(u32, String), u32>,
+    /// Scroll state by window: `SB_HORZ` first, `SB_VERT` second.
+    pub scroll: HashMap<u32, [ScrollBar; 2]>,
+    /// `SetTimer`'s timers, which the pump turns into `WM_TIMER`.
+    pub timers: Vec<WindowTimer>,
+    next_timer: u32,
+    /// `SetWindowsHookExA`'s hooks, in the order they were installed.
+    pub hooks: Vec<Hook>,
+    next_hook: u32,
+    /// The caret, when the guest made one.
+    pub caret: Option<Caret>,
+    /// Dialogs the guest created, by the window handle it was given.
+    pub dialogs: HashMap<u32, Dialog>,
+    next_dialog_item: u32,
+    /// The names `RegisterWindowMessageA` handed a number to, and the number.
+    pub registered: Vec<(String, u32)>,
+    /// The windows that hold the activation, the keyboard focus and the
+    /// foreground. One machine, one user: each is a single window, and a guest
+    /// that asks gets the one it last set.
+    pub active: u32,
+    pub focus: u32,
+    pub foreground: u32,
+    /// `GetMessagePos` and `GetMessageTime`: where and when the message the pump
+    /// last handed out was produced.
+    pub message_pos: (i32, i32),
+    pub message_time: u32,
+    /// The window whose creation is part-way through, while `CreateWindowExA`
+    /// runs the guest routines that creation needs.
+    creating: Option<Creating>,
 }
 
 impl Windows {
@@ -628,6 +841,10 @@ impl Windows {
                 proc_address,
                 style,
                 rect,
+                text: String::new(),
+                parent: None,
+                visible: style & WS_VISIBLE != 0,
+                enabled: true,
             },
         );
         handle
@@ -710,6 +927,427 @@ impl Windows {
     }
 }
 
+// ---- the state the rest of the module reads -------------------------------
+
+/// The accessors the submodules and the other shims share.
+///
+/// Every one of these is a question about a handle the guest may have made up,
+/// so each answers `None` rather than stopping: Win32 answers zero for a window
+/// that does not exist, and a guest that passes a stale handle is the guest's
+/// problem, not a fault in this machine.
+impl Windows {
+    /// Whether a handle names a window this host knows.
+    pub fn exists(&self, handle: u32) -> bool {
+        handle == DESKTOP_WINDOW || self.windows.contains_key(&handle)
+    }
+
+    /// A window's rectangle, as `left, top, right, bottom`.
+    pub(crate) fn window_rect(&self, handle: u32) -> Option<[i32; 4]> {
+        self.rect(handle)
+    }
+
+    /// A window's client area, which on a borderless window is the window.
+    pub(crate) fn client_rect(&self, handle: u32) -> Option<[i32; 4]> {
+        let rect = self.rect(handle)?;
+        Some([0, 0, rect[2] - rect[0], rect[3] - rect[1]])
+    }
+
+    /// Moves a window, which `SetWindowPos` and `ScrollWindow` both do.
+    pub(crate) fn move_window(&mut self, handle: u32, x: i32, y: i32) {
+        if let Some(rect) = self.rect(handle) {
+            let (width, height) = (rect[2] - rect[0], rect[3] - rect[1]);
+            self.set_rect(handle, [x, y, x.saturating_add(width), y.saturating_add(height)]);
+        }
+    }
+
+    /// The class a window was created from.
+    pub(crate) fn class_of(&self, handle: u32) -> Option<&str> {
+        self.windows
+            .get(&handle)
+            .map(|window| window.class.as_str())
+    }
+
+    /// The procedure a class registered, which `CreateDialogIndirectParamA` and
+    /// `CallWindowProcA` both need.
+    pub(crate) fn class_proc(&self, name: &str) -> Option<u32> {
+        self.classes
+            .iter()
+            .find(|(class, _)| class.eq_ignore_ascii_case(name))
+            .map(|(_, proc_address)| *proc_address)
+    }
+
+    /// Forgets a class, which is what `UnregisterClassA` does: the next
+    /// `CreateWindowExA` of that name then fails, as it does on Windows.
+    /// Removes a window, which is what a cancelled creation does: the handle is
+    /// never handed to the guest, so nothing may still name it.
+    pub(crate) fn destroy(&mut self, handle: u32) -> bool {
+        self.windows.remove(&handle).is_some()
+    }
+
+    /// Replaces a window's procedure, which is what `SetWindowLongA(hwnd,
+    /// GWL_WNDPROC, ...)` does -- and what a framework's creation hook uses to
+    /// put its own procedure in front of the class's.
+    pub(crate) fn set_proc(&mut self, handle: u32, proc_address: u32) {
+        if let Some(window) = self.windows.get_mut(&handle) {
+            window.proc_address = proc_address;
+        }
+    }
+
+    pub(crate) fn unregister_class(&mut self, name: &str) -> bool {
+        let before = self.classes.len();
+        self.classes
+            .retain(|(class, _)| !class.eq_ignore_ascii_case(name));
+        before != self.classes.len()
+    }
+
+    /// The text a window carries: a caption for the guest's window, the label for
+    /// a dialog's control.
+    pub(crate) fn text_of(&self, handle: u32) -> Option<&str> {
+        self.windows
+            .get(&handle)
+            .map(|window| window.text.as_str())
+    }
+
+    pub(crate) fn set_text(&mut self, handle: u32, text: String) {
+        if let Some(window) = self.windows.get_mut(&handle) {
+            window.text = text;
+        }
+    }
+
+    pub(crate) fn is_visible(&self, handle: u32) -> bool {
+        self.windows
+            .get(&handle)
+            .is_some_and(|window| window.visible)
+    }
+
+    pub(crate) fn set_visible(&mut self, handle: u32, visible: bool) {
+        if let Some(window) = self.windows.get_mut(&handle) {
+            window.visible = visible;
+        }
+    }
+
+    pub(crate) fn is_enabled(&self, handle: u32) -> bool {
+        self.windows
+            .get(&handle)
+            .is_some_and(|window| window.enabled)
+    }
+
+    /// Enables or disables a window, answering what it was before, which is what
+    /// `EnableWindow` returns.
+    pub(crate) fn set_enabled(&mut self, handle: u32, enabled: bool) -> bool {
+        let Some(window) = self.windows.get_mut(&handle) else {
+            return false;
+        };
+        std::mem::replace(&mut window.enabled, enabled)
+    }
+
+    pub(crate) fn parent_of(&self, handle: u32) -> Option<u32> {
+        self.windows.get(&handle).and_then(|window| window.parent)
+    }
+
+    pub(crate) fn set_parent(&mut self, handle: u32, parent: u32) {
+        if let Some(window) = self.windows.get_mut(&handle) {
+            window.parent = Some(parent);
+        }
+    }
+
+    /// The children of a window, in the order they were created: a dialog's
+    /// controls, which `GetDlgItem` and `GetNextDlgTabItem` walk.
+    pub(crate) fn children_of(&self, handle: u32) -> Vec<u32> {
+        let mut children: Vec<u32> = self
+            .windows
+            .iter()
+            .filter(|(_, window)| window.parent == Some(handle))
+            .map(|(child, _)| *child)
+            .collect();
+        children.sort_unstable();
+        children
+    }
+
+    /// Creates a window for a submodule, which is the same operation
+    /// `CreateWindowExA` does without its `WNDCLASS` lookup.
+    pub(crate) fn add_window(
+        &mut self,
+        class: String,
+        proc_address: u32,
+        style: u32,
+        rect: [i32; 4],
+    ) -> u32 {
+        self.create(class, proc_address, style, rect)
+    }
+
+    /// The extra bytes `SetWindowLongA` stashed with a selector.
+    pub(crate) fn extra_of(&self, handle: u32, selector: i32) -> u32 {
+        self.extra.get(&(handle, selector)).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn set_extra(&mut self, handle: u32, selector: i32, value: u32) {
+        self.extra.insert((handle, selector), value);
+    }
+
+    /// Files a menu and answers its handle.
+    pub(crate) fn add_menu(&mut self, menu: Menu) -> u32 {
+        let handle = FIRST_MENU + self.next_menu * 4;
+        self.next_menu += 1;
+        self.menus.insert(handle, menu);
+        handle
+    }
+
+    pub(crate) fn menu(&self, handle: u32) -> Option<&Menu> {
+        self.menus.get(&handle)
+    }
+
+    pub(crate) fn menu_mut(&mut self, handle: u32) -> Option<&mut Menu> {
+        self.menus.get_mut(&handle)
+    }
+
+    /// The menu bar a window carries, which `SetMenu` sets and `GetMenu` reads.
+    /// It is kept in the extra-bytes table under its own selector so one map
+    /// holds both kinds of per-window value.
+    pub(crate) fn menu_of(&self, handle: u32) -> u32 {
+        self.extra_of(handle, GWL_MENU)
+    }
+
+    pub(crate) fn set_menu(&mut self, handle: u32, menu: u32) {
+        self.set_extra(handle, GWL_MENU, menu);
+    }
+
+    /// One of a window's two scroll bars, made on first use: Win32 has a bar per
+    /// window whether or not the guest ever set a range.
+    pub(crate) fn scroll_bar(&self, handle: u32, bar: usize) -> ScrollBar {
+        self.scroll
+            .get(&handle)
+            .map(|pair| pair[bar.min(1)])
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_scroll_bar(&mut self, handle: u32, bar: usize, state: ScrollBar) {
+        self.scroll.entry(handle).or_default()[bar.min(1)] = state;
+    }
+
+    /// Installs a timer, answering the id `WM_TIMER` will carry.
+    ///
+    /// A guest that passes zero asks for any id, which Win32 answers with a
+    /// number of its own choosing -- and which the guest then keeps, so the same
+    /// number has to keep naming the same timer.
+    pub(crate) fn add_timer(
+        &mut self,
+        window: u32,
+        id: u32,
+        interval: u32,
+        proc_address: u32,
+        now: u64,
+    ) -> u32 {
+        let id = if id != 0 {
+            id
+        } else {
+            // Above the ids a guest chooses for itself, so the two cannot
+            // collide: a game numbers its timers from one.
+            self.next_timer = self.next_timer.max(0x1000) + 1;
+            self.next_timer
+        };
+        // Setting an id that already exists replaces that timer rather than
+        // adding a second one with the same id, as Windows does.
+        self.timers.retain(|timer| !(timer.window == window && timer.id == id));
+        self.timers.push(WindowTimer {
+            id,
+            window,
+            interval,
+            proc_address,
+            due: now.saturating_add(u64::from(interval.max(1))),
+        });
+        id
+    }
+
+    pub(crate) fn kill_timer(&mut self, window: u32, id: u32) -> bool {
+        let before = self.timers.len();
+        self.timers
+            .retain(|timer| !(timer.window == window && timer.id == id));
+        before != self.timers.len()
+    }
+
+    /// The timers due at `now`, each re-armed for its next interval. A timer with
+    /// a zero interval is handed out once and forgotten, which is what Windows
+    /// does with one.
+    pub(crate) fn due_timers(&mut self, now: u64) -> Vec<WindowTimer> {
+        let mut due = Vec::new();
+        let mut keep = Vec::with_capacity(self.timers.len());
+        for mut timer in self.timers.drain(..) {
+            if timer.due > now {
+                keep.push(timer);
+                continue;
+            }
+            due.push(timer);
+            if timer.interval > 0 {
+                // Re-armed from the schedule rather than from `now`, so a timer
+                // that came due while the guest was busy does not drift later and
+                // later.
+                timer.due = timer.due.saturating_add(u64::from(timer.interval));
+                if timer.due <= now {
+                    timer.due = now.saturating_add(u64::from(timer.interval));
+                }
+                keep.push(timer);
+            }
+        }
+        self.timers = keep;
+        due
+    }
+
+    /// Installs a hook, answering its handle.
+    pub(crate) fn add_hook(&mut self, hook: Hook) -> u32 {
+        self.hooks.push(hook);
+        self.next_hook += 1;
+        FIRST_HOOK + self.next_hook * 4
+    }
+
+    pub(crate) fn remove_hook(&mut self, handle: u32) -> bool {
+        let Some(index) = (0..self.hooks.len()).find(|index| {
+            FIRST_HOOK + (*index as u32 + 1) * 4 == handle
+        }) else {
+            return false;
+        };
+        self.hooks.remove(index);
+        true
+    }
+
+    /// Files a dialog and answers the map of its controls, empty until the caller
+    /// fills it from the template.
+    pub(crate) fn add_dialog(&mut self, window: u32) -> &mut Dialog {
+        self.dialogs.insert(
+            window,
+            Dialog {
+                window,
+                items: Vec::new(),
+            },
+        );
+        self.dialogs.get_mut(&window).expect("the dialog was just filed")
+    }
+
+    /// Adds a control to a dialog, answering the child handle the guest will see.
+    pub(crate) fn add_dialog_item(
+        &mut self,
+        dialog: u32,
+        id: u32,
+        text: String,
+        template: [i32; 4],
+    ) -> u32 {
+        let child = self.create("Button".to_string(), 0, 0, template);
+        self.set_parent(child, dialog);
+        self.set_text(child, text.clone());
+        self.next_dialog_item += 1;
+        if let Some(entry) = self.dialogs.get_mut(&dialog) {
+            entry.items.push((
+                id,
+                DialogItem {
+                    handle: child,
+                    text,
+                    enabled: true,
+                    visible: true,
+                },
+            ));
+        }
+        child
+    }
+
+    /// A control of a dialog by the id its template gave it.
+    pub(crate) fn dialog_item(&self, dialog: u32, id: u32) -> Option<&DialogItem> {
+        self.dialogs
+            .get(&dialog)?
+            .items
+            .iter()
+            .find(|(item_id, _)| *item_id == id)
+            .map(|(_, item)| item)
+    }
+
+    pub(crate) fn dialog_item_mut(&mut self, dialog: u32, id: u32) -> Option<&mut DialogItem> {
+        self.dialogs
+            .get_mut(&dialog)?
+            .items
+            .iter_mut()
+            .find(|(item_id, _)| *item_id == id)
+            .map(|(_, item)| item)
+    }
+
+    /// The id a dialog's control was created with, which `GetDlgCtrlID` answers.
+    pub(crate) fn dialog_item_id(&self, dialog: u32, handle: u32) -> Option<u32> {
+        self.dialogs
+            .get(&dialog)?
+            .items
+            .iter()
+            .find(|(_, item)| item.handle == handle)
+            .map(|(id, _)| *id)
+    }
+
+    /// The number `RegisterWindowMessageA` gave a name: one per name, and the
+    /// same number for the same name across every call.
+    pub(crate) fn register_message(&mut self, name: &str) -> u32 {
+        if let Some((_, id)) = self
+            .registered
+            .iter()
+            .find(|(registered, _)| registered.eq_ignore_ascii_case(name))
+        {
+            return *id;
+        }
+        // Registered messages live in the range Windows reserves for them.
+        let id = 0xC000 + self.registered.len() as u32;
+        self.registered.push((name.to_owned(), id));
+        id
+    }
+
+    /// The window under a screen point, which `WindowFromPoint` answers: the
+    /// smallest window that contains it, children before their parent.
+    pub(crate) fn window_at(&self, x: i32, y: i32) -> Option<u32> {
+        let mut best: Option<(u32, i64)> = None;
+        for (handle, window) in &self.windows {
+            let [left, top, right, bottom] = window.rect;
+            if x < left || y < top || x >= right || y >= bottom {
+                continue;
+            }
+            let area = i64::from(right - left) * i64::from(bottom - top);
+            if best.is_none_or(|(_, smallest)| area < smallest) {
+                best = Some((*handle, area));
+            }
+        }
+        best.map(|(handle, _)| handle)
+    }
+
+    /// The first window the guest created, which is its top-level one.
+    pub(crate) fn top_window(&self) -> u32 {
+        self.main
+    }
+
+    /// The window that owns a handle: the parent of a child, the owner of a
+    /// popup, and zero for a top-level window that has neither -- which is what
+    /// `GetWindow(hwnd, GW_OWNER)` answers on Windows. A desktop handle here is
+    /// not an owner anything can be walked from.
+    pub(crate) fn owner_of(&self, handle: u32) -> u32 {
+        self.parent_of(handle).unwrap_or(0)
+    }
+}
+
+/// Queues the `WM_TIMER` messages that are due.
+///
+/// A timer is a message, not a callback, unless the guest asked for a
+/// `TIMERPROC` -- and this host's pump is the guest's own loop, so posting here
+/// is what makes `PeekMessageA` see it on the next iteration.
+fn deliver_timers(host: &mut Host) {
+    let now = host.now();
+    let due = host.windows.due_timers(now);
+    if due.is_empty() {
+        return;
+    }
+    for timer in due {
+        let target = if timer.window != 0 {
+            timer.window
+        } else {
+            host.windows.top_window()
+        };
+        host.input
+            .post(target, WM_TIMER, timer.id, timer.proc_address);
+    }
+    host.wake_message_waiters();
+}
+
 // ---- window classes and windows ------------------------------------------
 
 fn register_class(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
@@ -728,6 +1366,7 @@ fn register(host: &mut Host, call: &mut Call<'_>, wide: bool) -> Result<Action> 
     }
     let proc_address = call.memory.read_u32(class.wrapping_add(WNDCLASS_PROC))?;
     let name = call.memory.read_u32(class.wrapping_add(WNDCLASS_NAME))?;
+
     let name = if wide {
         call.wstr(name)?
     } else {
@@ -751,6 +1390,11 @@ fn create_window_ex_w(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
 }
 
 fn create(host: &mut Host, call: &mut Call<'_>, class: String, title: String) -> Result<Action> {
+    // A creation that is part-way through has just come back from one of its
+    // guest routines, and the next step runs from here.
+    if host.resumed {
+        return resume_create(host, call);
+    }
     let style = call.arg(3)?;
     // The game asks for `CW_USEDEFAULT` in every coordinate, so the window the
     // host reports is the surface itself; a zero size would be a window nobody
@@ -777,20 +1421,226 @@ fn create(host: &mut Host, call: &mut Call<'_>, class: String, title: String) ->
             y.saturating_add(height),
         ],
     );
-    if let Some(line) = host.windows.describe(handle) {
-        host.notice(line);
+    let _ = title;
+    // Windows runs the creation sequence here, before this import returns: the
+    // `WH_CBT` hook, then `WM_NCCREATE`, then `WM_CREATE`. It is not optional for
+    // a window an application creates through a framework -- MFC registers its
+    // classes with `DefWindowProcA` and uses the hook to swap in its own
+    // procedure -- and a host that skips it hands the guest a window that exists
+    // and is never shown.
+    begin_create(host, call, handle, style, [x, y, width, height])
+}
+
+/// One step of a window's creation, so a resumed shim knows what just returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CreationStep {
+    /// The `WH_CBT` hook, called with `HCBT_CREATEWND`.
+    Hook,
+    /// `WM_NCCREATE`, whose zero answer cancels the creation.
+    NcCreate,
+    /// `WM_CREATE`, whose -1 answer cancels the creation.
+    Create,
+}
+
+/// A window whose creation is between two guest routines.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Creating {
+    window: u32,
+    step: CreationStep,
+    style: u32,
+    /// The `CREATESTRUCT` in guest memory, which both messages carry as `lparam`.
+    lparam: u32,
+}
+
+/// Whether a value points at guest code rather than at one of this host's own
+/// import stubs.
+///
+/// This is the answer to a question that looked like a broken binary: a class
+/// registered through an imported `DefWindowProcA` holds the *stub address* the
+/// import table was filled with, not a function in the image. Calling it would
+/// run the import stub as a window procedure, so every step below treats it as
+/// what it is -- the default procedure, which answers zero.
+fn is_guest_code(host: &Host, entry: u32) -> bool {
+    entry != 0 && crate::cpu::host_slot_at(entry, host.target.table).is_none()
+}
+
+/// One line of the creation sequence, under `SHIMKIT_LOG_WINDOWS`: which guest
+/// routine ran and what it answered, which is what a window that never appears
+/// is diagnosed from.
+fn trace_creation(host: &mut Host, line: String) {
+    if std::env::var("SHIMKIT_LOG_WINDOWS").is_ok() {
+        host.notice(format!("create: {line}"));
     }
-    if !title.is_empty() {
-        host.notice(format!("window title \"{title}\""));
+}
+
+/// Fills the window's `CREATESTRUCT` and starts its creation sequence.
+fn begin_create(
+    host: &mut Host,
+    call: &mut Call<'_>,
+    handle: u32,
+    style: u32,
+    size: [i32; 4],
+) -> Result<Action> {
+    let lparam = host.allocate(CREATESTRUCT_BYTES, 4)?;
+    call.zero(lparam, CREATESTRUCT_BYTES)?;
+    // `hInstance`, the size and place, and the style are the members a guest's
+    // `WM_CREATE` reads. The class and window names stay null: a window created
+    // from a registered class name carries none, which is what Windows does.
+    for (offset, value) in [
+        (4_u32, crate::pe::IMAGE_BASE),
+        (16, size[3] as u32),
+        (20, size[2] as u32),
+        (24, size[1] as u32),
+        (28, size[0] as u32),
+        (32, style),
+    ] {
+        call.memory.write_u32(lparam.wrapping_add(offset), value)?;
     }
-    // A `WS_VISIBLE` window is on screen as soon as it exists, and Windows
-    // activates it then. A game that creates its window that way -- Cave Story
-    // does -- never calls `ShowWindow`, and its message loop waits for exactly
-    // these messages before it runs a frame.
-    if style & WS_VISIBLE != 0 {
-        activate(host, handle);
+    let creating = Creating {
+        window: handle,
+        step: CreationStep::Hook,
+        style,
+        lparam,
+    };
+    host.windows.creating = Some(creating);
+    run_hook(host, call, creating)
+}
+
+/// The `WH_CBT` hook: the last one installed, called with `HCBT_CREATEWND`.
+///
+/// Its return value is not read. A CBT hook exists for what it does to the
+/// window -- a framework attaches its object and replaces the procedure -- and
+/// `FALSE`, which every one of them returns, means "go on and create it".
+fn run_hook(host: &mut Host, call: &mut Call<'_>, creating: Creating) -> Result<Action> {
+    let Some(entry) = host
+        .windows
+        .hooks
+        .iter()
+        .rev()
+        .find(|hook| hook.kind == WH_CBT && hook.proc_address != 0)
+        .map(|hook| hook.proc_address)
+    else {
+        return send_nc_create(host, call, creating);
+    };
+    // `CBT_CREATEWND { CREATESTRUCT *lpcs; HWND hwndInsertAfter; }`
+    let address = host.allocate(8, 4)?;
+    call.memory.write_u32(address, creating.lparam)?;
+    call.memory.write_u32(address.wrapping_add(4), 0)?;
+    host.windows.creating = Some(Creating { step: CreationStep::Hook, ..creating });
+    trace_creation(
+        host,
+        format!("{:#010x}: WH_CBT hook {entry:#010x}", creating.window),
+    );
+    host.guest_call = Some(GuestCall {
+        entry,
+        args: [HCBT_CREATEWND, creating.window, address, 0],
+        answer: None,
+        resume: true,
+    });
+    Ok(Return(creating.window))
+}
+
+/// `WM_NCCREATE`, then `WM_CREATE`, sent to whatever procedure the window has
+/// now: the hook above is what gives it the one that handles them.
+fn send_nc_create(host: &mut Host, call: &mut Call<'_>, creating: Creating) -> Result<Action> {
+    send_creation(host, call, Creating { step: CreationStep::NcCreate, ..creating }, WM_NCCREATE)
+}
+
+fn send_create(host: &mut Host, call: &mut Call<'_>, creating: Creating) -> Result<Action> {
+    send_creation(host, call, Creating { step: CreationStep::Create, ..creating }, WM_CREATE)
+}
+
+fn send_creation(
+    host: &mut Host,
+    _call: &mut Call<'_>,
+    creating: Creating,
+    message: u32,
+) -> Result<Action> {
+    let entry = host.windows.proc_address(creating.window).unwrap_or(0);
+    if !is_guest_code(host, entry) {
+        // A class that still holds the default procedure: nothing to call, and
+        // nothing to wait for, so the next message goes out now.
+        return if message == WM_NCCREATE {
+            send_create(host, _call, creating)
+        } else {
+            end_create(host, creating)
+        };
     }
-    Ok(Return(handle))
+    trace_creation(
+        host,
+        format!(
+            "{:#010x}: {message:#06x} to {entry:#010x}",
+            creating.window
+        ),
+    );
+    host.windows.creating = Some(creating);
+    host.guest_call = Some(GuestCall {
+        entry,
+        args: [creating.window, message, 0, creating.lparam],
+        answer: None,
+        resume: true,
+    });
+    Ok(Return(creating.window))
+}
+
+/// The sequence is over: a window created with `WS_VISIBLE` is on screen from the
+/// moment it exists, so it is activated now, exactly as Windows activates it.
+fn end_create(host: &mut Host, creating: Creating) -> Result<Action> {
+    let proc_address = host.windows.proc_address(creating.window).unwrap_or(0);
+    trace_creation(
+        host,
+        format!(
+            "{:#010x}: created, proc {proc_address:#010x}",
+            creating.window
+        ),
+    );
+    host.windows.creating = None;
+    if creating.style & WS_VISIBLE != 0 {
+        activate(host, creating.window);
+    }
+    Ok(Return(creating.window))
+}
+
+/// The step a guest routine just finished, for a `CreateWindowExA` that asked to
+/// be resumed.
+fn resume_create(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let creating = host
+        .windows
+        .creating
+        .expect("a resumed creation has a window");
+    let answer = host.guest_result;
+    match creating.step {
+        // The hook's own value says nothing this host needs.
+        CreationStep::Hook => send_nc_create(host, call, creating),
+        // `WM_NCCREATE` answering zero cancels the window, and Windows then
+        // answers `CreateWindowExA` with NULL.
+        CreationStep::NcCreate if answer == 0 => {
+            trace_creation(
+                host,
+                format!("{:#010x}: WM_NCCREATE refused", creating.window),
+            );
+            destroy_created(host, creating)
+        }
+        CreationStep::NcCreate => {
+            trace_creation(
+                host,
+                format!("{:#010x}: WM_NCCREATE answered", creating.window),
+            );
+            send_create(host, call, creating)
+        }
+        // `WM_CREATE` answering -1 abandons it the same way.
+        CreationStep::Create if answer == u32::MAX => {
+            trace_creation(host, format!("{:#010x}: WM_CREATE refused", creating.window));
+            destroy_created(host, creating)
+        }
+        CreationStep::Create => end_create(host, creating),
+    }
+}
+
+fn destroy_created(host: &mut Host, creating: Creating) -> Result<Action> {
+    host.windows.creating = None;
+    host.windows.destroy(creating.window);
+    Ok(Return(0))
 }
 
 /// Queues the messages a window receives when it becomes the one the user is
@@ -807,6 +1657,7 @@ pub(crate) fn activate(host: &mut Host, handle: u32) {
     host.input.post(handle, WM_ACTIVATE, WA_ACTIVE, 0);
     host.input.post(handle, WM_SETFOCUS, 0, 0);
     host.input.post(handle, WM_ACTIVATEAPP, 1, 0);
+    host.wake_message_waiters();
 }
 
 /// There is one guest in this host, so the answer is always "no other copy".
@@ -820,8 +1671,75 @@ fn show_window(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     // Windows follows that with the activation messages, and the guest's window
     // procedure reads them: it is how a game learns it has the user's attention.
     let handle = call.arg(0)?;
+    // `SW_HIDE` (0) is the one command that takes the window off the screen; the
+    // rest ask for a state a borderless window is already in.
+    if call.arg(1)? != 0 {
+        host.windows.set_visible(handle, true);
+        // A window that has just been shown is owed a paint, exactly as on
+        // Windows: the guest's menu is drawn in `WM_PAINT`, so a host that never
+        // queues one shows an empty frame.
+        request_paint(host, handle);
+    } else {
+        host.windows.set_visible(handle, false);
+    }
     activate(host, handle);
     Ok(Return(1))
+}
+
+/// `AFX_IDS_APP_TITLE`: the first string MFC asks for, from its own reserved
+/// range. A statically linked MFC program carries it only when its `.rc` included
+/// `afxres.rc`; when it does not, `CWinApp` falls back to the executable's name.
+const AFX_IDS_APP_TITLE: u32 = 0xE000;
+
+/// The title an MFC program with no app-title string of its own presents: the
+/// executable's name without its extension, which is exactly what MFC's fallback
+/// in `CWinApp` produces (`HERCULES.EXE` becomes `HERCULES`).
+fn app_title(exe_name: &str) -> &str {
+    match exe_name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() && !extension.is_empty() => stem,
+        _ => exe_name,
+    }
+}
+
+/// The resource tree an instance handle names, the base its RVAs are relative to,
+/// and a name for it to say in a log.
+///
+/// A guest passes a module handle to `LoadStringA` and every other `Load*` call,
+/// and the answer comes from that module's own `.rsrc`. `0` and the program's own
+/// base both mean the program, which is the handle a program that has no DLL of
+/// its own passes.
+pub(crate) fn instance_resources(
+    host: &Host,
+    instance: u32,
+) -> (&[crate::pe::Resource], u32, &str) {
+    if instance == 0 || instance == crate::pe::IMAGE_BASE {
+        return (&host.resources, crate::pe::IMAGE_BASE, "the image");
+    }
+    match host
+        .guest_modules
+        .iter()
+        .find(|module| module.base == instance)
+    {
+        Some(module) => (&module.resources, module.base, module.name.as_str()),
+        // A handle nothing was mapped at: the guest asked the wrong question, and
+        // answering from the program's tree would hide that.
+        None => (&[], 0, "an unknown module"),
+    }
+}
+
+/// Queues the paint a window is owed, once.
+///
+/// `WM_PAINT` is posted rather than sent -- the guest draws when its pump reaches
+/// it -- and it coalesces: however often a window is invalidated, one paint waits
+/// until the guest takes it. Without this, a title whose window only draws in
+/// `WM_PAINT` (an MFC launcher, a dialog) has nothing to draw with, which looks
+/// exactly like a game that started and never painted.
+fn request_paint(host: &mut Host, handle: u32) {
+    if handle == 0 || host.input.waiting(handle, WM_PAINT) {
+        return;
+    }
+    host.input.post(handle, WM_PAINT, 0, 0);
+    host.wake_message_waiters();
 }
 
 fn update_window(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
@@ -830,6 +1748,7 @@ fn update_window(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let handle = call.arg(0)?;
     if handle != 0 {
         host.input.post(handle, WM_PAINT, 0, 0);
+        host.wake_message_waiters();
     }
     Ok(Return(1))
 }
@@ -847,6 +1766,7 @@ fn peek_message(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let max = call.arg(3)?;
     let remove = call.arg(4)? & PM_REMOVE != 0;
 
+    deliver_timers(host);
     let Some(index) = host.input.find(window, min, max) else {
         return Ok(Return(0));
     };
@@ -864,9 +1784,11 @@ fn peek_message(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     Ok(Return(1))
 }
 
-/// `GetMessageA` cannot wait, so an empty queue answers with `WM_NULL`: the
-/// guest keeps running and the next event finds it in its loop, instead of the
-/// process ending on a message that never came.
+/// `GetMessageA` cannot block: the page cannot interrupt a call, and the
+/// guest's own window procedure is what drives its frames -- a message answered
+/// per pump iteration is a tick the game runs on. An empty queue therefore
+/// answers `WM_NULL`, which every window ignores, and the next event finds the
+/// guest still in its loop.
 fn get_message(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     // `GetMessageA(lpMsg, hwnd, filterMin, filterMax)`, same order as the peek.
     let destination = call.arg(0)?;
@@ -874,6 +1796,7 @@ fn get_message(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let min = call.arg(2)?;
     let max = call.arg(3)?;
 
+    deliver_timers(host);
     let message = host.input.take(window, min, max).unwrap_or(input::Message {
         hwnd: window,
         message: WM_NULL,
@@ -925,6 +1848,9 @@ fn dispatch_message(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         return Ok(Return(0));
     }
     match host.windows.proc_address(window) {
+        // A class that registered an imported `DefWindowProcA` holds that
+        // import's stub address, not code: dispatching would run the stub.
+        Some(entry) if !is_guest_code(host, entry) => Ok(Return(0)),
         Some(entry) => {
             host.guest_call = Some(GuestCall {
                 entry,
@@ -1044,6 +1970,9 @@ fn set_window_long(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
                 .and_modify(|window| window.style = value);
         }
         GWL_EXSTYLE => {}
+        // `GWL_WNDPROC` is the one selector that changes where messages go, so
+        // it is stored where dispatch reads it rather than in the extra table.
+        GWL_WNDPROC => host.windows.set_proc(handle, value),
         _ => {
             host.windows
                 .extra
@@ -1064,6 +1993,7 @@ fn window_long(host: &Host, handle: u32, selector: i32) -> u32 {
         GWL_STYLE => host.windows.style(handle).unwrap_or(0),
         // There are no extended styles: no always-on-top, no layered window.
         GWL_EXSTYLE => 0,
+        GWL_WNDPROC => host.windows.proc_address(handle).unwrap_or(0),
         _ => host
             .windows
             .extra
@@ -1073,15 +2003,25 @@ fn window_long(host: &Host, handle: u32, selector: i32) -> u32 {
     }
 }
 
-fn get_menu(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
-    // The image carries no menu resource; the game draws its own.
-    Ok(Return(0))
+fn get_menu(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    // The game draws its own screens, so it rarely asks; a guest that *did* load
+    // a menu and install it gets the bar it set, which is what makes
+    // `EnableMenuItem(GetMenu(hwnd), ...)` act on the menu the player sees rather
+    // than on handle zero.
+    Ok(Return(host.windows.menu_of(call.arg(0)?)))
 }
 
-fn def_window_proc(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+fn def_window_proc(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     // Nothing here has a title bar, border or menu for the default procedure to
     // draw or answer for; the guest's own drawing is the window.
-    Ok(Return(0))
+    //
+    // `WM_NCCREATE` is the exception, and not a detail: the default procedure is
+    // what says a window may be created, so it answers TRUE. A framework that
+    // routes `WM_NCCREATE` through `DefWindowProc` -- MFC does, from `AfxWndProc`
+    // when the window is not one of its permanent objects yet -- would otherwise
+    // be told the creation failed, and destroy the frame it just made.
+    let message = call.arg(1)?;
+    Ok(Return(u32::from(message == WM_NCCREATE)))
 }
 
 /// `GetClientRect(hwnd, &rect)`: the window's own area, from the origin.
@@ -1139,11 +2079,14 @@ fn client_to_screen(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     Ok(Return(1))
 }
 
-/// `InvalidateRect(hwnd, &rect, erase)`: nothing paints the guest's window
-/// through GDI, so there is no region to mark and the call succeeds.
+/// `InvalidateRect(hwnd, &rect, erase)`: the window is owed a paint.
+///
+/// There is no update region here -- a paint is the guest drawing its whole frame,
+/// and `BeginPaint` says `rcPaint` is the client area -- so all that is left of the
+/// call is the message Windows posts from it.
 fn invalidate_rect(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
-    let _ = host;
-    let _ = call.arg(0)?;
+    let window = call.arg(0)?;
+    request_paint(host, window);
     Ok(Return(1))
 }
 
@@ -1350,7 +2293,17 @@ const RT_STRING: u32 = 6;
 /// 16-bit count of UTF-16 code units. So this reads the block and walks it, and a
 /// block or entry that is not there is an empty string -- which is what a program
 /// that falls back to a default already handles.
+///
+/// `instance` picks the table: a title that keeps its text in a DLL asks for that
+/// DLL's handle, and MFC asks for the module carrying its own strings. Reading the
+/// program's tree whatever was asked answers with another module's text, or with
+/// nothing at all, which is a miss the guest cannot tell from a block it never
+/// shipped.
+///
+/// The one string that is answered without a resource is MFC's own app title: see
+/// [`AFX_IDS_APP_TITLE`].
 fn load_string(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let instance = call.arg(0)?;
     let id = call.arg(1)?;
     let buffer = call.arg(2)?;
     let limit = call.arg(3)?;
@@ -1358,15 +2311,37 @@ fn load_string(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         return Ok(Return(0));
     }
     let block = crate::pe::ResourceKey::Id((id >> 4) + 1);
-    let found = host.resources.iter().find(|resource| {
-        resource.kind == crate::pe::ResourceKey::Id(RT_STRING) && resource.name == block
-    });
-    let Some(resource) = found else {
+    let found = {
+        let (resources, base, _) = instance_resources(host, instance);
+        resources
+            .iter()
+            .find(|resource| {
+                resource.kind == crate::pe::ResourceKey::Id(RT_STRING) && resource.name == block
+            })
+            .map(|resource| (base.wrapping_add(resource.rva), resource.size))
+    };
+    let Some((at, size)) = found else {
+        // MFC's app-title string is the one id answered without a resource: a
+        // statically linked build carries it only when its `.rc` included
+        // `afxres.rc`, and MFC's own fallback when it is missing is the
+        // executable's name -- so that is the title the guest gets, not a gap.
+        if id == AFX_IDS_APP_TITLE {
+            let title = app_title(host.target.exe_name);
+            let room = (limit as usize).saturating_sub(1);
+            let mut text = title.as_bytes().to_vec();
+            text.truncate(room);
+            let copied = text.len() as u32;
+            text.push(0);
+            call.write(buffer, &text)?;
+            return Ok(Return(copied));
+        }
+        // A string the module does not carry is an empty string, which is what
+        // Windows answers too: every caller of this has a fallback, and saying so
+        // in the log only made a normal miss look like a broken image.
         call.write(buffer, &[0])?;
         return Ok(Return(0));
     };
-    let at = crate::pe::IMAGE_BASE.wrapping_add(resource.rva);
-    let bytes = call.memory.read_bytes(at, resource.size as usize)?.to_vec();
+    let bytes = call.memory.read_bytes(at, size as usize)?.to_vec();
 
     let mut offset = 0_usize;
     let mut index = 0_u32;
@@ -1989,12 +2964,127 @@ mod tests {
     }
 
     #[test]
+    /// MFC asks for its own app-title string before it does anything, and a build
+    /// that never linked `afxres.rc` does not carry it. The answer is the name MFC
+    /// would fall back to, so the guest's title is the same as on Windows and the
+    /// call succeeds instead of reporting a hole in the image.
+    #[test]
+    fn mfc_app_title_is_answered_with_the_executable_name() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let buffer = STACK_BASE + 0x200;
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "LoadStringA", &[0, 0xE000, buffer, 32]).unwrap(),
+            Return(7)
+        );
+        // The reference machine runs `program.exe`, whose title is `program`.
+        assert_eq!(memory.read_bytes(buffer, 8).unwrap(), b"program\0");
+
+        // An id beside it is still an ordinary miss: only the title has a value
+        // this host can answer without the image carrying one.
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "LoadStringA", &[0, 0xE001, buffer, 32]).unwrap(),
+            Return(0)
+        );
+    }
+
+    /// The handle a guest passes to `LoadStringA` chooses the table: a module's
+    /// own strings come from that module, and asking the program instead does not
+    /// find them.
+    #[test]
+    fn a_string_comes_from_the_module_the_handle_names() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let base = STACK_BASE;
+        // Block 3 covers ids 32..47; entry 1 is `"Hi"`, two code units long.
+        let mut block = Vec::new();
+        block.extend_from_slice(&0_u16.to_le_bytes());
+        block.extend_from_slice(&2_u16.to_le_bytes());
+        for unit in "Hi".encode_utf16() {
+            block.extend_from_slice(&unit.to_le_bytes());
+        }
+        memory.write_bytes(base, &block).unwrap();
+        host.guest_modules.push(crate::shim::GuestModule {
+            name: "strings.dll".to_string(),
+            base,
+            exports: Vec::new(),
+            resources: vec![crate::pe::Resource {
+                kind: crate::pe::ResourceKey::Id(RT_STRING),
+                name: crate::pe::ResourceKey::Id(3),
+                rva: 0,
+                size: block.len() as u32,
+            }],
+        });
+
+        let buffer = STACK_BASE + 0x100;
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "LoadStringA", &[base, 33, buffer, 16]).unwrap(),
+            Return(2)
+        );
+        assert_eq!(memory.read_bytes(buffer, 3).unwrap(), b"Hi\0");
+
+        // The same id asked of the program itself is a block it does not have.
+        assert_eq!(
+            call_shim(
+                &mut host,
+                &mut memory,
+                "LoadStringA",
+                &[crate::pe::IMAGE_BASE, 33, buffer, 16]
+            )
+            .unwrap(),
+            Return(0)
+        );
+    }
+
+    /// A window's menu is drawn in `WM_PAINT`, so a window that is shown and an
+    /// area that is invalidated each owe one paint -- one, not one per call.
+    #[test]
+    fn a_window_that_is_shown_or_invalidated_is_owed_one_paint() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let window = window_with_proc(&mut host, &mut memory, 0x0045_7da3);
+        assert!(!host.input.waiting(window, WM_PAINT));
+
+        // SW_SHOW: the window is on screen, so the guest's own paint runs.
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "ShowWindow", &[window, 5]).unwrap(),
+            Return(1)
+        );
+        assert!(
+            host.input.waiting(window, WM_PAINT),
+            "showing a window posts the paint that draws it"
+        );
+
+        // Invalidated twice while that paint waits: still one, which is what keeps
+        // a guest that invalidates inside its paint handler from never leaving it.
+        call_shim(&mut host, &mut memory, "InvalidateRect", &[window, 0, 0]).unwrap();
+        call_shim(&mut host, &mut memory, "InvalidateRect", &[window, 0, 0]).unwrap();
+        let first = host
+            .input
+            .find(window, WM_PAINT, WM_PAINT)
+            .expect("the paint is still queued");
+        host.input.remove(first).unwrap();
+        assert!(
+            host.input.find(window, WM_PAINT, WM_PAINT).is_none(),
+            "three invalidations queue one paint"
+        );
+
+        // Hiding is not painting.
+        call_shim(&mut host, &mut memory, "ShowWindow", &[window, 0]).unwrap();
+        assert!(!host.input.waiting(window, WM_PAINT));
+    }
+
     fn get_message_keeps_the_guest_alive_when_nothing_is_queued() {
         let Some((mut host, mut memory)) = machine() else {
             return;
         };
         let window = window_with_proc(&mut host, &mut memory, 0x0045_7da3);
         let message = STACK_BASE + 0x3f00;
+        // An empty queue answers `WM_NULL`, which keeps the guest's own loop
+        // alive instead of ending the process on a message that never came.
         assert_eq!(
             call_shim(
                 &mut host,

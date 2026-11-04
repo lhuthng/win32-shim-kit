@@ -1121,9 +1121,11 @@ mod tests {
         name: "test",
         exe_name: "program.exe",
         screen: (640, 480, 8),
+        windows: crate::target::Windows::XP,
         table: crate::dispatch::Table { slots: MANIPULATOR },
         shims: crate::shim::TABLES,
         provided_files: &[],
+        hle: &[],
     };
 
     fn stream_machine() -> Machine {

@@ -36,11 +36,6 @@ use Action::{Exit, Return};
 
 const KERNEL32: &str = "KERNEL32.dll";
 
-/// Windows XP, 5.1 build 2600. The game predates the browser, so claiming a
-/// 2001-era platform keeps its version checks on the branch the art was drawn
-/// for; the localization's own volume fix targets newer versions separately.
-const WINDOWS_VERSION: u32 = 0x0a28_0105;
-
 /// `GetLastError` after a handle could not be opened.
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 /// `GetLastError` after `FindResourceA` found nothing of that type and name.
@@ -330,29 +325,331 @@ pub const SHIMS: &[Binding] = &[
     Binding { dll: KERNEL32, name: "SetThreadPriority", arg_bytes: 8, shim: succeed },
     Binding { dll: KERNEL32, name: "VirtualProtect", arg_bytes: 16, shim: virtual_protect },
     Binding { dll: KERNEL32, name: "VirtualQuery", arg_bytes: 12, shim: virtual_query },
+    // The Win9x `Local`/`Global` family, which one arena answers for both halves
+    // of, and the small questions a 1999 launcher asks before it draws.
+    Binding { dll: KERNEL32, name: "GlobalFree", arg_bytes: 4, shim: global_free },
+    Binding { dll: KERNEL32, name: "GlobalHandle", arg_bytes: 4, shim: global_handle },
+    Binding { dll: KERNEL32, name: "GlobalFlags", arg_bytes: 4, shim: global_flags },
+    Binding { dll: KERNEL32, name: "GlobalReAlloc", arg_bytes: 12, shim: global_realloc },
+    Binding { dll: KERNEL32, name: "LocalReAlloc", arg_bytes: 12, shim: local_realloc },
+    Binding { dll: KERNEL32, name: "GlobalAddAtomA", arg_bytes: 4, shim: global_add_atom },
+    Binding { dll: KERNEL32, name: "GlobalDeleteAtom", arg_bytes: 4, shim: global_delete_atom },
+    Binding { dll: KERNEL32, name: "GlobalGetAtomNameA", arg_bytes: 12, shim: global_get_atom_name },
+    Binding { dll: KERNEL32, name: "MulDiv", arg_bytes: 12, shim: mul_div },
+    Binding { dll: KERNEL32, name: "GetCurrentThread", arg_bytes: 0, shim: get_current_thread },
+    Binding { dll: KERNEL32, name: "GetFullPathNameA", arg_bytes: 16, shim: get_full_path_name },
+    Binding { dll: KERNEL32, name: "GetPriorityClass", arg_bytes: 4, shim: get_priority_class },
+    Binding { dll: KERNEL32, name: "SetPriorityClass", arg_bytes: 8, shim: set_priority_class },
+    Binding { dll: KERNEL32, name: "GetThreadPriority", arg_bytes: 4, shim: get_thread_priority },
+    Binding { dll: KERNEL32, name: "GetProcessVersion", arg_bytes: 4, shim: get_process_version },
+    Binding { dll: KERNEL32, name: "GetVolumeInformationA", arg_bytes: 32, shim: get_volume_information },
+    Binding { dll: KERNEL32, name: "SetErrorMode", arg_bytes: 4, shim: set_error_mode },
+    Binding { dll: KERNEL32, name: "SuspendThread", arg_bytes: 4, shim: suspend_thread },
+    Binding { dll: KERNEL32, name: "TerminateThread", arg_bytes: 8, shim: terminate_thread },
+    Binding { dll: KERNEL32, name: "WritePrivateProfileStringA", arg_bytes: 16, shim: write_private_profile_string },
+    Binding { dll: KERNEL32, name: "lstrcatA", arg_bytes: 8, shim: lstrcat },
+    Binding { dll: KERNEL32, name: "lstrcmpA", arg_bytes: 8, shim: lstrcmp },
 ];
+
+// ---- the memory handle family and the launcher's questions ---------------
+
+/// `LocalReAlloc(handle, size, flags)`: the same arena as everything else.
+///
+/// A null handle is an allocate, which is the form the CRT's own boot uses;
+/// `LMEM_MODIFY` is ignored because every block here is already movable.
+fn local_realloc(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let pointer = call.arg(0)?;
+    let size = call.arg(1)?;
+    if pointer == 0 {
+        return match host.allocate(size, 8) {
+            Ok(pointer) => Ok(Return(pointer)),
+            Err(error) => Ok(Return(refuse(host, call, "LocalReAlloc", size, error))),
+        };
+    }
+    match host.reallocate(call.memory, pointer, size, 8) {
+        Ok(pointer) => Ok(Return(pointer)),
+        Err(error) => Ok(Return(refuse(host, call, "LocalReAlloc", size, error))),
+    }
+}
+
+fn global_realloc(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let pointer = call.arg(0)?;
+    let size = call.arg(1)?;
+    if pointer == 0 {
+        return match host.allocate(size, 8) {
+            Ok(pointer) => Ok(Return(pointer)),
+            Err(error) => Ok(Return(refuse(host, call, "GlobalReAlloc", size, error))),
+        };
+    }
+    match host.reallocate(call.memory, pointer, size, 8) {
+        Ok(pointer) => Ok(Return(pointer)),
+        Err(error) => Ok(Return(refuse(host, call, "GlobalReAlloc", size, error))),
+    }
+}
+
+/// `GlobalFree(handle)`: success is `NULL`, which is the one Win32 call that
+/// reports success that way.
+fn global_free(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let pointer = call.arg(0)?;
+    if pointer != 0 {
+        host.release(pointer);
+    }
+    Ok(Return(0))
+}
+
+/// `GlobalHandle(pointer)`: every block is its own handle here, because the one
+/// arena hands out addresses rather than a second level of indirection.
+fn global_handle(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(call.arg(0)?))
+}
+
+/// `GlobalFlags(handle)`: no lock count and no discardable block.
+fn global_flags(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(0))
+}
+
+/// `GlobalAddAtomA(name)`: one id per distinct string, as Windows does not
+/// promise -- but a guest that adds the same name twice only leaks ids if this
+/// does not, and the register classes a window uses do exactly that.
+fn global_add_atom(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let text = call.cstr(0)?;
+    if let Some((id, _)) = host
+        .atoms
+        .iter()
+        .find(|(_, atom)| atom.eq_ignore_ascii_case(&text))
+    {
+        return Ok(Return(*id));
+    }
+    host.next_atom += 1;
+    let id = 0xc000 + host.next_atom;
+    host.atoms.insert(id, text);
+    Ok(Return(id))
+}
+
+fn global_delete_atom(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let id = call.arg(0)?;
+    if host.atoms.remove(&id).is_some() {
+        return Ok(Return(0));
+    }
+    // The one failure value is the id itself, which is what Windows answers.
+    Ok(Return(id))
+}
+
+fn global_get_atom_name(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let id = call.arg(0)?;
+    let buffer = call.arg(1)?;
+    let capacity = call.arg(2)?;
+    let Some(atom) = host.atoms.get(&id).cloned() else {
+        host.last_error = ERROR_INVALID_HANDLE;
+        return Ok(Return(0));
+    };
+    if buffer == 0 || capacity == 0 {
+        return Ok(Return(0));
+    }
+    let bytes = atom.as_bytes();
+    let written = (capacity as usize - 1).min(bytes.len());
+    call.write(buffer, &bytes[..written])?;
+    call.write(buffer.wrapping_add(written as u32), &[0])?;
+    Ok(Return(written as u32))
+}
+
+/// `MulDiv(a, b, c)`: `a * b / c`, rounded to the nearest integer, which is what
+/// GDI's scaling and the game's own fixed-point helpers rely on.
+fn mul_div(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let (a, b, c) = (call.arg(0)? as i32, call.arg(1)? as i32, call.arg(2)? as i32);
+    if c == 0 {
+        return Ok(Return(u32::MAX));
+    }
+    let product = i64::from(a) * i64::from(b);
+    let divisor = i64::from(c);
+    let rounded = if (product < 0) != (divisor < 0) {
+        (product - divisor / 2) / divisor
+    } else {
+        (product + divisor / 2) / divisor
+    };
+    Ok(Return(rounded as i32 as u32))
+}
+
+/// `GetCurrentThread()`: the pseudo-handle `(HANDLE)-2`, which is a constant and
+/// not something this host has to keep anywhere.
+fn get_current_thread(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(0xffff_fffe))
+}
+
+/// `GetFullPathNameA(name, len, buffer, file_part)`.
+///
+/// The working directory is `"."`, so the absolute path of a relative name is
+/// the name itself. Answering the name is what a guest that echoes its own path
+/// expects; inventing a drive letter would be a path it cannot open.
+fn get_full_path_name(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let name = call.cstr(0)?;
+    let capacity = call.arg(1)?;
+    let buffer = call.arg(2)?;
+    let required = name.len() as u32 + 1;
+    if buffer != 0 && capacity >= required {
+        call.write(buffer, name.as_bytes())?;
+        call.write(buffer.wrapping_add(name.len() as u32), &[0])?;
+    }
+    Ok(Return(required))
+}
+
+fn get_priority_class(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(0x20))
+}
+
+fn set_priority_class(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(1))
+}
+
+fn get_thread_priority(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(0))
+}
+
+fn get_process_version(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(0x0004_0000))
+}
+
+/// `GetVolumeInformationA`: one volume, named and serialled, on FAT.
+///
+/// The serial is the part a guest checks: a game that copies its CD's volume
+/// serial into a save and compares it later needs the same number both times,
+/// not a real disc.
+fn get_volume_information(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let name = call.arg(1)?;
+    let name_capacity = call.arg(2)?;
+    let serial = call.arg(3)?;
+    let max_component = call.arg(4)?;
+    let flags = call.arg(5)?;
+    let fs_name = call.arg(6)?;
+    let fs_capacity = call.arg(7)?;
+    write_capped(call, name, name_capacity, b"HERCULES")?;
+    write_capped(call, fs_name, fs_capacity, b"FAT")?;
+    if serial != 0 {
+        call.write(serial, &0x4843_5245_u32.to_le_bytes())?;
+    }
+    if max_component != 0 {
+        call.write(max_component, &255_u32.to_le_bytes())?;
+    }
+    if flags != 0 {
+        call.write(flags, &0_u32.to_le_bytes())?;
+    }
+    Ok(Return(1))
+}
+
+/// Writes a NUL-terminated string into a Win32 buffer, taking at most
+/// `capacity` bytes including the terminator.
+fn write_capped(call: &mut Call<'_>, buffer: u32, capacity: u32, text: &[u8]) -> Result<()> {
+    if buffer == 0 || capacity == 0 {
+        return Ok(());
+    }
+    let take = (capacity as usize - 1).min(text.len());
+    call.write(buffer, &text[..take])?;
+    call.write(buffer.wrapping_add(take as u32), &[0])?;
+    Ok(())
+}
+
+fn set_error_mode(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(0))
+}
+
+/// `SuspendThread(handle)`: raises the thread's suspend count and answers the
+/// previous one, or -1 for a handle that names no thread. A count that was
+/// zero parks the thread wherever it is; suspending the running thread hands
+/// the CPU to whoever can run, the way a wait does. Hercules stages the next
+/// video segment on its worker into the buffer the main thread decodes out
+/// of, and the two take turns with suspend and resume -- a no-op here lets
+/// the worker lap the decoder, which then walks a table the next stage
+/// overwrote.
+fn suspend_thread(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let handle = call.arg(0)?;
+    let Some(id) = thread_id_of(host, handle) else {
+        if std::env::var("SHIMKIT_LOG_SUSPEND").is_ok() {
+            host.notice(format!(
+                "SuspendThread({handle:#x}): no such thread, on thread {}",
+                host.current_thread
+            ));
+        }
+        return Ok(Return(u32::MAX));
+    };
+    let previous = host.suspend_counts.get(&id).copied().unwrap_or(0);
+    host.suspend_counts.insert(id, previous.saturating_add(1));
+    host.suspends_dirty = true;
+    // A thread that suspends itself stops here, which is where Windows stops it:
+    // inside the call, not at the next instruction. `Session::enter` also parks a
+    // thread it finds unsaved on the way out, so this is the semantics rather
+    // than the safety net -- but it is the difference between the worker parking
+    // *in* `SuspendThread` and the count alone making it unrunnable, and it was
+    // the latter that used to lose the worker's place. Hercules' video loader
+    // suspends itself between segments, and a resume that landed back at its
+    // entry point made it re-read the first block's length for every segment.
+    if id == host.current_thread {
+        host.thread_want = Some(ThreadWant::Yield);
+    }
+    if std::env::var("SHIMKIT_LOG_SUSPEND").is_ok() {
+        host.notice(format!(
+            "SuspendThread({handle:#x}) suspends thread {id} (was {previous})"
+        ));
+    }
+    Ok(Return(previous))
+}
+
+fn terminate_thread(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(1))
+}
+
+/// `WritePrivateProfileStringA`: there is no INI and no reader that would see
+/// one. A guest's settings live in the files it writes, which the page keeps.
+fn write_private_profile_string(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let _ = (call.arg(0)?, call.arg(1)?, call.arg(2)?, call.arg(3)?);
+    Ok(Return(1))
+}
+
+fn lstrcat(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let destination = call.arg(0)?;
+    let source = call.arg(1)?;
+    let mut joined = read_bytes_until_nul(call.memory, destination)?;
+    joined.extend_from_slice(&read_bytes_until_nul(call.memory, source)?);
+    joined.push(0);
+    call.write(destination, &joined)?;
+    Ok(Return(destination))
+}
+
+/// `lstrcmpA`: the case-sensitive comparison, answered the way `strcmp` orders
+/// bytes. The guest only reads the sign.
+fn lstrcmp(_: &mut Host, call: &mut Call<'_>)-> Result<Action> {
+    let left = read_bytes_until_nul(call.memory, call.arg(0)?)?;
+    let right = read_bytes_until_nul(call.memory, call.arg(1)?)?;
+    Ok(Return(match left.cmp(&right) {
+        std::cmp::Ordering::Less => u32::MAX,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }))
+}
 
 // ---- process and version -------------------------------------------------
 
-fn get_version(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
-    Ok(Return(WINDOWS_VERSION))
+/// `GetVersion()`: the platform the target declares, packed the way a guest
+/// reads it. See [`crate::target::Windows`] for why the packing matters.
+fn get_version(host: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(host.target.windows.code()))
 }
 
-/// `GetVersionExA(info)`: the same Windows XP `GetVersion` answers, written into
-/// an `OSVERSIONINFOA`. The guest states how much it allocated in the first
-/// field, and a buffer too small for a field is left alone.
-fn get_version_ex(_: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+/// `GetVersionExA(info)`: the same platform `GetVersion` answers, written into an
+/// `OSVERSIONINFOA`. The guest states how much it allocated in the first field,
+/// and a buffer too small for a field is left alone.
+fn get_version_ex(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     const CSD_BYTES: u32 = 128;
+    let windows = host.target.windows;
     let info = call.arg(0)?;
     if info == 0 {
         return Ok(Return(0));
     }
     let size = call.memory.read_u32(info)?;
     let fields = [
-        (4, 5),    // dwMajorVersion
-        (8, 1),    // dwMinorVersion
-        (12, 2600), // dwBuildNumber
-        (16, 2),   // dwPlatformId: VER_PLATFORM_WIN32_NT
+        (4, u32::from(windows.major)),
+        (8, u32::from(windows.minor)),
+        (12, u32::from(windows.build)),
+        (16, windows.platform),
     ];
     for (offset, value) in fields {
         if size >= offset + 4 {
@@ -430,10 +727,42 @@ fn release_semaphore(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     Ok(Return(1))
 }
 
-/// `ResumeThread` and `SuspendThread`: a thread this host starts runs from the
-/// moment it is created, so the previous suspend count was the only one.
-fn resume_thread(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
-    Ok(Return(1))
+/// `ResumeThread(handle)`: lowers the thread's suspend count and answers the
+/// previous one, or -1 for a handle that names no thread. Reaching zero
+/// leaves the thread runnable; it runs when the scheduler reaches it, not
+/// ahead of whoever is running. Resuming a thread that is not suspended
+/// answers zero and changes nothing.
+fn resume_thread(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let handle = call.arg(0)?;
+    let Some(id) = thread_id_of(host, handle) else {
+        if std::env::var("SHIMKIT_LOG_SUSPEND").is_ok() {
+            host.notice(format!("ResumeThread({handle:#x}): no such thread"));
+        }
+        return Ok(Return(u32::MAX));
+    };
+    let previous = host.suspend_counts.get(&id).copied().unwrap_or(0);
+    if previous > 0 {
+        host.suspend_counts.insert(id, previous - 1);
+        host.suspends_dirty = true;
+    }
+    if std::env::var("SHIMKIT_LOG_SUSPEND").is_ok() {
+        host.notice(format!(
+            "ResumeThread({handle:#x}) resumes thread {id} (was {previous})"
+        ));
+    }
+    Ok(Return(previous))
+}
+
+/// The thread `handle` names: a real thread handle from `CreateThread`, or
+/// the `-2` pseudo-handle `GetCurrentThread` hands out for the caller itself.
+fn thread_id_of(host: &Host, handle: u32) -> Option<u32> {
+    if handle == 0xffff_fffe {
+        return Some(host.current_thread);
+    }
+    match host.objects.get(handle) {
+        Some(Object::Thread { id, .. }) => Some(id),
+        _ => None,
+    }
 }
 
 /// `GetDriveTypeA(root)`: the payload is a folder on a fixed disk, which is the
@@ -973,12 +1302,18 @@ fn create_event(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
 
 /// `CreateMutexA(attributes, initialOwner, name)`: owned by the creating thread
 /// when the guest asked for that, which is what a single-instance check does.
+///
+/// A fresh mutex reports no error. Madagascar tests its single-instance mutex
+/// with `GetLastError` immediately after creating one, so a stale error from an
+/// earlier import -- `ERROR_ALREADY_EXISTS` among them -- would make it conclude
+/// that another copy of the game is running and exit at boot.
 fn create_mutex(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let owner = if call.arg(1)? != 0 {
         host.current_thread
     } else {
         NO_OWNER
     };
+    host.last_error = 0;
     Ok(Return(host.objects.insert(Object::Mutex { owner })))
 }
 
@@ -1019,6 +1354,14 @@ fn create_thread(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         return Ok(Return(0));
     }
     let (handle, id) = host.objects.insert_thread();
+    // Which routine a new thread starts in, on request: `SHIMKIT_LOG_THREADS=1`.
+    // Unconditional it cost a notice per spawn, and the page shows the notice
+    // trail as its diagnostic, so the line pushed a real stop reason aside.
+    if std::env::var("SHIMKIT_LOG_THREADS").is_ok() && host.notices.len() < 600 {
+        host.notice(format!(
+            "CreateThread #{id} entry {entry:#010x} param {parameter:#010x}"
+        ));
+    }
     let thread_id = call.arg(5)?;
     if thread_id != 0 {
         call.write_u32(thread_id, id)?;
@@ -1294,17 +1637,48 @@ fn get_module_handle(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         // `GetModuleHandleA(NULL)` is the program itself.
         return Ok(Return(IMAGE_BASE));
     }
-    let text = call.memory.read_cstr(name)?;
+    let text = dll_name(&call.memory.read_cstr(name)?);
     if text.eq_ignore_ascii_case(host.target.exe_name) {
         return Ok(Return(IMAGE_BASE));
+    }
+    if let Some(loaded) = guest_module(host, &text) {
+        return Ok(Return(loaded.base));
     }
     match module_handle(host, &text) {
         Some(handle) => Ok(Return(handle)),
         None => {
+            // Not a DLL this host answers from a shim table. It may still be a
+            // DLL the payload carries: the session maps that one, because
+            // mapping needs guest memory and the dispatch table.
+            if host.files.contents(&text).is_some() {
+                host.load_module = Some(text);
+                return Ok(Return(0));
+            }
             host.last_error = ERROR_MOD_NOT_FOUND;
+            refuse_module(host, &text);
             Ok(Return(0))
         }
     }
+}
+
+/// Records a module this host cannot answer for.
+///
+/// A guest that asks for its engine and gets nothing usually gives up, and on a
+/// host that has no window to complain in a quiet exit is the whole diagnostic.
+/// Said once per name, so a loop that retries does not fill the log.
+fn refuse_module(host: &mut Host, name: &str) {
+    if host.notices.len() >= 600
+        || host
+            .notices
+            .iter()
+            .any(|notice| notice.contains(name) && notice.starts_with("no module"))
+    {
+        return;
+    }
+    host.notice(format!(
+        "no module named {name:?}: this host answers no shim table for it, and the payload \
+         carries no file of that name to map"
+    ));
 }
 
 /// `GetModuleHandleW(name)`: the same question with a wide name.
@@ -1313,17 +1687,36 @@ fn get_module_handle_w(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     if name == 0 {
         return Ok(Return(IMAGE_BASE));
     }
-    let text = call.wstr(name)?;
+    let text = dll_name(&call.wstr(name)?);
     if text.eq_ignore_ascii_case(host.target.exe_name) {
         return Ok(Return(IMAGE_BASE));
+    }
+    if let Some(loaded) = guest_module(host, &text) {
+        return Ok(Return(loaded.base));
     }
     match module_handle(host, &text) {
         Some(handle) => Ok(Return(handle)),
         None => {
+            // Not a DLL this host answers from a shim table. It may still be a
+            // DLL the payload carries: the session maps that one, because
+            // mapping needs guest memory and the dispatch table.
+            if host.files.contents(&text).is_some() {
+                host.load_module = Some(text);
+                return Ok(Return(0));
+            }
             host.last_error = ERROR_MOD_NOT_FOUND;
+            refuse_module(host, &text);
             Ok(Return(0))
         }
     }
+}
+
+/// A DLL the payload carried and the guest has already loaded, by name or path.
+fn guest_module<'a>(host: &'a Host, name: &str) -> Option<&'a crate::shim::GuestModule> {
+    let leaf = name.rsplit(['\\', '/']).next().unwrap_or(name);
+    host.guest_modules
+        .iter()
+        .find(|module| module.name.eq_ignore_ascii_case(leaf))
 }
 
 /// Where a module handle for a DLL this host answers for starts.
@@ -1340,6 +1733,21 @@ const ERROR_MOD_NOT_FOUND: u32 = 126;
 const ERROR_PROC_NOT_FOUND: u32 = 127;
 
 /// The handle for a DLL name, allocated on first use so two calls agree.
+/// A module name with the default extension, which is how Windows matches one:
+/// `GetModuleHandleA("KERNEL32")` is `KERNEL32.dll`.
+///
+/// The C runtime asks for the kernel exactly that way during start-up, so
+/// answering only the spelled-out name made the call fail -- and a library that
+/// cannot find the kernel it stands on stops rather than saying why.
+fn dll_name(name: &str) -> String {
+    let leaf = name.rsplit(['\\', '/']).next().unwrap_or(name);
+    if leaf.contains('.') {
+        name.to_owned()
+    } else {
+        format!("{name}.dll")
+    }
+}
+
 fn module_handle(host: &mut Host, name: &str) -> Option<u32> {
     // A path loads the file it names, and what this host answers for is the
     // file's basename: `C:\Game\dinput8.dll` is the same DLL as `dinput8.dll`,
@@ -1486,6 +1894,16 @@ fn sleep(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     if milliseconds == 0 {
         host.thread_want = Some(ThreadWant::Yield);
         return Ok(Return(0));
+    }
+    // A sleep this long is not a wait, it is a retirement: Madagascar's one-shot
+    // job threads end with `Sleep(INFINITE)` and are never entered again, and
+    // every one of them keeps the whole stack `_beginthread` gave it. One line
+    // per occurrence is how the accumulation is seen before it is a problem.
+    if milliseconds >= 3_600_000 && host.notices.len() < 600 {
+        host.notice(format!(
+            "thread {} sleeps {milliseconds} ms; nothing here will wake it",
+            host.current_thread
+        ));
     }
     // A waiter with no handle is a sleep: nothing can signal it, and its
     // deadline is what ends it.
@@ -1665,7 +2083,6 @@ fn map_view_of_file(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     };
     let offset = ((offset_high as u64) << 32) | u64::from(offset_low);
     let (contents, mapped) = (mapping.bytes.clone(), mapping.size);
-    drop(mapping);
     let view = if bytes == 0 {
         mapped.saturating_sub(offset as u32)
     } else {
@@ -1853,13 +2270,20 @@ fn load_library(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         host.last_error = ERROR_MOD_NOT_FOUND;
         return Ok(Return(0));
     }
-    let text = call.memory.read_cstr(name)?;
+    let text = dll_name(&call.memory.read_cstr(name)?);
     if std::env::var("SHIMKIT_LOG_USER").is_ok() && host.notices.len() < 600 {
         host.notice(format!("LoadLibraryA {text:?}"));
     }
     match module_handle(host, &text) {
         Some(handle) => Ok(Return(handle)),
         None => {
+            // Not a DLL this host answers from a shim table. It may still be a
+            // DLL the payload carries: the session maps that one, because
+            // mapping needs guest memory and the dispatch table.
+            if host.files.contents(&text).is_some() {
+                host.load_module = Some(text);
+                return Ok(Return(0));
+            }
             host.last_error = ERROR_MOD_NOT_FOUND;
             Ok(Return(0))
         }
@@ -1873,10 +2297,17 @@ fn load_library_w(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         host.last_error = ERROR_MOD_NOT_FOUND;
         return Ok(Return(0));
     }
-    let text = call.wstr(name)?;
+    let text = dll_name(&call.wstr(name)?);
     match module_handle(host, &text) {
         Some(handle) => Ok(Return(handle)),
         None => {
+            // Not a DLL this host answers from a shim table. It may still be a
+            // DLL the payload carries: the session maps that one, because
+            // mapping needs guest memory and the dispatch table.
+            if host.files.contents(&text).is_some() {
+                host.load_module = Some(text);
+                return Ok(Return(0));
+            }
             host.last_error = ERROR_MOD_NOT_FOUND;
             Ok(Return(0))
         }
@@ -1904,6 +2335,22 @@ fn get_proc_address(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         host.notice(format!(
             "GetProcAddress({module:#x}, {wanted:?})"
         ));
+    }
+    // A DLL the guest loaded from the payload answers with its own exports.
+    // There is no import slot behind one of these: the address is guest code.
+    if let Some(loaded) = host.guest_modules.iter().find(|loaded| loaded.base == module) {
+        let found = loaded
+            .exports
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&wanted))
+            .map(|(_, address)| *address);
+        return match found {
+            Some(address) => Ok(Return(address)),
+            None => {
+                host.last_error = ERROR_PROC_NOT_FOUND;
+                Ok(Return(0))
+            }
+        };
     }
     let dll = if module == IMAGE_BASE {
         // The guest's own handle: a program that is its own table of exports is
@@ -2445,6 +2892,71 @@ mod tests {
         (binding.shim)(host, &mut call)
     }
 
+    /// Suspending the pseudo-handle suspends the caller and answers the
+    /// previous count; resuming lowers it. Unknown handles fail with -1.
+    #[test]
+    fn suspend_and_resume_count_by_thread() {
+        let mut memory = GuestMemory::empty(crate::memory::HEAP_BASE as usize + 0x1000)
+            .expect("blank memory");
+        let mut host = Host::new();
+        host.current_thread = 0;
+
+        // Unknown handles fail instead of suspending nothing.
+        let Return(failed) =
+            blank_call(&mut host, &mut memory, "SuspendThread", &[0x1234]).unwrap()
+        else {
+            panic!("a bad handle fails")
+        };
+        assert_eq!(failed, u32::MAX);
+        let Return(failed) =
+            blank_call(&mut host, &mut memory, "ResumeThread", &[0x1234]).unwrap()
+        else {
+            panic!("a bad handle fails")
+        };
+        assert_eq!(failed, u32::MAX);
+        assert!(host.suspend_counts.is_empty());
+
+        // The `-2` pseudo-handle is the caller itself.
+        let Return(previous) =
+            blank_call(&mut host, &mut memory, "SuspendThread", &[0xffff_fffe]).unwrap()
+        else {
+            panic!("the first suspend answers")
+        };
+        assert_eq!(previous, 0);
+        let Return(previous) =
+            blank_call(&mut host, &mut memory, "SuspendThread", &[0xffff_fffe]).unwrap()
+        else {
+            panic!("the second suspend answers")
+        };
+        assert_eq!(previous, 1);
+        assert_eq!(host.suspend_counts.get(&0), Some(&2));
+        assert!(host.suspends_dirty);
+        // Suspending itself asks the session to park it. The count alone makes
+        // the thread unrunnable, and a switch taken on that alone leaves the
+        // record holding the context the thread was spawned with -- so it comes
+        // back at its entry instead of after the call. Hercules' video worker
+        // suspends itself between segments, and restarting at its entry made it
+        // re-read the first block's length for every segment.
+        assert_eq!(host.thread_want, Some(ThreadWant::Yield));
+        host.thread_want = None;
+
+        // Resuming answers what the count was and lowers it; resuming a
+        // running thread answers zero and changes nothing.
+        let Return(previous) =
+            blank_call(&mut host, &mut memory, "ResumeThread", &[0xffff_fffe]).unwrap()
+        else {
+            panic!("the resume answers")
+        };
+        assert_eq!(previous, 2);
+        let Return(previous) =
+            blank_call(&mut host, &mut memory, "ResumeThread", &[0xffff_fffe]).unwrap()
+        else {
+            panic!("the last resume answers")
+        };
+        assert_eq!(previous, 1);
+        assert_eq!(host.suspend_counts.get(&0), Some(&0));
+    }
+
     #[test]
     fn a_mapped_file_reads_where_the_view_points() {
         let mut memory = GuestMemory::empty(crate::memory::HEAP_BASE as usize + 0x1000)
@@ -2464,7 +2976,6 @@ mod tests {
         };
         assert_ne!(mapping, 0);
 
-        let view = STACK_BASE - 0x160;
         let Return(address) = blank_call(
             &mut host,
             &mut memory,
@@ -2695,9 +3206,43 @@ mod tests {
         };
         assert_eq!(
             call_shim(&mut host, &mut memory, "GetVersion", &[]).unwrap(),
-            Return(WINDOWS_VERSION)
+            Return(0x0a28_8501)
         );
-        assert_eq!(WINDOWS_VERSION & 0xff, 5, "major version 5");
+        // `GetVersion`'s own packing: the Win32s bit, then major, then minor in
+        // the low word, and the build in the high word.
+        let code = crate::target::Windows::XP.code();
+        assert_eq!(code & 0x8000_0000, 0x8000_0000, "NT, not Win32s");
+        assert_eq!((code >> 8) & 0xff, 5, "major version 5");
+        assert_eq!(code & 0xff, 1, "minor version 1");
+        assert_eq!(code >> 16, 2600, "build 2600");
+    }
+
+    #[test]
+    fn a_target_can_ask_to_be_a_windows_98_machine() {
+        let Some((_, mut memory)) = machine() else {
+            return;
+        };
+        // A target of its own, because the default is the XP one every other
+        // test reads.
+        let mut target = crate::target::Target::EMPTY;
+        target.windows = crate::target::Windows::WIN98;
+        let target: &'static crate::target::Target = Box::leak(Box::new(target));
+        let mut host = crate::shim::Host::with_target(target);
+        // 4.10 build 2222: the Win32s bit clear, because Win9x sets none.
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "GetVersion", &[]).unwrap(),
+            Return(0x08ae_840a)
+        );
+        let info = crate::memory::STACK_BASE + 0x7000;
+        memory.write_u32(info, 148).unwrap();
+        assert_eq!(
+            call_shim(&mut host, &mut memory, "GetVersionExA", &[info]).unwrap(),
+            Return(1)
+        );
+        assert_eq!(memory.read_u32(info + 4).unwrap(), 4, "major 4");
+        assert_eq!(memory.read_u32(info + 8).unwrap(), 10, "minor 10");
+        assert_eq!(memory.read_u32(info + 12).unwrap(), 2222, "build 2222");
+        assert_eq!(memory.read_u32(info + 16).unwrap(), 1, "Win9x platform id");
     }
 
     #[test]
@@ -3246,5 +3791,30 @@ mod tests {
             Return(0)
         );
         assert_eq!(host.thread_want.take(), Some(ThreadWant::Yield));
+    }
+
+    /// A sleep measured in hours is a worker parking for good -- Madagascar's
+    /// job threads end with `Sleep(INFINITE)` -- and each one keeps its whole
+    /// stack for the rest of the session, so the run says so out loud.
+    #[test]
+    fn a_sleep_long_enough_to_be_forever_leaves_a_line() {
+        let Some((mut host, mut memory)) = blank() else {
+            return;
+        };
+        host.current_thread = 2;
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "Sleep", &[0xffff_ffff]).unwrap(),
+            Return(0)
+        );
+        assert_eq!(host.notices.len(), 1);
+        assert!(host.notices[0].contains("thread 2"), "{}", host.notices[0]);
+        assert!(host.notices[0].contains("4294967295"), "{}", host.notices[0]);
+
+        // An ordinary wait is nobody's business.
+        assert_eq!(
+            blank_call(&mut host, &mut memory, "Sleep", &[500]).unwrap(),
+            Return(0)
+        );
+        assert_eq!(host.notices.len(), 1, "an ordinary sleep is not news");
     }
 }

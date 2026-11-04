@@ -10,9 +10,12 @@
 
 import { join, resolve } from "node:path";
 
+import { mergedIndex, payloadFile, payloadRoots } from "./payloads";
+
 import { recorder } from "./gl-recorder";
 
 const root = resolve(process.argv[2] ?? "demo");
+const roots = payloadRoots(resolve(root, ".."));
 
 let failures = 0;
 function check(condition: boolean, message: string): void {
@@ -105,6 +108,11 @@ const server = Bun.serve({
   port: 0,
   async fetch(request) {
     const path = decodeURIComponent(new URL(request.url).pathname);
+    if (path === "/payloads/index.json") return Response.json(await mergedIndex(roots));
+    if (path.startsWith("/payloads/")) {
+      const file = await payloadFile(roots, path.slice("/payloads/".length));
+      return file ? new Response(file) : new Response("not found", { status: 404 });
+    }
     const file = Bun.file(join(root, path === "/" ? "index.html" : path));
     if (!(await file.exists())) return new Response("not found", { status: 404 });
     return new Response(file);

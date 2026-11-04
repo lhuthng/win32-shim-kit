@@ -33,7 +33,7 @@
 //! over the network writes nothing anywhere but its own storage.
 use std::collections::{BTreeSet, HashMap};
 
-use crate::shim::{Action, Binding, Call, Host};
+use crate::shim::{Action, Binding, Call, FileApc, Host};
 use crate::Result;
 
 use Action::Return;
@@ -507,16 +507,43 @@ impl Files {
 
     /// Every file matching a `FindFirstFileA` pattern, in the order Windows
     /// enumerates a directory: by name.
+    ///
+    /// The pattern's directory is part of the match, so `sprite\Loading\*`
+    /// answers with the files in that folder and not with every file of that
+    /// shape in the payload. A leading `.` is the working directory, which is
+    /// the payload's root. A pattern nothing matches as a whole path is tried as
+    /// a bare name, which is what a caller that glued a path of its own onto the
+    /// name expects.
     fn matches(&self, pattern: &str) -> Vec<(String, u32)> {
-        let pattern = basename(&normalize(pattern));
+        let pattern = normalize(pattern);
+        let pattern = pattern.strip_prefix(".\\").unwrap_or(&pattern).to_string();
+        let mut found = self.matched(&pattern, true);
+        if found.is_empty() {
+            found = self.matched(&basename(&pattern), false);
+        }
+        found
+    }
+
+    /// The matches of one wildcard, against the whole key when `path` is set and
+    /// against each entry's name when it is not.
+    fn matched(&self, pattern: &str, path: bool) -> Vec<(String, u32)> {
         // A name the guest wrote wins over the payload's copy, length and all.
         let mut found: HashMap<String, u32> = HashMap::new();
+        // A Win32 search reports the two directory entries of the folder it
+        // looked in, and a guest that walks a listing counts on them: this
+        // game's loading screen throws its first hit away as `.` before it
+        // collects the pictures.
+        if wildcard(&basename(pattern), ".") {
+            found.insert(".".to_string(), 0);
+            found.insert("..".to_string(), 0);
+        }
         for (key, entry) in self.install.iter().chain(self.saved.iter()) {
             let name = basename(key);
             if self.removed.contains(&name) {
                 continue;
             }
-            if wildcard(&pattern, &name) {
+            let subject = if path { normalize(key) } else { name.clone() };
+            if wildcard(pattern, &subject) {
                 found.insert(name, entry.length);
             }
         }
@@ -589,6 +616,11 @@ fn normalize(path: &str) -> String {
     path.replace('/', "\\").to_lowercase()
 }
 
+/// Whether this search result is one of the folder's own entries.
+fn directory(name: &str) -> bool {
+    name == "." || name == ".."
+}
+
 fn basename(path: &str) -> String {
     path.rsplit('\\').next().unwrap_or(path).to_string()
 }
@@ -596,6 +628,7 @@ fn basename(path: &str) -> String {
 pub const SHIMS: &[Binding] = &[
     Binding { dll: KERNEL32, name: "CreateFileA", arg_bytes: 28, shim: create_file },
     Binding { dll: KERNEL32, name: "ReadFile", arg_bytes: 20, shim: read_file },
+    Binding { dll: KERNEL32, name: "ReadFileEx", arg_bytes: 20, shim: read_file_ex },
     Binding { dll: KERNEL32, name: "SetFilePointer", arg_bytes: 16, shim: set_file_pointer },
     Binding { dll: KERNEL32, name: "WriteFile", arg_bytes: 20, shim: write_file },
     Binding { dll: KERNEL32, name: "SetEndOfFile", arg_bytes: 4, shim: set_end_of_file },
@@ -740,7 +773,11 @@ fn write_find_data(
     name: &str,
     length: u32,
 ) -> Result<()> {
-    call.write_u32(destination, 0x80)?;
+    // `FILE_ATTRIBUTE_ARCHIVE`, which is what Windows reports for an ordinary
+    // file. `FILE_ATTRIBUTE_NORMAL` is only an input to `SetFileAttributes`, and
+    // a guest that tests for the archive bit saw every file as something else.
+    // The two directory entries a search reports say they are directories.
+    call.write_u32(destination, if directory(name) { 0x10 } else { 0x20 })?;
     for offset in [4, 12, 20] {
         call.write_u32(destination + offset, 0xD2B0_9E00)?;
         call.write_u32(destination + offset + 4, 0x01D5_CC00)?;
@@ -754,7 +791,7 @@ fn write_find_data(
 /// `FindFirstFileW(pattern, &find_data)`: the same search, with a wide pattern
 /// and a wide `WIN32_FIND_DATAW`.
 fn find_first_file_w(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
-    let pattern = call.wstr(0)?;
+    let pattern = call.wstr(call.arg(0)?)?;
     let destination = call.arg(1)?;
     if destination == 0 {
         host.last_error = 87;
@@ -777,7 +814,8 @@ fn write_find_data_w(
     name: &str,
     length: u32,
 ) -> Result<()> {
-    call.write_u32(destination, 0x80)?;
+    // `FILE_ATTRIBUTE_ARCHIVE`, as in the ANSI structure.
+    call.write_u32(destination, if directory(name) { 0x10 } else { 0x20 })?;
     for offset in [4, 12, 20] {
         call.write_u32(destination + offset, 0xD2B0_9E00)?;
         call.write_u32(destination + offset + 4, 0x01D5_CC00)?;
@@ -900,29 +938,16 @@ fn read_file(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
             "read {handle:#x} {requested} bytes (overlapped {overlapped:#x}, offset {at:?})"
         ));
     }
-    let Some((entry, position)) = host.files.file(handle) else {
-        host.last_error = ERROR_INVALID_HANDLE;
+    let Some((count, position)) = transfer(host, call, handle, destination, requested, at)? else {
         return Ok(Return(0));
     };
-    // A read at or past the end of the file transfers nothing, which a guest
-    // that seeked past the end (or posted an overlapped read there) is allowed to
-    // ask for: the position is clamped so the slice below stays inside the bytes.
-    let position = at.unwrap_or(position).min(entry.length);
-    // Short reads are legal: the guest reads in chunks and stops at zero.
-    let available = entry.length.saturating_sub(position);
-    let count = requested.min(available);
-    if entry.bytes.is_empty() && count > 0 {
-        // A synthetic entry, so the bytes are zeroes. The first time that happens
-        // is worth saying out loud: the guest was supposed to measure this file,
-        // not read it.
-        if host.files.synthetic_reads == 0 {
-            host.notice("read from a synthetic CD marker: the guest wanted its contents".to_string());
-        }
-        host.files.synthetic_reads += 1;
-        call.zero(destination, count)?;
-    } else {
-        let chunk = entry.bytes[position as usize..position as usize + count as usize].to_vec();
-        call.write(destination, &chunk)?;
+    // A short read leaves the rest of the guest's buffer as it was, and a
+    // streamer that trusts its own size table walks into that stale data: the
+    // count is worth a line of its own rather than being inferred.
+    if std::env::var("SHIMKIT_LOG_READS").is_ok() && host.notices.len() < 900 {
+        host.notice(format!(
+            "read {handle:#x} gave {count}/{requested} at {position}"
+        ));
     }
     if copied_out != 0 {
         call.write_u32(copied_out, count)?;
@@ -948,6 +973,101 @@ fn read_file(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         host.files.seek(handle, position.saturating_add(count));
     }
     host.files.bytes_read += u64::from(count);
+    Ok(Return(1))
+}
+
+/// The bytes one read transfers, and the file position it read from.
+///
+/// A read at or past the end of the file transfers nothing, which a guest that
+/// seeked past the end (or posted an overlapped read there) is allowed to ask
+/// for: the position is clamped so the slice stays inside the bytes. Short
+/// reads are legal: the guest reads in chunks and stops at zero. A synthetic
+/// entry reads as zeroes, exactly as `ReadFile` answers it, and the first read
+/// from one is worth saying out loud: the guest was supposed to measure this
+/// file, not read it. `None` is an invalid handle.
+fn transfer(
+    host: &mut Host,
+    call: &mut Call<'_>,
+    handle: u32,
+    destination: u32,
+    requested: u32,
+    at: Option<u32>,
+) -> Result<Option<(u32, u32)>> {
+    let Some((entry, position)) = host.files.file(handle) else {
+        host.last_error = ERROR_INVALID_HANDLE;
+        return Ok(None);
+    };
+    let position = at.unwrap_or(position).min(entry.length);
+    let available = entry.length.saturating_sub(position);
+    let count = requested.min(available);
+    if entry.bytes.is_empty() && count > 0 {
+        if host.files.synthetic_reads == 0 {
+            host.notice("read from a synthetic CD marker: the guest wanted its contents".to_string());
+        }
+        host.files.synthetic_reads += 1;
+        call.zero(destination, count)?;
+    } else {
+        let chunk = entry.bytes[position as usize..position as usize + count as usize].to_vec();
+        call.write(destination, &chunk)?;
+    }
+    Ok(Some((count, position)))
+}
+
+/// `ReadFileEx(handle, buffer, count, overlapped, completion)`.
+///
+/// The read itself is the one `ReadFile` performs overlapped: the bytes land in
+/// the buffer now, the `OVERLAPPED` records them where `GetOverlappedResult`
+/// and an event wait look, and the event fires. What is different is the
+/// completion routine: it is queued for the thread that posted the read, and
+/// the session runs it as guest code on that thread at its next switch point,
+/// the way a timer callback runs. The call answers success because the read is
+/// queued rather than done -- in this host the bytes are already in memory, so
+/// the queue only decides when the guest is told.
+fn read_file_ex(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let handle = call.arg(0)?;
+    let destination = call.arg(1)?;
+    let requested = call.arg(2)?;
+    let overlapped = call.arg(3)?;
+    let completion = call.arg(4)?;
+    if overlapped == 0 || completion == 0 {
+        // There is no non-overlapped form, and no routine to run would leave a
+        // completion that can never report itself.
+        host.last_error = 87; // ERROR_INVALID_PARAMETER
+        return Ok(Return(0));
+    }
+    let low = call.memory.read_u32(overlapped.wrapping_add(8))?;
+    let high = call.memory.read_u32(overlapped.wrapping_add(12))?;
+    if high != 0 {
+        host.last_error = 87; // ERROR_INVALID_PARAMETER
+        return Ok(Return(0));
+    }
+    let Some((count, _)) = transfer(host, call, handle, destination, requested, Some(low))?
+    else {
+        return Ok(Return(0));
+    };
+    if std::env::var("SHIMKIT_LOG_FILES").is_ok() && host.notices.len() < 600 {
+        host.notice(format!(
+            "read {handle:#x} {requested} bytes overlapped {overlapped:#x}, completion {completion:#010x}"
+        ));
+    }
+    call.write_u32(overlapped, 0)?; // Internal: STATUS_SUCCESS
+    call.write_u32(overlapped.wrapping_add(4), count)?; // InternalHigh: transferred
+    let event = call.memory.read_u32(overlapped.wrapping_add(16))?;
+    if event != 0 {
+        host.objects.signal(event);
+        host.woken.extend(host.objects.wake(event));
+    }
+    host.files.bytes_read += u64::from(count);
+    // The cursor does not move: an overlapped read owns its own offset, and the
+    // guest is free to seek or to post the next buffer while the completion
+    // waits to run.
+    host.file_apcs.push(FileApc {
+        thread: host.current_thread,
+        entry: completion,
+        error: 0,
+        transferred: count,
+        overlapped,
+    });
     Ok(Return(1))
 }
 
@@ -1001,6 +1121,7 @@ pub(crate) fn file_type(host: &Host, handle: u32) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::memory::{GuestMemory, STACK_BASE};
+    use crate::objects::Object;
 
     fn machine() -> Option<(Host, GuestMemory)> {
         let image = crate::reference_image()?;
@@ -1474,6 +1595,35 @@ mod tests {
         assert_eq!(host.last_error, ERROR_FILE_NOT_FOUND);
     }
 
+    /// A game that lists its own art asks for `.<dir>\*`, the current directory
+    /// glued to a folder: the directory part is not part of the match, because
+    /// the table is keyed by whole paths and every entry is "here".
+    #[test]
+    fn find_first_file_w_matches_a_directory_wildcard() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        host.files.provide("sprite/Loading/1.bmp", vec![1, 2]);
+        let pattern = STACK_BASE + 0xa600;
+        let data = STACK_BASE + 0xa700;
+        for (index, unit) in ".\\sprite\\Loading\\*".encode_utf16().enumerate() {
+            memory
+                .write_u16(pattern + index as u32 * 2, unit)
+                .unwrap();
+        }
+        memory.write_u16(pattern + 34, 0).unwrap();
+        let action = call_shim(&mut host, &mut memory, "FindFirstFileW", &[pattern, data]).unwrap();
+        let Return(search) = action else {
+            panic!("FindFirstFileW returned {action:?}");
+        };
+        assert_ne!(search, INVALID_HANDLE_VALUE);
+        let mut name = Vec::new();
+        for index in 0..13 {
+            name.push(memory.read_u16(data + 44 + index * 2).unwrap());
+        }
+        assert_eq!(String::from_utf16_lossy(&name), "1.bmp");
+    }
+
     #[test]
     fn a_restored_save_is_writable_without_being_a_change() {
         let mut files = Files::default();
@@ -1534,6 +1684,186 @@ mod tests {
             Return(0)
         );
         assert_eq!(host.last_error, ERROR_INVALID_HANDLE);
+    }
+
+    /// An `OVERLAPPED` the way the guest's streaming loader builds one: internal
+    /// results, the offset, and the event that will be signalled.
+    fn write_overlapped(
+        memory: &mut GuestMemory,
+        overlapped: u32,
+        offset: u32,
+        event: u32,
+    ) -> Result<()> {
+        memory.write_u32(overlapped, 0)?; // Internal
+        memory.write_u32(overlapped.wrapping_add(4), 0)?; // InternalHigh
+        memory.write_u32(overlapped.wrapping_add(8), offset)?; // Offset
+        memory.write_u32(overlapped.wrapping_add(12), 0)?; // OffsetHigh
+        memory.write_u32(overlapped.wrapping_add(16), event)?; // hEvent
+        Ok(())
+    }
+
+    #[test]
+    fn a_read_file_ex_fills_the_buffer_records_the_result_and_queues_the_completion() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        host.files.provide("sfx.dat", vec![10, 20, 30, 40, 50, 60]);
+        let handle = open_sfx(&mut host, &mut memory);
+        let buffer = STACK_BASE + 0xb000;
+        let overlapped = STACK_BASE + 0xb100;
+        let completion = STACK_BASE + 0xb200;
+        write_overlapped(&mut memory, overlapped, 2, 0).unwrap();
+        let before = host.files.bytes_read();
+
+        assert_eq!(
+            call_shim(
+                &mut host,
+                &mut memory,
+                "ReadFileEx",
+                &[handle, buffer, 4, overlapped, completion]
+            )
+            .unwrap(),
+            Return(1)
+        );
+        // The bytes are where the guest will look for them, from the offset the
+        // `OVERLAPPED` carries, and the cursor never moved.
+        assert_eq!(memory.read_bytes(buffer, 4).unwrap(), &[30, 40, 50, 60]);
+        assert_eq!(host.files.position(handle), Some(0));
+        assert_eq!(memory.read_u32(overlapped).unwrap(), 0, "Internal");
+        assert_eq!(
+            memory.read_u32(overlapped.wrapping_add(4)).unwrap(),
+            4,
+            "InternalHigh: transferred"
+        );
+        assert_eq!(host.files.bytes_read(), before + 4);
+        // The completion is queued for the thread that posted the read, with the
+        // arguments the routine will be entered with.
+        assert_eq!(host.file_apcs.len(), 1);
+        let apc = host.file_apcs[0];
+        assert_eq!(apc.thread, 0);
+        assert_eq!(apc.entry, completion);
+        assert_eq!(apc.error, 0);
+        assert_eq!(apc.transferred, 4);
+        assert_eq!(apc.overlapped, overlapped);
+    }
+
+    #[test]
+    fn a_read_file_ex_at_the_end_of_the_file_completes_with_zero_bytes() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        host.files.provide("sfx.dat", vec![1, 2]);
+        let handle = open_sfx(&mut host, &mut memory);
+        let buffer = STACK_BASE + 0xb300;
+        let overlapped = STACK_BASE + 0xb400;
+        let completion = STACK_BASE + 0xb500;
+        write_overlapped(&mut memory, overlapped, 2, 0).unwrap();
+        assert_eq!(
+            call_shim(
+                &mut host,
+                &mut memory,
+                "ReadFileEx",
+                &[handle, buffer, 8, overlapped, completion]
+            )
+            .unwrap(),
+            Return(1)
+        );
+        // A read at the end transfers nothing, and Windows still runs the
+        // completion for it: zero bytes is an answer, not a failure.
+        assert_eq!(host.file_apcs.len(), 1);
+        assert_eq!(host.file_apcs[0].transferred, 0);
+        assert_eq!(host.file_apcs[0].error, 0);
+    }
+
+    #[test]
+    fn a_read_file_ex_on_a_bad_handle_fails_without_queueing_anything() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let buffer = STACK_BASE + 0xb600;
+        let overlapped = STACK_BASE + 0xb700;
+        let completion = STACK_BASE + 0xb800;
+        write_overlapped(&mut memory, overlapped, 0, 0).unwrap();
+        assert_eq!(
+            call_shim(
+                &mut host,
+                &mut memory,
+                "ReadFileEx",
+                &[0x1234, buffer, 4, overlapped, completion]
+            )
+            .unwrap(),
+            Return(0)
+        );
+        assert_eq!(host.last_error, ERROR_INVALID_HANDLE);
+        assert!(host.file_apcs.is_empty());
+    }
+
+    #[test]
+    fn a_read_file_ex_without_a_structure_or_a_routine_is_rejected() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        host.files.provide("sfx.dat", vec![1]);
+        let handle = open_sfx(&mut host, &mut memory);
+        let buffer = STACK_BASE + 0xb900;
+        let completion = STACK_BASE + 0xba00;
+        // No `OVERLAPPED`: there is no non-overlapped form of this call.
+        assert_eq!(
+            call_shim(
+                &mut host,
+                &mut memory,
+                "ReadFileEx",
+                &[handle, buffer, 1, 0, completion]
+            )
+            .unwrap(),
+            Return(0)
+        );
+        assert_eq!(host.last_error, 87);
+        // No routine: the completion could never report itself.
+        assert_eq!(
+            call_shim(
+                &mut host,
+                &mut memory,
+                "ReadFileEx",
+                &[handle, buffer, 1, STACK_BASE + 0xbb00, 0]
+            )
+            .unwrap(),
+            Return(0)
+        );
+        assert_eq!(host.last_error, 87);
+        assert!(host.file_apcs.is_empty());
+    }
+
+    #[test]
+    fn a_read_file_ex_signals_the_event_the_overlapped_names() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        host.files.provide("sfx.dat", vec![7, 8, 9]);
+        let handle = open_sfx(&mut host, &mut memory);
+        let event = host.objects.insert(Object::Event {
+            manual: true,
+            signalled: false,
+        });
+        let buffer = STACK_BASE + 0xbc00;
+        let overlapped = STACK_BASE + 0xbd00;
+        let completion = STACK_BASE + 0xbe00;
+        write_overlapped(&mut memory, overlapped, 0, event).unwrap();
+        assert_eq!(
+            call_shim(
+                &mut host,
+                &mut memory,
+                "ReadFileEx",
+                &[handle, buffer, 3, overlapped, completion]
+            )
+            .unwrap(),
+            Return(1)
+        );
+        assert!(
+            host.objects.signalled(event),
+            "a waiter on the event must not be left behind"
+        );
+        assert!(!host.woken.is_empty(), "the wake reaches the session");
     }
 
     #[test]

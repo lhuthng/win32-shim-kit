@@ -10,15 +10,32 @@
 // out before the next call.
 
 import { createRenderer } from "./webgl2.js";
+import { createMixer } from "./mixer.js";
 
-const EVENT_WORDS = 11;
-const EVENT_PLAY = 0;
-const EVENT_UPDATE = 1;
-const EVENT_STOP = 2;
-const EVENT_RELEASE = 3;
-const EVENT_DATA = 4;
-/** The guest moved the playhead with `SetCurrentPosition`; its offset is in `bytes`. */
-const EVENT_SEEK = 5;
+
+/**
+ * Exports that answer with a pointer into the module's memory.
+ *
+ * A pointer is an unsigned 32-bit offset, and `i32` arrives signed, so each of
+ * these is widened before the page uses the answer as one.
+ */
+const POINTER_EXPORTS = [
+  "wh_alloc",
+  "wh_memory_ptr",
+  "wh_message_ptr",
+  "wh_saved_ptr",
+  "wh_render_ptr",
+  "wh_audio_samples",
+  "wh_audio_pcm_ptr",
+  // The event queue is a `Vec` in the host's heap, and the guest arena here is
+  // 2047 MiB, so it always lands above 2 GiB: read signed it is negative, and a
+  // negative offset is what a typed array rejects. Leaving it off this list made
+  // `drainAudio` throw on the first event of the session -- the exception
+  // escaped `frame`, which re-arms itself at the top, so the game went on
+  // rendering in silence with nothing said about why.
+  "wh_audio_events_ptr",
+  "wh_framebuffer_offset",
+];
 
 /**
  * The page's audio context, one for the whole page.
@@ -93,7 +110,7 @@ function scancode(code) {
 }
 
 function decodeMessage(host) {
-  const pointer = host.wh_message_ptr();
+  const pointer = (host.wh_message_ptr() >>> 0);
   const length = host.wh_message_len();
   if (!pointer || !length) return "";
   return new TextDecoder().decode(new Uint8Array(host.memory.buffer, pointer, length));
@@ -214,11 +231,13 @@ export async function boot({
   onStatus("fetching payload");
 
   const [artifact, fileList, settings] = await Promise.all([
-    fetch(`${base}artifact.json`).then((response) => {
+    // The manifest is the cache key for everything else, so a stale copy would
+    // silently replay an old module: never serve it from cache.
+    fetch(`${base}artifact.json`, { cache: "no-store" }).then((response) => {
       if (!response.ok) throw new Error(`artifact.json: HTTP ${response.status}`);
       return response.json();
     }),
-    fetch(`${base}game/files.json`).then((response) => {
+    fetch(`${base}game/files.json`, { cache: "no-store" }).then((response) => {
       if (!response.ok) throw new Error(`game/files.json: HTTP ${response.status}`);
       return response.json();
     }),
@@ -231,14 +250,31 @@ export async function boot({
 
   // The module's URL never changes, so a browser keeps whatever build it first
   // fetched -- a page reload replays the old shims without saying so, which
-  // reads as a fix that did not take. The size the artifact records changes with
-  // every rebuild, so it is the cache key: the same build is fetched once, and a
-  // rebuilt payload cannot be missed.
-  const build = artifact.module?.bytes ?? 0;
-  const wasmResponse = await fetch(`${base}host_wasm.wasm?v=${build}`).then((response) => {
+  // reads as a fix that did not take. The artifact's build stamp is a hash of
+  // the module, so it is the cache key: the same build is fetched once, and a
+  // rebuilt payload cannot be missed -- not even one whose size did not move.
+  const build = artifact.module?.build ?? artifact.module?.bytes ?? 0;
+  // Revalidated on every load, not merely keyed by the stamp. A payload whose
+  // module was replaced without rebaking its artifact keeps the same stamp, and
+  // the browser then replays whatever build it cached first while every rebuild
+  // looks like a fix that did not take.
+  const wasmResponse = await fetch(`${base}host_wasm.wasm?v=${build}`, {
+    cache: "no-cache",
+  }).then((response) => {
     if (!response.ok) throw new Error(`host_wasm.wasm: HTTP ${response.status}`);
     return response.arrayBuffer();
   });
+  if (
+    typeof artifact.module?.bytes === "number" &&
+    artifact.module.bytes !== wasmResponse.byteLength
+  ) {
+    // The artifact names a size the served module does not have, so the payload
+    // was rebuilt and its artifact was not. Saying so beats running a module
+    // nobody meant to run and calling it the new one.
+    console.warn(
+      `host_wasm.wasm is ${wasmResponse.byteLength} bytes but artifact.json says ${artifact.module.bytes}: the baked artifact is stale`,
+    );
+  }
 
   const builds = Array.isArray(artifact.executables)
     ? artifact.executables
@@ -261,17 +297,37 @@ export async function boot({
   );
 
   const { instance } = await WebAssembly.instantiate(wasmResponse, {});
-  const host = instance.exports;
+  // A wasm `i32` result reaches JavaScript signed, so a pointer at 2 GiB or
+  // above arrives negative -- and a negative offset is what a typed array
+  // rejects with "offset is out of bounds". The guest arena is free to reach
+  // that, and the buffers the host allocates above it do too, so every export
+  // that answers with a pointer is read as unsigned once, here, rather than at
+  // each of the places a pointer is used.
+  const host = { ...instance.exports };
+  for (const name of POINTER_EXPORTS) {
+    const raw = host[name];
+    if (typeof raw === "function") host[name] = (...args) => raw(...args) >>> 0;
+  }
+  // TEMP DIAGNOSTIC: the live host exports on the window, so a frozen session
+  // can be probed from the console. Remove when done.
+  if (typeof window !== "undefined") window.__wh = host;
 
   const screen = artifact.screen ?? { width: 640, height: 480, depth: 8 };
   host.wh_set_screen(screen.width, screen.height, screen.depth);
 
+  // A payload says which Windows it wants to be: a launcher that refuses
+  // anything newer than Windows 98 needs this before it reads the platform.
+  const windows = artifact.windows;
+  if (windows) {
+    host.wh_set_windows(windows.major, windows.minor, windows.build, windows.platform);
+  }
+
   const name = new TextEncoder().encode(executableName);
-  const namePointer = host.wh_alloc(name.length);
+  const namePointer = host.wh_alloc(name.length) >>> 0;
   new Uint8Array(host.memory.buffer, namePointer, name.length).set(name);
   host.wh_set_exe_name(namePointer, name.length);
 
-  const imagePointer = host.wh_alloc(executable.length);
+  const imagePointer = host.wh_alloc(executable.length) >>> 0;
   new Uint8Array(host.memory.buffer, imagePointer, executable.length).set(executable);
   if (host.wh_load(imagePointer, executable.length) !== 0) {
     throw new Error(decodeMessage(host) || "the executable did not load");
@@ -286,7 +342,7 @@ export async function boot({
     const contents = new Uint8Array(await response.arrayBuffer());
     const encoded = new TextEncoder().encode(file.name);
     // Name and bytes in one allocation: `wh_alloc` reuses one buffer.
-    const pointer = host.wh_alloc(encoded.length + contents.length);
+    const pointer = host.wh_alloc(encoded.length + contents.length) >>> 0;
     const memory = new Uint8Array(host.memory.buffer);
     memory.set(encoded, pointer);
     memory.set(contents, pointer + encoded.length);
@@ -299,7 +355,7 @@ export async function boot({
   for (const file of storedSaves(saveKey)) {
     if (!keptBy(saves, file.name)) continue;
     const name = new TextEncoder().encode(file.name);
-    const pointer = host.wh_alloc(name.length + file.bytes.length);
+    const pointer = host.wh_alloc(name.length + file.bytes.length) >>> 0;
     const memory = new Uint8Array(host.memory.buffer);
     memory.set(name, pointer);
     memory.set(file.bytes, pointer + name.length);
@@ -336,6 +392,13 @@ export async function boot({
   }
   let paletteVersion = -1;
   let frameSize = { width: 0, height: 0 };
+  // One ImageData, reused for every presented frame of the same size. Allocating
+  // a fresh 300 KB buffer and a fresh Uint32Array view on each present was pure
+  // garbage: putImageData reads the buffer we hand it, and every pixel is
+  // rewritten below anyway.
+  let image = null;
+  let imageOut = null;
+  let imageSize = { width: 0, height: 0 };
 
   function refreshPalette() {
     const version = host.wh_palette_version();
@@ -373,7 +436,7 @@ export async function boot({
     const pitch = host.wh_framebuffer_pitch();
     // `wh_framebuffer_offset` is relative to the guest's image base, and
     // `wh_memory_ptr` is where that base sits inside the module's linear memory.
-    const offset = host.wh_memory_ptr() + host.wh_framebuffer_offset();
+    const offset = (host.wh_memory_ptr() >>> 0) + host.wh_framebuffer_offset();
     if (!width || !height || !pitch || !host.wh_framebuffer_offset()) return;
 
     const depth = host.wh_framebuffer_depth ? host.wh_framebuffer_depth() : 8;
@@ -384,16 +447,27 @@ export async function boot({
     frameSize = { width, height };
 
     const memory = new Uint8Array(host.memory.buffer);
-    const image = context.createImageData(width, height);
-    const out = new Uint32Array(image.data.buffer);
+    if (!image || imageSize.width !== width || imageSize.height !== height) {
+      image = context.createImageData(width, height);
+      imageOut = new Uint32Array(image.data.buffer);
+      imageSize = { width, height };
+    }
+    const out = imageOut;
+    // The palette changes rarely; asking the module for its revision 240 times
+    // per frame was 240 wasm calls to learn the same answer. The depth branch
+    // likewise belongs outside the row loop -- it cannot change mid-frame.
+    if (depth === 8) refreshPalette();
 
-    for (let y = 0; y < height; y += 1) {
-      const row = offset + y * pitch;
-      const line = y * width;
-      if (depth === 8) {
-        refreshPalette();
+    if (depth === 8) {
+      for (let y = 0; y < height; y += 1) {
+        const row = offset + y * pitch;
+        const line = y * width;
         for (let x = 0; x < width; x += 1) out[line + x] = palette[memory[row + x]];
-      } else if (depth === 16) {
+      }
+    } else if (depth === 16) {
+      for (let y = 0; y < height; y += 1) {
+        const row = offset + y * pitch;
+        const line = y * width;
         // Five and six bit channels widen by repeating their top bits, which is
         // how a display expands them: shifting alone caps white at 248,252,248,
         // so every bright pixel comes out a shade dull and a shade green.
@@ -409,7 +483,11 @@ export async function boot({
             (((green << 2) | (green >> 4)) << 8) |
             ((red << 3) | (red >> 2));
         }
-      } else {
+      }
+    } else {
+      for (let y = 0; y < height; y += 1) {
+        const row = offset + y * pitch;
+        const line = y * width;
         for (let x = 0; x < width; x += 1) {
           const at = row + x * 4;
           // Little-endian BGRX, which is SDL's 32-bit XRGB surface.
@@ -427,65 +505,46 @@ export async function boot({
   // ---- audio --------------------------------------------------------------
 
   /**
-   * One entry per sounding voice: its format, and where the playhead has got
-   * to. The samples are not copied -- the mixer reads them where the guest
-   * keeps them, so a buffer rewritten under a playing voice is heard as it is.
+   * The mixer, and the queue that carries its blocks to the sound card.
+   *
+   * The mixer is `mixer.js`: it owns the voice table and renders samples out of
+   * guest memory. It is a module rather than part of this closure so that
+   * `tmp/hercules-probe/mix-lab.mjs` can drive the real thing without a browser
+   * and write the result to a WAV. This half is only the transport -- a
+   * context, a queue of rendered blocks, and the pause switch.
    */
-  const voices = new Map();
+  const mixer = createMixer(host);
   /** Seconds of audio rendered into one queued block. */
-  const CHUNK = 0.05;
-  /** How far ahead of the audio clock the queue is kept filled. */
-  const AHEAD = 0.09;
+  const CHUNK = 0.025;
+  /**
+   * How far ahead of the audio clock the queue is kept filled.
+   *
+   * This is also the delay between the guest stopping a sound and the last of
+   * that sound being heard, because a block already handed to the sound card
+   * cannot be recalled. It was 90 ms of 50 ms blocks, so a stop took up to
+   * 140 ms to become audible -- long enough to be heard as a sound that "will
+   * not go off when it should".
+   */
+  const AHEAD = 0.06;
 
-  /** DirectSound volume is hundredths of a decibel: 0 is unity, -10000 silent. */  function gainOf(volume) {
-    if (!volume) return 1;
-    return Math.min(1, Math.pow(10, volume / 2000));
-  }
-
-  /** DirectSound pan is -10000 (left) to 10000 (right). */
-  function panOf(pan) {
-    return Math.max(-1, Math.min(1, pan / 10000));
-  }
-
-  /** One frame of a voice's buffer, as a fraction of full scale. */
-  function sampleAt(memory, base, index, bytes, bits) {
-    const at = base + index * bytes;
-    if (bits === 8) return (memory[at] - 128) / 128;
-    // 16-bit samples are signed and little-endian.
-    return (((memory[at] | (memory[at + 1] << 8)) << 16) >> 16) / 32768;
-  }
+  /** Peak and clipped-sample count of the last block, for the diagnostic. */
+  let audioPeak = 0;
+  let audioClipped = 0;
+  /** The first exception the audio path threw, so it is reported once. */
+  let audioFault = null;
 
   /**
    * The bus every voice mixes into.
    *
-   * A game hands DirectSound a dozen 8-bit voices at once and DirectSound adds
-   * them up; the sum passes full scale often enough that adding them here
-   * unguarded clips on every loud chord, which is heard as roughness over the
-   * music. A limiter is what keeps the sum inside the range without turning the
-   * game down.
+   * A plain gain, because the mix is soft-clipped inside `mixInto` where the
+   * peak is known. See `softClip` in `mixer.js` for why the
+   * `DynamicsCompressorNode` that used to stand here was itself the distortion.
    */
   let master = null;
   function output(context) {
     if (master) return master;
     master = context.createGain();
-    if (context.createDynamicsCompressor) {
-      // A safety limiter, not compression. DirectSound never compressed -- the
-      // guest sets its own levels, and percussion is a transient by definition --
-      // so this only has to catch the rare moment a dozen voices sum past full
-      // scale. Held at -6 dB with a 6 dB knee it caught every drum hit instead:
-      // a mix whose peaks reach 0.5 was reduced by six, twelve decibels of
-      // punch stripped off the one sound that is nothing but attack.
-      const limiter = context.createDynamicsCompressor();
-      limiter.threshold.value = -1;
-      limiter.knee.value = 0;
-      limiter.ratio.value = 20;
-      limiter.attack.value = 0.003;
-      limiter.release.value = 0.25;
-      master.connect(limiter);
-      limiter.connect(context.destination);
-    } else {
-      master.connect(context.destination);
-    }
+    master.connect(context.destination);
     return master;
   }
 
@@ -495,88 +554,21 @@ export async function boot({
   /**
    * Renders one block of the mix and queues it.
    *
-   * DirectSound is a mixer: it reads each voice's buffer at that voice's own
-   * play position, wraps a looping buffer and stops at the end of a one-shot.
-   * One `AudioBufferSource` per `Play` cannot express that -- it copies the
-   * samples once and loops that copy, so a note retuned under it keeps the old
-   * waveform, a buffer the guest rewrites is played stale, and every restart
-   * puts a step in the waveform. A step inside a period is a click; at the rate
-   * a low note plays, several of them per period is noise. So the sum is
-   * computed here, straight out of guest memory, and these blocks are the only
-   * thing Web Audio plays.
+   * The block is rendered at the context's own rate so that Web Audio never
+   * resamples it. That is not an optimisation: a block at any other rate is
+   * resampled by the browser *per block*, with the resampler's phase restarting
+   * at every boundary, and the rate used to be picked per block from whichever
+   * voice was loudest -- so it could change under the resampler as well.
    */
   function mixBlock(context) {
-    // Render at the rate the guest's own buffers use, not the device's, and let
-    // Web Audio do the conversion: its resampler is band-limited, while mixing
-    // straight into 48 kHz here folded images of the 22 kHz source -- Cave
-    // Story's buffers are mono 8-bit at 22050 -- back into 11 to 22 kHz, which
-    // is the hiss laid over the music that the original does not have.
-    let sourceRate = 0;
-    for (const entry of voices.values()) {
-      if (entry.stopped) continue;
-      if (entry.spec.rate > sourceRate) sourceRate = entry.spec.rate;
-    }
-    const rate = Math.min(context.sampleRate || 22_050, sourceRate || 22_050);
+    const rate = context.sampleRate || 48_000;
     const frames = Math.max(1, Math.round(CHUNK * rate));
     const buffer = context.createBuffer(2, frames, rate);
     const left = buffer.getChannelData(0);
     const right = buffer.getChannelData(1);
-    const memory = new Uint8Array(host.memory.buffer);
-
-    for (const [voice, entry] of voices) {
-      if (entry.stopped) continue;
-      const spec = entry.spec;
-      const bytes = spec.channels * (spec.bits / 8);
-      if (!spec.channels || !spec.bits || !spec.rate || !bytes) continue;
-
-      // Live memory first: a streaming guest writes into the buffer it plays.
-      let base = 0;
-      let length = 0;
-      const address = host.wh_audio_samples ? host.wh_audio_samples(voice) : 0;
-      if (address) {
-        length = host.wh_audio_samples_len(voice);
-        base = host.wh_memory_ptr() + address;
-      }
-      if (!length) {
-        // A voice the guest released: the host kept the copy it took.
-        length = host.wh_audio_pcm_len ? host.wh_audio_pcm_len(voice) : 0;
-        base = host.wh_audio_pcm_ptr ? host.wh_audio_pcm_ptr(voice) : 0;
-      }
-      const available = length ? Math.floor(length / bytes) : 0;
-      if (!available) continue;
-
-      // `frequency` is the playback rate in Hz against the buffer's own rate,
-      // which is what makes DirectSound's tiny looping waveforms notes. The mix
-      // leaves at the context's rate rather than the buffer's, so one source
-      // frame lasts `frequency / output rate` output frames: dividing by the
-      // buffer's rate instead plays a 22050 Hz track at 48000/22050 of its true
-      // length -- fast, and wrapping its loop before the guest has refilled it.
-      const step = (spec.frequency || spec.rate) / rate;
-      const gain = gainOf(spec.volume);
-      const angle = ((panOf(spec.pan) + 1) / 2) * (Math.PI / 2);
-      const leftGain = Math.cos(angle) * gain;
-      const rightGain = Math.sin(angle) * gain;
-
-      let position = entry.position;
-      if (position >= available) position = spec.looping ? position % available : available;
-      for (let index = 0; index < frames; index += 1) {
-        if (position >= available) {
-          if (!spec.looping) break;
-          position -= available;
-        }
-        const frame = Math.floor(position);
-        const next = frame + 1 < available ? frame + 1 : 0;
-        const between = position - frame;
-        const first = sampleAt(memory, base, frame, bytes, spec.bits);
-        const second = sampleAt(memory, base, next, bytes, spec.bits);
-        const value = first + (second - first) * between;
-        left[index] += value * leftGain;
-        right[index] += value * rightGain;
-        position += step;
-      }
-      entry.position = position;
-    }
-
+    const mixed = mixer.mixInto(left, right, rate);
+    audioPeak = mixed.peak;
+    audioClipped = mixed.clipped;
     const source = context.createBufferSource();
     source.buffer = buffer;
     source.connect(output(context));
@@ -603,71 +595,21 @@ export async function boot({
   }
 
   function drainAudio() {
-    const count = host.wh_audio_event_count();
-    if (count) {
-      const base = host.wh_audio_events_ptr();
-      const memory = new Uint8Array(host.memory.buffer);
-      const words = new Uint32Array(memory.buffer, base, count * EVENT_WORDS);
-      for (let index = 0; index < count; index += 1) {
-        const at = index * EVENT_WORDS;
-        const kind = words[at];
-        const voice = words[at + 1];
-        if (kind === EVENT_PLAY) {
-          const spec = {
-            channels: words[at + 2],
-            rate: words[at + 3],
-            volume: words[at + 5] | 0,
-            pan: words[at + 6] | 0,
-            looping: (words[at + 7] & 1) === 1,
-            frequency: words[at + 9],
-            bits: words[at + 10],
-          };
-          const sounding = voices.get(voice);
-          if (sounding) {
-            // `Play` starts at the play cursor, so a voice that is already
-            // sounding keeps playing: this is a sustained looping waveform
-            // being retuned, not a new note.
-            sounding.spec = { ...sounding.spec, ...spec };
-            sounding.stopped = false;
-          } else {
-            voices.set(voice, { spec, position: 0, stopped: false });
-          }
-        } else if (kind === EVENT_STOP) {
-          // A stopped buffer keeps its play cursor, in the guest and here: the
-          // `Play` that follows resumes where it stopped.
-          const entry = voices.get(voice);
-          if (entry) entry.stopped = true;
-        } else if (kind === EVENT_RELEASE) {
-          voices.delete(voice);
-        } else if (kind === EVENT_SEEK) {
-          // The guest moved the playhead itself, which is how a drum restarts:
-          // `iw` is the byte it asked for.
-          const entry = voices.get(voice);
-          if (entry) {
-            const bytes = entry.spec.channels * (entry.spec.bits / 8);
-            entry.position = bytes ? words[at + 8] / bytes : 0;
-          }
-        } else if (kind === EVENT_UPDATE) {
-          const entry = voices.get(voice);
-          if (entry) {
-            // An update carries the frequency and not the buffer's own rate --
-            // `SetFrequency` is how a game retunes a waveform it is already
-            // playing, which is every note of Cave Story's music.
-            entry.spec = {
-              ...entry.spec,
-              volume: words[at + 5] | 0,
-              pan: words[at + 6] | 0,
-              frequency: words[at + 9] || entry.spec.frequency,
-            };
-          }
-        }
-        // `EVENT_DATA` needs nothing here: the mixer reads the buffer as it
-        // stands, so a write the guest makes is heard on the next block.
+    try {
+      // Every frame, not only on a present: the guest writes its samples after
+      // `Play`, and a sound must not wait for the next flip to be heard.
+      mixer.applyEvents();
+      pumpAudio();
+    } catch (error) {
+      // A throw in here used to escape `frame` silently. `frame` re-arms itself
+      // at the top, so the game kept rendering, the sound was gone, and nothing
+      // anywhere said why -- which is exactly how the missing pointer widening
+      // above survived three rounds of looking at this. Say it once.
+      if (!audioFault) {
+        audioFault = error;
+        onDiagnostic(`audio: ${error?.message ?? error}`);
       }
-      host.wh_audio_events_clear();
     }
-
-    pumpAudio();
   }
 
   /**
@@ -770,6 +712,13 @@ export async function boot({
   // straight onto the primary never moves the flip counter.
   let version = host.wh_frame_version();
   let instructions = 0;
+  /**
+   * What the last `wh_run` chunk cost in milliseconds. The frame loop decides
+   * whether it can afford another chunk from this, because the cost of a chunk
+   * is not a constant: it is a budget in instructions retired, and a guest that
+   * enters a native replacement retires many times that budget in one call.
+   */
+  let chunkCost = 2;
   let handle = null;
   let lastStatus = "";
 
@@ -785,6 +734,8 @@ export async function boot({
   let presented = 0;
   /** Milliseconds of pause the guest has not been told about. */
   let clockShift = 0;
+  /** TEMP DIAGNOSTIC: paces the once-a-second mixer line in the pane. */
+  let diagTick = 0;
   /** When the guest stopped running, or 0 while it is. */
   let frozenAt = 0;
 
@@ -818,23 +769,62 @@ export async function boot({
     host.wh_set_time(now - clockShift);
     const started = performance.now();
     let outcome = 0;
-    // A frame's budget is instructions, not time: 250,000 per chunk, repeated
-    // until the guest presents or a wall-clock slice is used up, so one slow
-    // frame cannot freeze the page.
+    // A frame's budget is wall time, but the clock can only be consulted between
+    // chunks of guest work, and a chunk is not small. At 250,000 instructions one
+    // `wh_run` measured 7.5 ms at the median on Hercules' menu and 18 ms at the
+    // tail: the budget is a count of instructions retired, and a run of native
+    // sprite rows retires several times its budget in one call. So "stop when the
+    // slice is used up", checked *after* each chunk, really meant "stop somewhere
+    // between the slice and the slice plus a chunk" -- and more than half the
+    // callbacks then ran past the 16.7 ms display slot. A callback that crosses a
+    // vsync does not shorten the next one; it loses it. Measured on the menu that
+    // was 39 rAF callbacks a second instead of 60, and the display interval
+    // swinging between 20 and 54 ms (p10 to p90) on a game that is otherwise a
+    // steady 30 fps.
     //
-    // A paced game gets its own interval as that slice. It waits for real time
+    // So the chunk is small enough that the overshoot is a fraction of a vsync,
+    // and the clock is consulted *before* the chunk that would overshoot, using
+    // the cost of the previous one. That adapts by itself: a slower machine has
+    // costlier chunks, so it asks for fewer of them. The same measurement then
+    // gives 60 callbacks a second, none over the slot, and 93% of frames landing
+    // on exactly two vsyncs instead of 43%.
+    //
+    // A paced game gets its own interval as the slice. It waits for real time
     // inside the guest -- `Sleep` against `GetTickCount`, which is how a game
     // written for 50 made its own frame rate -- so a slice shorter than a frame
     // cuts the wait in half and costs a frame. An unpaced one keeps the 12 ms
     // that has always been enough to keep a page responsive.
-    const slice = paced ? Math.max(12, 1000 / rate) : 12;
-    for (let chunk = 0; chunk < 8; chunk += 1) {
-      outcome = host.wh_run(250_000);
-      instructions += 250_000;
-      if (outcome !== 0) break;
-      if (host.wh_flips() !== flips) break;
-      if (host.wh_frame_version() !== version) break;
-      if (performance.now() - started > slice) break;
+    //
+    // A payload can raise that ceiling with `sliceMs` in config.json. An
+    // interpreter-bound game spends its whole slice in wh_run, so 12 ms out of
+    // every 16.7 ms rAF is only ~72% of the CPU. The ceiling has to stay clear of
+    // a whole vsync, or the callback delays rAF itself and the extra work stops
+    // buying frames: 16 ms was measured as 19.9 ms callbacks and 67% of them over
+    // the slot, because the chunk granularity of the day was 4 ms.
+    const CHUNK = 64_000;
+    const configured = Number(settings.sliceMs);
+    const slice = configured > 0 ? configured : paced ? Math.max(12, 1000 / rate) : 12;
+    try {
+      for (let chunk = 0; chunk < 64; chunk += 1) {
+        // Half the slice is the most a chunk may be assumed to cost, so a single
+        // hitch cannot make the loop refuse to run at all: a cost estimated at
+        // more than the whole slice would stop it before its first chunk, and
+        // nothing would ever run again to bring the estimate back down.
+        const reserved = Math.min(chunkCost, slice * 0.5);
+        if (performance.now() - started + reserved > slice) break;
+        const at = performance.now();
+        outcome = host.wh_run(CHUNK);
+        chunkCost = performance.now() - at;
+        instructions += CHUNK;
+        if (outcome !== 0) break;
+        if (host.wh_flips() !== flips) break;
+        if (host.wh_frame_version() !== version) break;
+      }
+    } catch (error) {
+      // A wasm trap would otherwise kill this frame and every one after it, with
+      // nothing said. Name it once, in the diagnostic pane.
+      onDiagnostic(`trap: ${error.message ?? error}`);
+      throw error;
     }
 
     if (host.wh_flips() !== flips || host.wh_frame_version() !== version) {
@@ -847,7 +837,45 @@ export async function boot({
     // `Play`, and a sound must not wait for the next flip to be heard.
     drainAudio();
 
-    for (const notice of decodeNotices(host)) onDiagnostic(notice);
+    // The guest has stopped -- `ExitProcess`, a fault -- and a real machine goes
+    // silent with it: the buffers belong to the process, so the mixer dies with
+    // the process. Nothing here does that on its own. This mixer is fed from
+    // guest memory and keeps rendering whatever it holds, so the last sounds of
+    // the session repeat forever after the game has gone, and a looping one is
+    // the one that is still audible. Hercules leaves two of them: 1.57-second
+    // ambience loops it never stops because it exits instead of winding its
+    // sound system down.
+    if (outcome !== 0 && mixer.size) {
+      mixer.clear();
+      onDiagnostic(`audio: guest halted (${outcome}); mixer cleared`);
+    }
+
+    // The mixer's live state, once a second, in the diagnostic pane: a session
+    // that is silent names which link of the chain broke.
+    diagTick += 1;
+    if (diagTick >= 60) {
+      diagTick = 0;
+      const guestClock = host.wh_clock_ms ? host.wh_clock_ms() : -1;
+      const instr = host.wh_instructions ? host.wh_instructions() : -1;
+      // `looping` is how many voices the guest has left looping, and `oldest`
+      // is the age of the oldest of them in seconds of its own audio. A looping
+      // voice has no end of its own, so only a Stop or a Release can take it off
+      // the mixer: an age of minutes on a one-second buffer is the whole of "a
+      // sound effect that will not go off", and it names the fault without
+      // anyone having to listen for it.
+      const held = mixer.stats();
+      const oldest = held.looping ? ` oldest=${held.longest.toFixed(1)}s#${held.voice}` : "";
+      const level = `peak=${audioPeak.toFixed(2)} clipped=${audioClipped}`;
+      onDiagnostic(
+        audio
+          ? `audio: ctx=${audio.state} voices=${held.count} looping=${held.looping}${oldest} ${level} aheadMs=${Math.round((queued - audio.currentTime) * 1000)} clock=${Math.round(guestClock)} instr=${instr} oc=${outcome}`
+          : `audio: no context clock=${Math.round(guestClock)} instr=${instr} oc=${outcome}`,
+      );
+    }
+
+    for (const notice of decodeNotices(host)) {
+      onDiagnostic(notice);
+    }
     // A write to a file the guest owns is a save; nothing else says so.
     persistSaves();
 
@@ -970,7 +998,7 @@ export async function boot({
       running = false;
       if (handle !== null) cancelAnimationFrame(handle);
       handle = null;
-      voices.clear();
+      mixer.clear();
       queued = 0;
       if (scene) scene.dispose();
       scene = null;

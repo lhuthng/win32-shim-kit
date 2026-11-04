@@ -134,6 +134,7 @@ fn main() -> ExitCode {
         table: table_for(&image),
         shims: host::shim::TABLES,
         provided_files: &[],
+        hle: &[],
     }));
 
     let mut session = Session::load_for(bytes, target).expect("the session loads");

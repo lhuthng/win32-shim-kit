@@ -10,19 +10,23 @@
 //! away at an instruction count the way an operating system takes it at a timer
 //! tick, and only ever to a thread that already wants it.
 //!
-//! What this model does not do is enforce the guest's own locks. A critical
-//! section, a `_lock` and a `_Lockit` all answer at once, because nothing here
-//! contends for them, so a thread can be switched out inside one and another
-//! thread can be running in it when the switch happens. A guest that hands work
-//! over with a semaphore -- which is what a Win32 game's worker usually does --
-//! is fine; one that expects a critical section to keep two threads out of its
-//! own data is not, and making those block is the next thing this needs.
+//! The guest's own locks are the shims' business, not this module's:
+//! `EnterCriticalSection` parks the second thread on the lock and `Leave` hands
+//! it to the waiter that has been waiting longest, with the recursion count a
+//! re-entrant enter needs (`kernel32.rs`); the CRT's `_lock` and `_Lockit` go
+//! through the same objects. What nothing here does is *contend* -- no thread
+//! ever has a lock taken away from it -- so the exclusion a guest sees is only
+//! as strong as its own discipline about releasing. A guest that hands work
+//! over with a semaphore, which is what a Win32 game's worker usually does, and
+//! one that guards its queues with critical sections both get the behaviour
+//! they were written against.
 //!
 //! The machine state a thread carries is exactly what a swap of the CPU needs:
 //! registers, the x87 stack (games keep audio state there across a yield),
-//! the host calls suspended on its own stack, and a timer callback that
-//! interrupted it. The wait a thread is parked in lives in [`crate::objects`],
-//! which decides what a signal answers; this module only decides who runs.
+//! the host calls suspended on its own stack, and a timer callback or a queued
+//! `ReadFileEx` completion that interrupted it. The wait a thread is parked in
+//! lives in [`crate::objects`], which decides what a signal answers; this
+//! module only decides who runs.
 
 use crate::cpu::{Fpu, Registers};
 use crate::shim::Binding;
@@ -87,6 +91,14 @@ pub struct Thread {
     pub id: u32,
     pub handle: u32,
     pub state: State,
+    /// `SuspendThread`/`ResumeThread` nesting depth. A thread with a nonzero
+    /// count never runs, however it was parked: suspension is orthogonal to
+    /// waiting, and waking a suspended waiter only leaves it runnable once
+    /// the count is resumed back down. Hercules stages video on a worker
+    /// into the buffer the main thread decodes out of, and the two take
+    /// turns with exactly this count -- without it the worker laps the
+    /// decoder and the decoder walks a table the next stage overwrote.
+    pub suspends: u32,
     pub regs: Registers,
     pub fpu: Fpu,
     /// Host calls suspended on this thread's own stack.
@@ -95,6 +107,11 @@ pub struct Thread {
     /// timer it started at.
     pub timer_frame: Option<(Registers, Fpu)>,
     pub timer_started: Option<(u64, u32)>,
+    /// The frame a queued `ReadFileEx` completion interrupted on this thread,
+    /// and the instruction count it started at. Same shape as a timer's, and
+    /// the two never run at once.
+    pub apc_frame: Option<(Registers, Fpu)>,
+    pub apc_started: Option<u64>,
     /// What the import this thread parked in answers with, when that is not the
     /// value the shim already returned: a wait knows its result only when it
     /// completes, which is after the shim has run.
@@ -109,6 +126,13 @@ pub struct Thread {
     /// Instructions this thread retired before the CPU was last taken away from
     /// it, for the dump a run that neither faults nor moves prints.
     pub instructions: u64,
+    /// Whether this thread's registers and call frames are in its record as they
+    /// stand. Set by [`Threads::park`], cleared by [`Threads::run_on`], because a
+    /// thread that is running has left them behind. A switch away from a thread
+    /// that is not saved is a switch that loses its place: the record still holds
+    /// the context the thread was spawned with, and it resumes at its entry point
+    /// instead of where it stopped.
+    pub saved: bool,
 }
 
 /// One thread as a diagnostic sees it: where it stopped, what it is parked on,
@@ -135,20 +159,24 @@ impl Thread {
             id,
             handle,
             state: State::Runnable,
+            suspends: 0,
             regs,
             fpu,
             frames: Vec::new(),
             timer_frame: None,
             timer_started: None,
+            apc_frame: None,
+            apc_started: None,
             answer: None,
             yielded: false,
             stack: 0,
             instructions: 0,
+            saved: true,
         }
     }
 
     pub fn running(&self) -> bool {
-        self.state == State::Runnable
+        self.state == State::Runnable && self.suspends == 0
     }
 }
 
@@ -203,6 +231,10 @@ impl Threads {
         !thread.running() || thread.yielded
     }
 
+    pub fn current_thread(&self) -> &Thread {
+        &self.threads[self.current]
+    }
+
     pub fn current_thread_mut(&mut self) -> &mut Thread {
         &mut self.threads[self.current]
     }
@@ -229,6 +261,7 @@ impl Threads {
         let thread = &mut self.threads[self.current];
         thread.regs = regs;
         thread.fpu = fpu;
+        thread.saved = true;
         match want {
             ThreadWant::Wait { .. } => {
                 thread.state = State::Waiting;
@@ -244,6 +277,17 @@ impl Threads {
             }
         }
         &self.threads[self.current]
+    }
+
+    /// Mirrors the suspend counts the `SuspendThread`/`ResumeThread` shims keep
+    /// in the host, so the scheduler stops entering threads whose count is
+    /// nonzero. Suspension is orthogonal to parking: a suspended waiter that
+    /// is woken stays put until it is resumed, and a resumed thread only runs
+    /// when the scheduler reaches it.
+    pub fn set_suspends(&mut self, counts: &std::collections::HashMap<u32, u32>) {
+        for thread in &mut self.threads {
+            thread.suspends = counts.get(&thread.id).copied().unwrap_or(0);
+        }
     }
 
     /// Makes a parked thread runnable, with the value its wait answered.
@@ -271,7 +315,8 @@ impl Threads {
             let index = (self.current + step) % count;
             let thread = &self.threads[index];
             // A thread that just yielded comes last: it has had its turn.
-            if thread.state == State::Runnable && !thread.yielded {
+            // A suspended thread never runs, yielded or not.
+            if thread.running() && !thread.yielded {
                 return Some(index);
             }
         }
@@ -284,7 +329,7 @@ impl Threads {
         }
         for step in 1..=count {
             let index = (self.current + step) % count;
-            if self.threads[index].state == State::Runnable {
+            if self.threads[index].running() {
                 return Some(index);
             }
         }
@@ -299,6 +344,7 @@ impl Threads {
         let thread = &mut self.threads[index];
         thread.state = State::Runnable;
         thread.yielded = false;
+        thread.saved = false;
         (thread.id, thread.regs, thread.fpu.clone())
     }
 
@@ -338,6 +384,26 @@ mod tests {
     fn run(threads: &mut Threads) -> u32 {
         let index = threads.schedule().expect("a thread can run");
         threads.run_on(index).0
+    }
+
+    /// A thread's record is only its own while it is parked.
+    ///
+    /// `run_on` marks it unsaved because the registers have gone to the CPU;
+    /// `park` puts them back. The session parks a thread it finds unsaved on the
+    /// way out, so a switch can never leave a record holding the context the
+    /// thread was spawned with -- which is how a suspended thread used to come
+    /// back at its entry point instead of where it stopped.
+    #[test]
+    fn a_running_thread_is_unsaved_until_it_parks() {
+        let mut threads = started();
+        threads.spawn(1, 7, registers(), Fpu::default());
+        assert!(threads.current_thread().saved, "a thread that has not run has nothing to lose");
+
+        run(&mut threads);
+        assert!(!threads.current_thread().saved, "a running thread's record is behind");
+
+        threads.park(registers(), Fpu::default(), &ThreadWant::Yield);
+        assert!(threads.current_thread().saved, "parking puts the registers back");
     }
 
     #[test]
@@ -389,6 +455,54 @@ mod tests {
             0,
             "a thread that yielded is only waiting for the others, not left out"
         );
+    }
+
+    #[test]
+    fn a_suspended_thread_is_never_scheduled() {
+        let mut threads = started();
+        threads.spawn(1, 7, registers(), Fpu::default());
+
+        let mut counts = std::collections::HashMap::new();
+        counts.insert(1, 1);
+        threads.set_suspends(&counts);
+        assert_eq!(run(&mut threads), 0);
+        assert_eq!(run(&mut threads), 0, "the worker stays parked while suspended");
+
+        // A nested suspend deepens the count; one resume is not enough.
+        counts.insert(1, 2);
+        threads.set_suspends(&counts);
+        counts.insert(1, 1);
+        threads.set_suspends(&counts);
+        assert_eq!(run(&mut threads), 0);
+
+        // Resumed to zero, the worker runs again.
+        counts.insert(1, 0);
+        threads.set_suspends(&counts);
+        threads.park(registers(), Fpu::default(), &ThreadWant::Yield);
+        assert_eq!(run(&mut threads), 1);
+    }
+
+    #[test]
+    fn a_suspended_waiter_that_is_woken_stays_put_until_resumed() {
+        let mut threads = started();
+        threads.spawn(1, 7, registers(), Fpu::default());
+
+        threads.park(registers(), Fpu::default(), &ThreadWant::Yield);
+        assert_eq!(run(&mut threads), 1);
+        threads.park(registers(), Fpu::default(), &ThreadWant::Wait { timeout: None });
+
+        let mut counts = std::collections::HashMap::new();
+        counts.insert(1, 1);
+        threads.set_suspends(&counts);
+        threads.wake(1, 0x102);
+        // The wait completed, but the thread is still suspended.
+        assert_eq!(run(&mut threads), 0);
+
+        counts.insert(1, 0);
+        threads.set_suspends(&counts);
+        threads.park(registers(), Fpu::default(), &ThreadWant::Yield);
+        assert_eq!(run(&mut threads), 1);
+        assert_eq!(threads.current_thread_mut().answer.take(), Some(0x102));
     }
 
     #[test]

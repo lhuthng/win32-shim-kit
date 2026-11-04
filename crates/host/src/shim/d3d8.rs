@@ -267,6 +267,11 @@ pub struct Direct3D {
     /// Whether the notice about a clamped, impossible back-buffer size has been
     /// printed.
     pub said_mode: bool,
+    /// Whether the notice about a `CopyRects` that moves no guest bytes has been
+    /// printed. RenderWare copies a rendered frame into a texture that way, and
+    /// when the source is a surface the page owns there are no bytes here to
+    /// copy, which is worth saying once rather than every frame.
+    pub said_copy_rects: bool,
     /// Surfaces the device handed out that are not the back buffer: render
     /// targets, depth-stencils and plain images, by their size, format, pool
     /// and usage.
@@ -874,6 +879,16 @@ fn refusal(kind: u8, slot: u8) -> String {
 /// share a resource's memory, so the first `Release` is the last.
 fn release(host: &mut Host, call: &mut Call<'_>, kind: u8) -> Result<Action> {
     let object = call.arg(0)?;
+    if kind == D3D8_SURFACE {
+        host.d3d8.texture_surfaces.remove(&object);
+        host.d3d8.surfaces.remove(&object);
+        // The back buffer and depth-stencil names belong to the page's own
+        // buffers, and a guest saves and restores them without creating them.
+        if object != host.d3d8.back_buffer_surface && object != host.d3d8.depth_surface {
+            host.release(object);
+        }
+        return Ok(Return(1));
+    }
     let freed = match kind {
         D3D8_VERTEX_BUFFER => host.d3d8.vertex_buffers.remove(&object).map(|b| b.address),
         D3D8_INDEX_BUFFER => host.d3d8.index_buffers.remove(&object).map(|b| b.address),
@@ -1331,8 +1346,7 @@ fn device(method: &str, host: &mut Host, call: &mut Call<'_>) -> Result<Action> 
         // The device has one buffer, and the page presents it. These answer with
         // that buffer so the guest can save the target it is drawing into and put
         // it back, which is what a 2005 game's menu code does around a full-screen
-        // effect. There is no depth-stencil surface object, and Direct3D allows a
-        // NULL there, so that is the answer.
+        // effect.
         "GetRenderTarget" | "GetFrontBuffer" | "GetBackBuffer" => {
             state(host)?;
             let destination = if method == "GetRenderTarget" {
@@ -1349,27 +1363,24 @@ fn device(method: &str, host: &mut Host, call: &mut Call<'_>) -> Result<Action> 
             call.write_u32(destination, surface)?;
             Ok(Return(S_OK))
         }
+        // `SetRenderTarget(pRenderTarget, pNewZStencil)`: both arguments are
+        // surface handles, not the out-pointers their names suggest -- there is
+        // no `GetRenderTarget`-style write here, and treating the first one as
+        // one overwrites a surface object with a pointer to itself.
         "SetRenderTarget" => {
             state(host)?;
-            let previous = parameter(call, 0)?;
-            let wanted = parameter(call, 1)?;
-            let current = if host.d3d8.render_target == 0 {
-                back_buffer(host, call)?
-            } else {
-                host.d3d8.render_target
-            };
-            if previous != 0 {
-                call.write_u32(previous, current)?;
-            }
+            let wanted = parameter(call, 0)?;
+            let depth = parameter(call, 1)?;
             // Only the buffer this host has can be drawn into; anything else is
             // refused by name rather than silently redirected, because a picture
             // drawn into the wrong target is worse than a stop that says so.
             if wanted != 0 && wanted != host.d3d8.back_buffer_surface {
-                return Err(
-                    "Direct3D 8: SetRenderTarget asked for a surface that is not the back buffer;\
-                     this host draws into one buffer"
-                        .to_string(),
-                );
+                return Err(format!(
+                    "Direct3D 8: SetRenderTarget asked for a surface that is not the back buffer\
+                     ({wanted:#x}, this device's buffer is {:#x}, its depth is {depth:#x}); this \
+                     host draws into one buffer",
+                    host.d3d8.back_buffer_surface
+                ));
             }
             host.d3d8.render_target = wanted;
             Ok(Return(S_OK))
@@ -1438,9 +1449,23 @@ fn device(method: &str, host: &mut Host, call: &mut Call<'_>) -> Result<Action> 
         "CreateVertexBuffer" => create_buffer(host, call, false),
         "CreateIndexBuffer" => create_buffer(host, call, true),
         "CreateTexture" => create_texture(host, call),
-        // A texture the guest fills itself: `CreateImageSurface` is the same thing
-        // without a mip chain, and both would have to become render targets for
-        // `CopyRects` to work, which is a surface this device does not have.        "CreateVolumeTexture" | "CreateCubeTexture" | "CopyRects" | "UpdateTexture"
+        // `CopyRects(SourceSurface, SourceRects, RectCount, DestSurface,
+        // DestPoints)`: RenderWare moves a rendered frame into a texture through
+        // here, so the rectangles have to land in the guest's own bytes for the
+        // next draw to sample them.
+        "CopyRects" => {
+            state(host)?;
+            let source = parameter(call, 0)?;
+            let rects = parameter(call, 1)?;
+            let count = parameter(call, 2)?;
+            let destination = parameter(call, 3)?;
+            let points = parameter(call, 4)?;
+            copy_rects(host, call, source, rects, count, destination, points)
+        }
+        // A volume or cube texture, a texture a guest hands over from an image
+        // surface, and the state blocks: each names itself rather than being
+        // answered with something that would draw the wrong picture.
+        "CreateVolumeTexture" | "CreateCubeTexture" | "UpdateTexture"
         | "CreateAdditionalSwapChain"
         | "CreateStateBlock" | "BeginStateBlock" | "EndStateBlock" | "DeleteStateBlock"
         | "ApplyStateBlock" | "CaptureStateBlock" | "ProcessVertices" | "SetClipPlane"
@@ -2393,6 +2418,146 @@ fn texture_surface(
     }
 }
 
+/// The guest bytes behind a surface, when this device has any.
+///
+/// Only a texture's levels are real memory here: the back buffer and the
+/// surfaces `CreateRenderTarget` and `CreateImageSurface` hand out are names
+/// for buffers the page owns, so a copy into or out of one of them has no
+/// bytes here to move.
+#[derive(Clone, Copy)]
+struct Pixels {
+    address: u32,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    format: u32,
+    bytes: u32,
+}
+
+fn pixels(host: &Host, object: u32) -> Option<Pixels> {
+    let &(texture, level) = host.d3d8.texture_surfaces.get(&object)?;
+    let t = host.d3d8.textures.get(&texture)?;
+    Some(Pixels {
+        address: t.level_address(level)?,
+        pitch: t.level_pitches[level as usize],
+        width: t.level_width(level),
+        height: t.level_height(level),
+        format: t.format,
+        bytes: bytes_per_pixel(t.format)?,
+    })
+}
+
+/// `CopyRects`: each source rectangle lands at the matching destination point,
+/// or at its own coordinates when no points are given. A zero rectangle count
+/// with no rectangle array means the whole surface.
+///
+/// Direct3D 8 requires the two surfaces to share a format, and a rectangle that
+/// reaches past either surface is clipped rather than wrapped: a wrapped row
+/// would draw the picture skewed. A copy into a texture level is followed by the
+/// same upload an unlock records, because the next draw samples those bytes.
+fn copy_rects(
+    host: &mut Host,
+    call: &mut Call<'_>,
+    source: u32,
+    rects: u32,
+    count: u32,
+    destination: u32,
+    points: u32,
+) -> Result<Action> {
+    if source == 0 || destination == 0 {
+        return Ok(Return(D3DERR_INVALIDCALL));
+    }
+    let (Some(from), Some(to)) = (pixels(host, source), pixels(host, destination)) else {
+        // A rendered frame copied out of the back buffer is the common case, and
+        // the page already has those pixels on its own side of the fence.
+        if !host.d3d8.said_copy_rects {
+            host.d3d8.said_copy_rects = true;
+            host.notice(format!(
+                "Direct3D 8: CopyRects moves pixels between surfaces the page owns \
+                 ({source:#x} -> {destination:#x}, {count} rectangle(s)), which this host has \
+                 no guest bytes for; the texture keeps what it held"
+            ));
+        }
+        return Ok(Return(S_OK));
+    };
+    if from.format != to.format {
+        return Ok(Return(D3DERR_INVALIDCALL));
+    }
+    if rects == 0 || count == 0 {
+        copy_rectangle(call, &from, &to, 0, 0, from.width as i32, from.height as i32, 0, 0)?;
+    } else {
+        for index in 0..count {
+            let rect = rects.wrapping_add(index.wrapping_mul(16));
+            let left = call.memory.read_u32(rect)? as i32;
+            let top = call.memory.read_u32(rect + 4)? as i32;
+            let right = call.memory.read_u32(rect + 8)? as i32;
+            let bottom = call.memory.read_u32(rect + 12)? as i32;
+            let (dx, dy) = if points == 0 {
+                (left, top)
+            } else {
+                let point = points.wrapping_add(index.wrapping_mul(8));
+                (
+                    call.memory.read_u32(point)? as i32,
+                    call.memory.read_u32(point + 4)? as i32,
+                )
+            };
+            copy_rectangle(call, &from, &to, left, top, right, bottom, dx, dy)?;
+        }
+    }
+    if let Some(&(texture, level)) = host.d3d8.texture_surfaces.get(&destination) {
+        let mut record = host.d3d8.stream.begin(op::UPDATE_TEXTURE);
+        record
+            .u32(texture)
+            .u32(level)
+            .guest(to.address)
+            .u32(to.pitch)
+            .u32(to.width)
+            .u32(to.height)
+            .u32(to.format);
+    }
+    Ok(Return(S_OK))
+}
+
+/// Copies the part of `(left, top)-(right, bottom)` that lies inside both
+/// surfaces, with its top-left corner at `(dx, dy)` on the destination.
+#[allow(clippy::too_many_arguments)]
+fn copy_rectangle(
+    call: &mut Call<'_>,
+    from: &Pixels,
+    to: &Pixels,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    dx: i32,
+    dy: i32,
+) -> Result<()> {
+    let (width, height) = (from.width as i32, from.height as i32);
+    let mut left = left.max(0);
+    let mut top = top.max(0);
+    let mut right = right.min(width);
+    let mut bottom = bottom.min(height);
+    // The destination point can push the copied block off the destination, in
+    // either direction, so the rectangle moves rather than the point.
+    left = left.max(-dx);
+    top = top.max(-dy);
+    right = right.min(to.width as i32 - dx);
+    bottom = bottom.min(to.height as i32 - dy);
+    if right <= left || bottom <= top {
+        return Ok(());
+    }
+    let row = (right - left) as usize * from.bytes as usize;
+    let (x, y) = ((dx + left) as u32, (dy + top) as u32);
+    for row_index in 0..(bottom - top) as u32 {
+        let source = from.address
+            + (top as u32 + row_index) * from.pitch
+            + left as u32 * from.bytes;
+        let destination = to.address + (y + row_index) * to.pitch + x * to.bytes;
+        call.memory.copy(source, destination, row)?;
+    }
+    Ok(())
+}
+
 /// `QueryInterface`: `IID_IUnknown` answers the same object, and anything else is
 /// refused. Answering `S_OK` for an interface that is not implemented would send
 /// the guest into a vtable we cannot answer, which is worse than a stop.
@@ -2947,6 +3112,176 @@ mod tests {
         )
         .expect_err("a compressed texture is refused");
         assert!(error.contains("format"), "{error}");
+    }
+
+    #[test]
+    fn copy_rects_moves_the_guest_bytes_a_rendered_frame_would() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let device = device_at(&mut host, &mut memory);
+        let holder = crate::memory::STACK_BASE + 0x5300;
+        // Two 8x8 A8R8G8B8 textures: the source a rendered frame would land in,
+        // and the destination the next draw samples.
+        invoke_on(
+            &mut host,
+            &mut memory,
+            device,
+            D3D8_DEVICE,
+            "CreateTexture",
+            &[8, 8, 1, 0, D3DFMT_A8R8G8B8, 0, holder],
+        )
+        .expect("a source texture");
+        let source = memory.read_u32(holder).unwrap();
+        invoke_on(
+            &mut host,
+            &mut memory,
+            device,
+            D3D8_DEVICE,
+            "CreateTexture",
+            &[8, 8, 1, 0, D3DFMT_A8R8G8B8, 0, holder],
+        )
+        .expect("a destination texture");
+        let destination = memory.read_u32(holder).unwrap();
+
+        // Every source pixel names its own coordinate, so a row that lands one
+        // place off is a difference rather than the same colour over and over.
+        let (address, pitch) = {
+            let texture = &host.d3d8.textures[&source];
+            (texture.address, texture.pitch)
+        };
+        for y in 0..8u32 {
+            for x in 0..8u32 {
+                memory
+                    .write_u32(address + y * pitch + x * 4, y * 8 + x)
+                    .unwrap();
+            }
+        }
+
+        let source_holder = crate::memory::STACK_BASE + 0x5600;
+        let destination_holder = crate::memory::STACK_BASE + 0x5700;
+        invoke_on(
+            &mut host,
+            &mut memory,
+            source,
+            D3D8_TEXTURE,
+            "GetSurfaceLevel",
+            &[0, source_holder],
+        )
+        .expect("the source level's surface");
+        invoke_on(
+            &mut host,
+            &mut memory,
+            destination,
+            D3D8_TEXTURE,
+            "GetSurfaceLevel",
+            &[0, destination_holder],
+        )
+        .expect("the destination level's surface");
+        let source_surface = memory.read_u32(source_holder).unwrap();
+        let destination_surface = memory.read_u32(destination_holder).unwrap();
+
+        // `CopyRects(Source, Rects, 1, Destination, NULL)`: no points means each
+        // rectangle lands at its own coordinates.
+        let rect = crate::memory::STACK_BASE + 0x5800;
+        for (offset, value) in [(0, 2), (4, 3), (8, 6), (12, 5)] {
+            memory.write_u32(rect + offset, value).unwrap();
+        }
+        let answer = invoke_on(
+            &mut host,
+            &mut memory,
+            device,
+            D3D8_DEVICE,
+            "CopyRects",
+            &[source_surface, rect, 1, destination_surface, 0],
+        )
+        .expect("a copy");
+        assert_eq!(answer, Return(S_OK));
+
+        let target = host.d3d8.textures[&destination].address;
+        let target_pitch = host.d3d8.textures[&destination].pitch;
+        for y in 0..8u32 {
+            for x in 0..8u32 {
+                let got = memory.read_u32(target + y * target_pitch + x * 4).unwrap();
+                let inside = (2..6).contains(&x) && (3..5).contains(&y);
+                assert_eq!(
+                    got,
+                    if inside { y * 8 + x } else { 0 },
+                    "pixel {x},{y} of the destination"
+                );
+            }
+        }
+
+        // The page is told to upload the level again, exactly as an unlock would
+        // tell it: the bytes changed without a lock.
+        let mut last = None;
+        let mut cursor = crate::render::Cursor::new(host.d3d8.stream.bytes());
+        while let Some(Ok((operation, payload))) = cursor.next() {
+            last = Some((operation, crate::render::payload_u32(payload, 0)));
+        }
+        assert_eq!(last, Some((op::UPDATE_TEXTURE, Some(destination))));
+    }
+
+    #[test]
+    fn set_render_target_takes_surface_handles_not_out_pointers() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let device = device_at(&mut host, &mut memory);
+        let holder = crate::memory::STACK_BASE + 0x5300;
+        invoke_on(
+            &mut host,
+            &mut memory,
+            device,
+            D3D8_DEVICE,
+            "GetRenderTarget",
+            &[holder],
+        )
+        .expect("a render target");
+        let target = memory.read_u32(holder).unwrap();
+        let depth_holder = crate::memory::STACK_BASE + 0x5400;
+        invoke_on(
+            &mut host,
+            &mut memory,
+            device,
+            D3D8_DEVICE,
+            "GetDepthStencilSurface",
+            &[depth_holder],
+        )
+        .expect("a depth stencil");
+        let depth = memory.read_u32(depth_holder).unwrap();
+        let table = memory.read_u32(target).unwrap();
+
+        // Both arguments are handles, so `SetRenderTarget` stores nothing
+        // through them: neither object's vtable pointer moves. A save and a
+        // restore around a render-to-texture pass is exactly this call twice.
+        let answer = invoke_on(
+            &mut host,
+            &mut memory,
+            device,
+            D3D8_DEVICE,
+            "SetRenderTarget",
+            &[target, depth],
+        )
+        .expect("a target is set");
+        assert_eq!(answer, Return(S_OK));
+        assert_eq!(
+            memory.read_u32(target).unwrap(),
+            table,
+            "the render target object is unchanged"
+        );
+        assert_eq!(
+            invoke_on(
+                &mut host,
+                &mut memory,
+                device,
+                D3D8_DEVICE,
+                "SetRenderTarget",
+                &[0, 0]
+            )
+            .expect("the default target"),
+            Return(S_OK)
+        );
     }
 
     #[test]

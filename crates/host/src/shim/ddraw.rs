@@ -34,7 +34,7 @@
 
 use std::collections::HashMap;
 
-use crate::shim::{Action, Binding, Call, Host};
+use crate::shim::{Action, Binding, Call, GuestCall, Host};
 use crate::thunks::{self, m, Method};
 use crate::Result;
 
@@ -305,6 +305,15 @@ impl DirectDraw {
 
     /// Bits per pixel of what is presented: 8 for a palettised surface, 16 or 32
     /// for a truecolour one. A page needs this to read the pixels correctly.
+    /// The depth the display mode asks for: 8 for a palettised screen, 16 or 32
+    /// for a truecolour one. This is the mode, not the surface -- `bits` answers
+    /// what is on screen now, which is a different question once a surface
+    /// exists. The window's own screen is built at this depth so the page colours
+    /// it the way the guest's display did.
+    pub fn display_depth(&self) -> u8 {
+        self.depth
+    }
+
     pub fn bits(&self) -> u8 {
         if let Some(presented) = self.presented.as_ref() {
             return presented.bits;
@@ -342,6 +351,29 @@ impl DirectDraw {
     /// The 256-entry palette the guest set, RGB triples in index order.
     pub fn palette(&self) -> &[[u8; 3]; 256] {
         &self.palette
+    }
+
+    /// Writes a run of entries into the palette the page shows, which is what
+    /// GDI's `RealizePalette` does to the device a context draws on.
+    ///
+    /// A guest that fades with GDI's `SetPaletteEntries` and `RealizePalette`
+    /// writes the same table `IDirectDrawPalette` does, so it has to land in the
+    /// same place; answering the number that changed is what `RealizePalette`
+    /// returns, and every one of them bumps the revision the page repaints on.
+    pub fn write_palette_entries(&mut self, first: u32, entries: &[[u8; 3]]) -> u32 {
+        let mut changed = 0;
+        for (offset, colour) in entries.iter().enumerate() {
+            let index = first as usize + offset;
+            if index >= 256 {
+                break;
+            }
+            let before = self.palette[index];
+            self.set_entry(index, *colour);
+            if self.palette[index] != before {
+                changed += 1;
+            }
+        }
+        changed
     }
 
     /// Writes one entry, unless DirectDraw reserves it: indices 0 and 255 are
@@ -764,6 +796,9 @@ pub(crate) fn serve(
             host.ddraw.height = height;
             host.ddraw.depth = depth;
             host.notice(format!("DirectDraw: display mode {width}x{height}x{depth}"));
+            // The screen the page reads follows the mode, or the guest draws its
+            // layout into a surface of the size it happened to have before.
+            crate::shim::gdi32::resize_window_screen(host, width, height)?;
             Ok(Return(DD_OK))
         }
         (thunks::DDRAW, "RestoreDisplayMode") | (thunks::DDRAW, "WaitForVerticalBlank") => {
@@ -1003,9 +1038,46 @@ pub(crate) fn serve(
         }
         (thunks::DDRAW_SURFACE, "SetColorKey") => set_color_key(host, call),
         (thunks::DDRAW_SURFACE, "GetColorKey") => get_color_key(host, call),
+        (thunks::DDRAW_SURFACE, "EnumAttachedSurfaces") => {
+            let context = call.arg(1)?;
+            let callback = call.arg(2)?;
+            let back = host.ddraw.backbuffer.unwrap_or(0);
+            if callback == 0 || back == 0 {
+                return Ok(Return(DD_OK));
+            }
+            let Some(surface) = host.ddraw.surfaces.get(&back) else {
+                return Ok(Return(DD_OK));
+            };
+            let surface = Surface {
+                width: surface.width,
+                height: surface.height,
+                pitch: surface.pitch,
+                bits: surface.bits,
+                buffer: surface.buffer,
+                caps: surface.caps,
+                locks: 0,
+                src_key: surface.src_key,
+                dest_key: surface.dest_key,
+                size: surface.size,
+                refs: 1,
+            };
+            let desc_at = host.allocate(DESC_SIZE, 4)?;
+            write_desc(call, desc_at, &surface)?;
+            // The one attachment a flipping primary has is its back buffer: run
+            // the guest's callback once with it, the way Windows does. Without
+            // this the enumeration silently finds nothing and the guest keeps
+            // whatever it had, which is how a title that locates its back buffer
+            // this way ends up walking garbage instead.
+            host.guest_call = Some(GuestCall {
+                entry: callback,
+                args: [back, desc_at, context, 0],
+                answer: Some(DD_OK),
+                resume: false,
+            });
+            Ok(Return(DD_OK))
+        }
         (thunks::DDRAW_SURFACE, "AddAttachedSurface")
         | (thunks::DDRAW_SURFACE, "AddOverlayDirtyRect")
-        | (thunks::DDRAW_SURFACE, "EnumAttachedSurfaces")
         | (thunks::DDRAW_SURFACE, "EnumOverlayZOrders")
         | (thunks::DDRAW_SURFACE, "Initialize")
         | (thunks::DDRAW_SURFACE, "SetOverlayPosition")
@@ -1221,7 +1293,11 @@ fn set_color_key(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     } else {
         let low = call.memory.read_u32(key)?;
         let high = call.memory.read_u32(key + 4)?;
-        Some((low.min(high), low.max(high)))
+        // A guest that keys one colour leaves the high value zero. Reading that
+        // as the range `0..=low` makes every pixel below the key transparent --
+        // which eats holes through a sprite wherever its art is dark -- while
+        // Windows means the single colour it was given.
+        Some(if high <= low { (low, low) } else { (low, high) })
     };
     if std::env::var("SHIMKIT_LOG_KEYS").is_ok() && host.notices.len() < 4000 {
         let (low, high) = range.unwrap_or((0, 0));
@@ -1263,9 +1339,131 @@ fn get_color_key(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     Ok(Return(DD_OK))
 }
 
-/// A rectangle copy. No stretching: the guest only ever copies same-format
-/// surfaces at the same size. A blit may be keyed, though -- the guest masks its
-/// sprites that way -- so the key ranges are honoured pixel by pixel.
+/// A blit between surfaces of different pixel sizes.
+///
+/// DirectDraw converts as it copies: an 8-bit artwork surface blitted onto a
+/// 32-bit primary reaches the screen as colour. Copying raw bytes instead wrote
+/// one index byte for every four-byte destination pixel, so the index landed in
+/// the blue channel and the other three kept whatever the previous frame left
+/// there -- a picture with its pixels torn out. That is what a screen built out of
+/// palettised sprites over a truecolour backdrop looks like when the conversion
+/// is missing: colour-keyed holes, torn text, and the ghost of the last frame
+/// showing through the gaps.
+fn blit_between_depths(
+    host: &mut Host,
+    call: &mut Call<'_>,
+    from: (u8, u32, u32, Option<(u32, u32)>),
+    to: (u8, u32, u32, Option<(u32, u32)>),
+    corners: (i32, i32, i32, i32),
+    size: (u32, u32),
+) -> Result<Action> {
+    let (sx, sy, left, top) = corners;
+    let (width, height) = size;
+    let (from_bits, from_buffer, from_pitch, src_key) = from;
+    let (to_bits, to_buffer, to_pitch, dest_key) = to;
+    // Copied out whole so the palette borrow ends before the pixels are written.
+    let palette = *host.ddraw.palette();
+    let from_bytes = u32::from(from_bits / 8).max(1);
+    let to_bytes = u32::from(to_bits / 8).max(1);
+    for row in 0..height {
+        let source_row =
+            from_buffer + (sy as u32 + row) * from_pitch + sx as u32 * from_bytes;
+        let dest_row = to_buffer + (top as u32 + row) * to_pitch + left as u32 * to_bytes;
+        for column in 0..width {
+            let source_at = source_row + column * from_bytes;
+            let value = match from_bits {
+                8 => u32::from(call.memory.read_u8(source_at)?),
+                16 => u32::from(call.memory.read_u16(source_at)?),
+                _ => call.memory.read_u32(source_at)?,
+            };
+            if let Some((low, high)) = src_key {
+                if (low..=high).contains(&value) {
+                    continue;
+                }
+            }
+            let dest_at = dest_row + column * to_bytes;
+            if let Some((low, high)) = dest_key {
+                let underneath = match to_bits {
+                    8 => u32::from(call.memory.read_u8(dest_at)?),
+                    16 => u32::from(call.memory.read_u16(dest_at)?),
+                    _ => call.memory.read_u32(dest_at)?,
+                };
+                if (low..=high).contains(&underneath) {
+                    continue;
+                }
+            }
+            let (red, green, blue) = colour_of(value, from_bits, &palette);
+            match to_bits {
+                8 => call
+                    .memory
+                    .write_u8(dest_at, nearest_index(&palette, (red, green, blue)))?,
+                16 => {
+                    let packed = (u32::from(red >> 3) << 11)
+                        | (u32::from(green >> 2) << 5)
+                        | u32::from(blue >> 3);
+                    call.memory.write_u16(dest_at, packed as u16)?;
+                }
+                _ => {
+                    // BGRX: the layout the page reads and `GetPixelFormat` reports.
+                    call.memory.write_u8(dest_at, blue)?;
+                    call.memory.write_u8(dest_at + 1, green)?;
+                    call.memory.write_u8(dest_at + 2, red)?;
+                    call.memory.write_u8(dest_at + 3, 0)?;
+                }
+            }
+        }
+    }
+    Ok(Return(DD_OK))
+}
+
+/// A pixel of `bits` per pixel, as the number the surfaces hold.
+fn colour_of(value: u32, bits: u8, palette: &[[u8; 3]; 256]) -> (u8, u8, u8) {
+    match bits {
+        8 => {
+            let [red, green, blue] = palette[(value & 0xff) as usize];
+            (red, green, blue)
+        }
+        16 => {
+            let pixel = value as u16;
+            let red = (pixel >> 11) & 0x1f;
+            let green = (pixel >> 5) & 0x3f;
+            let blue = pixel & 0x1f;
+            (
+                ((red << 3) | (red >> 2)) as u8,
+                ((green << 2) | (green >> 4)) as u8,
+                ((blue << 3) | (blue >> 2)) as u8,
+            )
+        }
+        _ => (
+            ((value >> 16) & 0xff) as u8,
+            ((value >> 8) & 0xff) as u8,
+            (value & 0xff) as u8,
+        ),
+    }
+}
+
+/// The palette entry closest to `colour`, by squared distance: an 8-bit
+/// destination has no other way to take a truecolour source.
+fn nearest_index(palette: &[[u8; 3]; 256], colour: (u8, u8, u8)) -> u8 {
+    let mut best = 0_u8;
+    let mut best_distance = i32::MAX;
+    for (index, entry) in palette.iter().enumerate() {
+        let red = i32::from(entry[0]) - i32::from(colour.0);
+        let green = i32::from(entry[1]) - i32::from(colour.1);
+        let blue = i32::from(entry[2]) - i32::from(colour.2);
+        let distance = red * red + green * green + blue * blue;
+        if distance < best_distance {
+            best_distance = distance;
+            best = index as u8;
+        }
+    }
+    best
+}
+
+/// A rectangle copy. No stretching: the guest only ever copies surfaces at the
+/// same size. A blit may be keyed, though -- the guest masks its sprites that
+/// way -- so the key ranges are honoured pixel by pixel, and a copy between two
+/// pixel sizes converts each pixel rather than moving its bytes.
 fn blit(host: &mut Host, call: &mut Call<'_>, method: &'static str) -> Result<Action> {
     let this = call.arg(0)?;
     // `BltFast(dx, dy, lpDDSrcSurface, lpSrcRect, dwTrans)` positions the copy
@@ -1519,6 +1717,30 @@ fn blit(host: &mut Host, call: &mut Call<'_>, method: &'static str) -> Result<Ac
     width = width.min(to.width - left as u32);
     height = height.min(to.height - top as u32);
 
+    // Surfaces of different pixel sizes convert on the way through. Copying the
+    // bytes was only ever right when both ends had the same pixel size.
+    if from.bits != to.bits {
+        // Copied out of the surfaces before the call: the pixels are written
+        // through `host`, which a borrow of its own surface table would forbid.
+        return blit_between_depths(
+            host,
+            call,
+            (
+                from.bits,
+                from.buffer,
+                from.pitch,
+                if key_source { from.src_key } else { None },
+            ),
+            (
+                to.bits,
+                to.buffer,
+                to.pitch,
+                if key_destination { to.dest_key } else { None },
+            ),
+            (sx as i32, sy as i32, left, top),
+            (width, height),
+        );
+    }
     let bytes = usize::from(from.bits / 8).max(1);
     let row_bytes = width as usize * bytes;
     // A colour key is one pixel wide, so a keyed blit compares whole pixels.
@@ -2008,6 +2230,83 @@ mod tests {
         // on the same block instead of advancing the arena, which is what makes a
         // session that creates a surface per tile fit in the heap at all.
         assert_eq!(host.allocate(size, 4).unwrap(), buffer);
+    }
+
+    #[test]
+    fn a_key_set_with_only_its_low_value_keys_one_colour() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let sprite = eight_by_four(&mut host, &mut memory, DDSCAPS_OFFSCREENPLAIN);
+        let key = STACK_BASE + 0xe600;
+        let args = STACK_BASE + 0xe700;
+        let out = STACK_BASE + 0xe800;
+        // A guest that keys one colour leaves the high value zero. That is the
+        // colour it means, not "everything from zero up to it", which makes every
+        // dark pixel of a sprite transparent and eats holes through the art.
+        memory.write_u32(key, 5).unwrap();
+        memory.write_u32(key + 4, 0).unwrap();
+        memory.write_u32(args, sprite).unwrap();
+        memory.write_u32(args + 4, DDCKEY_SRCBLT).unwrap();
+        memory.write_u32(args + 8, key).unwrap();
+        {
+            let mut call = Call {
+                memory: &mut memory,
+                args,
+                arg_bytes: 12,
+            };
+            assert_eq!(
+                serve(&mut host, &mut call, thunks::DDRAW_SURFACE, "SetColorKey").unwrap(),
+                Return(DD_OK)
+            );
+        }
+        memory.write_u32(args + 8, out).unwrap();
+        {
+            let mut call = Call {
+                memory: &mut memory,
+                args,
+                arg_bytes: 12,
+            };
+            assert_eq!(
+                serve(&mut host, &mut call, thunks::DDRAW_SURFACE, "GetColorKey").unwrap(),
+                Return(DD_OK)
+            );
+        }
+        assert_eq!(memory.read_u32(out).unwrap(), 5);
+        assert_eq!(
+            memory.read_u32(out + 4).unwrap(),
+            5,
+            "one colour, not everything below it"
+        );
+
+        // A real range is kept as it stands.
+        memory.write_u32(key, 2).unwrap();
+        memory.write_u32(key + 4, 6).unwrap();
+        {
+            let mut call = Call {
+                memory: &mut memory,
+                args,
+                arg_bytes: 12,
+            };
+            assert_eq!(
+                serve(&mut host, &mut call, thunks::DDRAW_SURFACE, "SetColorKey").unwrap(),
+                Return(DD_OK)
+            );
+        }
+        memory.write_u32(args + 8, out).unwrap();
+        {
+            let mut call = Call {
+                memory: &mut memory,
+                args,
+                arg_bytes: 12,
+            };
+            assert_eq!(
+                serve(&mut host, &mut call, thunks::DDRAW_SURFACE, "GetColorKey").unwrap(),
+                Return(DD_OK)
+            );
+        }
+        assert_eq!(memory.read_u32(out).unwrap(), 2);
+        assert_eq!(memory.read_u32(out + 4).unwrap(), 6);
     }
 
     #[test]

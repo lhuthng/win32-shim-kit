@@ -42,9 +42,15 @@ thread_local! {
     static EXE_NAME: RefCell<String> = const { RefCell::new(String::new()) };
     /// The screen to seed before the guest asks for its own display mode.
     static SCREEN: Cell<(u16, u16, u8)> = const { Cell::new((640, 480, 8)) };
+    /// The Windows the guest is told it runs on, before it reads it.
+    static WINDOWS: Cell<host::target::Windows> = const { Cell::new(host::target::Windows::XP) };
     static MESSAGE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static LAST_SLOT: Cell<i32> = const { Cell::new(-1) };
     static NOTICES_SHOWN: Cell<u32> = const { Cell::new(0) };
+    /// The page never touches this: it lets a probe boot the same module with
+    /// the native replacements off, so an A/B comparison needs only one build.
+    /// Set before [`wh_load`], which is when the target is built.
+    static HLE_ENABLED: Cell<bool> = const { Cell::new(true) };
 }
 
 fn set_message(text: &str) {
@@ -53,6 +59,33 @@ fn set_message(text: &str) {
         message.clear();
         message.extend_from_slice(text.as_bytes());
     });
+}
+
+/// TEMP DIAGNOSTIC: the guest's thread table as text, so a browser session can
+/// name where its threads sit without a probe. The page reads this through the
+/// message buffer. Remove when done.
+#[no_mangle]
+pub extern "C" fn wh_thread_debug_len() -> u32 {
+    let text = SESSION.with(|cell| {
+        cell.borrow().as_ref().map_or_else(
+            || String::from("no session"),
+            |session| {
+                session
+                    .thread_summaries()
+                    .iter()
+                    .map(|thread| {
+                        format!(
+                            "thread {} {:?} pc {:#010x} waits {:?} stack {:?}",
+                            thread.id, thread.state, thread.pc, thread.waits, thread.stack
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            },
+        )
+    });
+    set_message(&text);
+    text.len() as u32
 }
 
 /// Copies a string into the module's static lifetime.
@@ -97,13 +130,30 @@ fn build_target(image: &pe::Image) -> &'static Target {
         }
     });
     let screen = SCREEN.with(Cell::get);
+    let windows = WINDOWS.with(Cell::get);
+    // The native replacements belong to one image each, so the payload's own
+    // program name decides: Madagascar's `_rwcseg` vertex transform answers
+    // only for a `Game.exe` payload, Hercules' sprite rows only for a
+    // `HERCULES.EXE` payload, and every other program boots without any.
+    // An address that is code in one image can be data in another.
+    let hle: &'static [target::HleEntry] = if !HLE_ENABLED.with(Cell::get) {
+        &[]
+    } else if name.eq_ignore_ascii_case("Game.exe") {
+        host::hle::MADAGASCAR_HLE
+    } else if name.eq_ignore_ascii_case("HERCULES.EXE") {
+        host::hle::HERCULES_HLE
+    } else {
+        &[]
+    };
     Box::leak(Box::new(Target {
         name: "wasm",
         exe_name: leak(&name),
         screen,
+        windows,
         table: table_for(image),
         shims: host::shim::TABLES,
         provided_files: &[],
+        hle,
     }))
 }
 
@@ -129,6 +179,57 @@ pub extern "C" fn wh_set_exe_name(ptr: *const u8, len: u32) -> i32 {
     0
 }
 
+/// Arms or disarms the target's native replacements for the next [`wh_load`].
+/// The page leaves this alone; a probe uses 0 to boot the same module with the
+/// guest's own loops, which is what makes a byte-exact A/B of a replacement
+/// possible without two builds. Returns 0.
+#[no_mangle]
+pub extern "C" fn wh_set_hle(enabled: i32) -> i32 {
+    HLE_ENABLED.with(|flag| flag.set(enabled != 0));
+    0
+}
+
+/// Hercules sprite rows the host drew natively instead of interpreting, and
+/// the pixels they covered. Zero means no replacement is armed for this image.
+#[no_mangle]
+pub extern "C" fn wh_hle_calls() -> f64 {
+    SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(0.0, |session| session.hercules_calls() as f64)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn wh_hle_pixels() -> f64 {
+    SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(0.0, |session| session.hercules_pixels() as f64)
+    })
+}
+
+/// Guest instructions those rows stood in for. The instruction counter already
+/// includes them, so this is the share of the run the interpreter did not
+/// execute.
+#[no_mangle]
+pub extern "C" fn wh_hle_work() -> f64 {
+    SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(0.0, |session| session.hercules_work() as f64)
+    })
+}
+
+/// The module build's stamp, so a page can tell which engine it is talking to:
+/// a browser that cached an older module would otherwise replay old shims
+/// silently. The page compares this against what its own build expects.
+#[no_mangle]
+pub extern "C" fn wh_module_stamp() -> u32 {
+    // 2026-10-30, the day the stamp went in.
+    20_261_030
+}
+
 /// Seeds the screen before the guest creates its own: width, height, bits.
 /// Call before [`wh_load`]; 0, or -1 for a size the host cannot take.
 #[no_mangle]
@@ -142,6 +243,35 @@ pub extern "C" fn wh_set_screen(width: u32, height: u32, depth: u32) -> i32 {
         return -1;
     }
     SCREEN.with(|screen| screen.set((width as u16, height as u16, depth as u8)));
+    0
+}
+
+/// Seeds the platform the guest is told it runs on: major, minor, build, and the
+/// `dwPlatformId` (1 for Win9x, 2 for NT). Call before [`wh_load`]; 0, or -1 for
+/// a platform a real Windows never reported.
+///
+/// This exists because a start-up check is often the first thing a title does and
+/// the exact answer it wants is not the newest one: a launcher written for
+/// Windows 98 refuses to run on a machine that reports XP, and nothing else it
+/// calls ever gets a chance to be wrong.
+#[no_mangle]
+pub extern "C" fn wh_set_windows(major: u32, minor: u32, build: u32, platform: u32) -> i32 {
+    if major == 0 || major > 10 || minor > 99 || build > u32::from(u16::MAX) {
+        set_message("the Windows version is out of range");
+        return -1;
+    }
+    if platform != 1 && platform != 2 {
+        set_message("the platform must be 1 (Win9x) or 2 (NT)");
+        return -1;
+    }
+    WINDOWS.with(|slot| {
+        slot.set(host::target::Windows {
+            major: major as u8,
+            minor: minor as u8,
+            build: build as u16,
+            platform,
+        })
+    });
     0
 }
 
@@ -229,6 +359,20 @@ pub extern "C" fn wh_run(budget: u32) -> i32 {
         set_message("no executable loaded");
         return -1;
     };
+
+    // A stop's reason is written into the message buffer, and so is each entry of
+    // the notice trail -- one buffer, reused. The page drains the trail just
+    // before it asks why the run ended, so a backlog left here would be shown in
+    // place of the fault: a guest that faulted mid-stream was reported as its
+    // last `audio Unlock`. Dropping the backlog is what lets a fault name itself.
+    if matches!(outcome, Outcome::Fault(_) | Outcome::Halted) {
+        SESSION.with(|cell| {
+            if let Some(session) = cell.borrow_mut().as_mut() {
+                session.host.notices.clear();
+            }
+        });
+        NOTICES_SHOWN.with(|shown| shown.set(0));
+    }
 
     match &outcome {
         Outcome::HostCall(call) => {
@@ -429,6 +573,45 @@ pub extern "C" fn wh_saved_version() -> u32 {
         cell.borrow()
             .as_ref()
             .map_or(0, |session| session.host.files.version() as u32)
+    })
+}
+
+/// The registry in its text form, written into the message buffer: the length
+/// written, or 0 with no session. Read it with `wh_message_ptr`/`wh_message_len`
+/// and keep it as `registry.txt` next to the payload, which the next boot seeds
+/// before the guest's first instruction -- so a run's settings survive without a
+/// real registry behind them.
+#[no_mangle]
+pub extern "C" fn wh_registry_text() -> u32 {
+    SESSION.with(|cell| {
+        let session = cell.borrow();
+        let Some(session) = session.as_ref() else {
+            return 0;
+        };
+        let text = session.registry_text();
+        let length = text.len() as u32;
+        set_message(&text);
+        length
+    })
+}
+
+/// What this run read out of the registry and did not find, in the same text form
+/// and through the same message buffer as `wh_registry_text`: keep it as
+/// `registry.txt`, fill in the blank values, and the next boot answers them.
+///
+/// This is how a port learns a title's key paths: they are built at run time and
+/// passed straight to `RegOpenKeyExA`, so nothing in the install names them.
+#[no_mangle]
+pub extern "C" fn wh_registry_wanted() -> u32 {
+    SESSION.with(|cell| {
+        let session = cell.borrow();
+        let Some(session) = session.as_ref() else {
+            return 0;
+        };
+        let text = session.registry_wanted_text();
+        let length = text.len() as u32;
+        set_message(&text);
+        length
     })
 }
 
@@ -775,6 +958,18 @@ pub extern "C" fn wh_audio_samples_len(voice: u32) -> u32 {
     })
 }
 
+/// A voice's play cursor in bytes: the position the guest is told through
+/// `GetCurrentPosition`, so a page mixing the buffer itself reads from where the
+/// guest believes playback is rather than from a position of its own.
+#[no_mangle]
+pub extern "C" fn wh_audio_position(voice: u32) -> u32 {
+    SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(0, |session| session.host.audio_position(voice))
+    })
+}
+
 /// Whether the guest wants the system pointer shown. `ShowCursor` moves a counter
 /// that only goes negative when the guest asked for the pointer to be hidden --
 /// which a game that draws its own cursor does -- so a page hides its pointer
@@ -795,6 +990,18 @@ pub extern "C" fn wh_audio_plays() -> f64 {
             .as_ref()
             .map_or(0.0, |session| session.host.audio.plays() as f64)
     })
+}
+
+/// Turns the DirectSound call trail on, which is the only record of *which
+/// object* a guest aimed `Stop` and `Release` at: the event stream names the
+/// voice a buffer played as, never the one it was stopped as, so a guest that
+/// stops the wrong buffer is indistinguishable from one that stops nothing.
+///
+/// `SHIMKIT_LOG_AUDIO` is the same switch for `native_probe`, but `std::env`
+/// does not exist in this module, so a page needs its own way to ask.
+#[no_mangle]
+pub extern "C" fn wh_audio_trace(on: u32) {
+    host::shim::dsound::LOG_AUDIO.store(on != 0, std::sync::atomic::Ordering::Relaxed);
 }
 
 // ---- input ---------------------------------------------------------------

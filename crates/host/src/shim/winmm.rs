@@ -76,6 +76,10 @@ pub const SHIMS: &[Binding] = &[
     Binding { dll: WINMM, name: "auxGetVolume", arg_bytes: 8, shim: no_driver },
     Binding { dll: WINMM, name: "joyGetDevCapsA", arg_bytes: 12, shim: no_driver },
     Binding { dll: WINMM, name: "joyGetNumDevs", arg_bytes: 0, shim: no_devices },
+    // `joyGetPos` answers the same "unplugged" the Ex form does: a game that
+    // polls a stick falls back to its keyboard, which is the whole point of
+    // asking before it commits to one.
+    Binding { dll: WINMM, name: "joyGetPos", arg_bytes: 8, shim: joystick_unplugged },
     Binding { dll: WINMM, name: "joyGetPosEx", arg_bytes: 8, shim: joystick_unplugged },
     Binding { dll: WINMM, name: "joySetCapture", arg_bytes: 16, shim: joystick_unplugged },
     Binding { dll: WINMM, name: "joySetThreshold", arg_bytes: 8, shim: joystick_unplugged },

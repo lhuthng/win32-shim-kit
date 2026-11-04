@@ -23,8 +23,22 @@ pub const STACK_TOP: u32 = STACK_BASE + STACK_SIZE;
 /// allocates a surface per tile and a decoded map per screen, and 32 MB ran out
 /// while the first board was loading, so the reserve is sized for a session
 /// rather than for the boot.
+///
+/// The arena is one flat reservation, so how much a guest can hold is decided
+/// here. Little Fighter 2 draws every sprite through a `CreateDIBSection` at 32
+/// bits per pixel, whether or not the file it came from was, and its mods ship
+/// the whole system sprite set in `sprite/sys`: 655 MiB of pixels for NTSD
+/// Community alone. Decoding a stage on top of that reaches 1155 MiB of bitmaps
+/// held at once -- 1.45 copies of every picture in the install -- because the
+/// loading screen's decode stays live beside the fight's. A 32-bit Windows
+/// process has 2 GiB for exactly that reason, and this is as close as the
+/// browser target can come: guest memory is one `Vec<u8>`, and a `Vec` may not
+/// exceed `isize::MAX` bytes, which puts the ceiling just under 2 GiB. The
+/// reserve below leaves a megabyte of that headroom, so `MEMORY_TOP` is the
+/// largest arena this shape can have -- a guest that needs more needs the
+/// native host, not a bigger number.
 pub const HEAP_BASE: u32 = STACK_TOP;
-pub const HEAP_RESERVE: u32 = 0x0800_0000;
+pub const HEAP_RESERVE: u32 = 0x7f20_0000;
 pub const MEMORY_TOP: u32 = HEAP_BASE + HEAP_RESERVE;
 
 /// `NT_TIB`, which is what `fs:` refers to in this image.
@@ -35,12 +49,71 @@ const TIB_SELF: u32 = 0x18;
 
 const MAX_CSTRING: usize = 4096;
 
+/// The words `SHIMKIT_WATCH_WRITE` names, or none.
+fn watched_writes() -> Vec<u32> {
+    let Ok(text) = std::env::var("SHIMKIT_WATCH_WRITE") else {
+        return Vec::new();
+    };
+    text.split(',')
+        .filter_map(|part| u32::from_str_radix(part.trim().trim_start_matches("0x"), 16).ok())
+        .collect()
+}
+
+/// `SHIMKIT_WATCH_RANGE=start-end` (hex, inclusive-exclusive) watches a whole
+/// buffer rather than a handful of words. Unlike the word watch, it also records
+/// a byte coverage map and a tally of the guest instructions that wrote there,
+/// so a buffer with holes can say whether the holes were stored as zero or were
+/// never stored at all, and which routine did the storing.
+fn watched_ranges() -> Vec<(u32, u32)> {
+    let Ok(text) = std::env::var("SHIMKIT_WATCH_RANGE") else {
+        return Vec::new();
+    };
+    text.split(',')
+        .filter_map(|part| {
+            let (start, end) = part.trim().split_once('-')?;
+            let hex = |s: &str| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16);
+            let (start, end) = (hex(start).ok()?, hex(end).ok()?);
+            (start < end).then_some((start, end))
+        })
+        .collect()
+}
+
 pub struct GuestMemory {
     store: Vec<u8>,
     sections: Vec<Section>,
     pub entry_point: u32,
     pub size_of_image: u32,
     pub imports: Vec<crate::pe::Import>,
+    /// Guest DLL images mapped beside the program, as `(start, end)`.
+    ///
+    /// The program's own image is `[IMAGE_BASE, image_end())`, whose sections
+    /// decide what may be written. A module lives near the top of the arena,
+    /// where the heap cannot reach it until it has spent every byte it has, and
+    /// is the guest's to write as it likes: its `.data` is the reason it is
+    /// loaded at all.
+    modules: Vec<(u32, u32)>,
+    /// The instruction the guest is running and its stack pointer, so a watched
+    /// store can name the code that made it. The session writes these before
+    /// every step, and only does so while [`Self::watch`] is set.
+    pc: u32,
+    esp: u32,
+    /// The words `SHIMKIT_WATCH_WRITE` names. A guest global that changes with no
+    /// code in the image writing it is the mark of a copy that ran past its
+    /// buffer, and the address it lands on says nothing about the instruction
+    /// that did it -- so the store is reported as it happens instead.
+    watch: Vec<u32>,
+    watch_hits: u32,
+    /// The last few watched stores, printed when the guest stops: the store that
+    /// made the value bad is the last one before it, and a run of 90 million
+    /// instructions has far more of them than a log can hold.
+    watch_recent: std::collections::VecDeque<String>,
+    /// `SHIMKIT_WATCH_RANGE` ranges. Only the first gets a coverage map: one
+    /// buffer is enough to answer "which bytes did the guest never write".
+    ranges: Vec<(u32, u32)>,
+    cover: Vec<u8>,
+    cover_eips: std::collections::BTreeMap<u32, u64>,
+    range_hits: u64,
+    range_zero_hits: u64,
 }
 
 impl GuestMemory {
@@ -99,7 +172,19 @@ impl GuestMemory {
             entry_point,
             size_of_image,
             imports,
+            modules: Vec::new(),
+            pc: 0,
+            esp: 0,
+            watch: watched_writes(),
+            watch_hits: 0,
+            watch_recent: Default::default(),
+            ranges: watched_ranges(),
+            cover: Vec::new(),
+            cover_eips: Default::default(),
+            range_hits: 0,
+            range_zero_hits: 0,
         };
+        memory.init_cover();
         memory.write_u32(TEB_BASE + TIB_EXCEPTION_LIST, u32::MAX)?;
         memory.write_u32(TEB_BASE + TIB_STACK_BASE, STACK_TOP)?;
         memory.write_u32(TEB_BASE + TIB_STACK_LIMIT, STACK_BASE)?;
@@ -117,7 +202,7 @@ impl GuestMemory {
                 "a blank memory of {size} bytes does not fit below {MEMORY_TOP:#010x}"
             ));
         }
-        Ok(Self {
+        let mut memory = Self {
             store: vec![0_u8; size],
             sections: vec![Section {
                 name: "blank".to_string(),
@@ -130,7 +215,228 @@ impl GuestMemory {
             entry_point: IMAGE_BASE,
             size_of_image: size as u32,
             imports: Vec::new(),
-        })
+            modules: Vec::new(),
+            pc: 0,
+            esp: 0,
+            watch: watched_writes(),
+            watch_hits: 0,
+            watch_recent: Default::default(),
+            ranges: watched_ranges(),
+            cover: Vec::new(),
+            cover_eips: Default::default(),
+            range_hits: 0,
+            range_zero_hits: 0,
+        };
+        memory.init_cover();
+        Ok(memory)
+    }
+
+    /// Allocates the coverage bitmap after the struct exists, so both load paths
+    /// share the same rule: the first watched range gets one byte per address.
+    fn init_cover(&mut self) {
+        if let Some(&(start, end)) = self.ranges.first() {
+            self.cover = vec![0; (end - start) as usize];
+        }
+    }
+
+    /// The bytes of the first watched range that guest writes have touched, one
+    /// byte per address. Zero means nothing ever stored there.
+    pub fn coverage(&self) -> Option<(u32, &[u8])> {
+        self.ranges.first().map(|&(start, _)| (start, self.cover.as_slice()))
+    }
+
+    /// Whether either watch is armed, which is what makes the session bother to
+    /// record the instruction pointer.
+    pub fn watching(&self) -> bool {
+        !self.watch.is_empty() || !self.ranges.is_empty()
+    }
+
+    /// Records the instruction the guest is about to run, so a watched store can
+    /// name it. Free unless a watch is set.
+    #[inline]
+    pub fn set_pc(&mut self, pc: u32, esp: u32) {
+        if self.watching() {
+            self.pc = pc;
+            self.esp = esp;
+        }
+    }
+
+    /// Tallies a store inside a watched range by the guest instruction that made
+    /// it and marks the bytes it covered. Kept separate from the word watch so a
+    /// 64 KiB buffer can be watched without printing a line per byte.
+    #[inline]
+    fn watch_range_store(&mut self, va: u32, len: usize) {
+        if self.ranges.is_empty() {
+            return;
+        }
+        let store_end = (va as u64).saturating_add(len as u64);
+        let mut touched = false;
+        for &(start, end) in &self.ranges {
+            let lo = (va as u64).max(start as u64);
+            let hi = store_end.min(end as u64);
+            if lo >= hi {
+                continue;
+            }
+            touched = true;
+            *self.cover_eips.entry(self.pc).or_insert(0) += hi - lo;
+            let first = self.ranges[0];
+            if start == first.0 {
+                let begin = (lo - start as u64) as usize;
+                let finish = (hi - start as u64) as usize;
+                if let Some(bytes) = self.cover.get_mut(begin..finish) {
+                    bytes.fill(1);
+                }
+            }
+            let at = (va.wrapping_sub(IMAGE_BASE)) as usize;
+            if let Some(bytes) = self.store.get(at..at.saturating_add(len.min(64))) {
+                if bytes.iter().all(|&byte| byte == 0) {
+                    self.range_zero_hits += 1;
+                }
+            }
+        }
+        if touched {
+            self.range_hits += 1;
+            if self.range_hits <= 40 {
+                println!(
+                    "range: {len} byte(s) at {va:#010x} by {:#010x}",
+                    self.pc
+                );
+            }
+        }
+    }
+
+    /// Reports a store that touches a watched word, with the value it left, the
+    /// instruction that made it and the words on the stack above it -- usually the
+    /// caller's return address, which is what says *which* copy overflowed.
+    #[inline]
+    fn watch_store(&mut self, va: u32, len: usize) {
+        if self.ranges.is_empty() && self.watch.is_empty() {
+            return;
+        }
+        self.watch_range_store(va, len);
+        let end = va as u64 + len as u64;
+        if !self
+            .watch
+            .iter()
+            .any(|&at| u64::from(va) < u64::from(at) + 4 && u64::from(at) < end)
+        {
+            return;
+        }
+        self.watch_hits += 1;
+        let mut value = String::new();
+        let start = va.wrapping_sub(IMAGE_BASE) as usize;
+        if let Some(bytes) = self.store.get(start..start.saturating_add(len.min(8))) {
+            for byte in bytes {
+                value.push_str(&format!("{byte:02x}"));
+            }
+        }
+        let mut stack = Vec::new();
+        for index in 0..8 {
+            let at = self.esp.wrapping_add(index * 4);
+            let Ok(word) = self.read_u32(at) else { break };
+            stack.push(format!("{word:#010x}"));
+        }
+        let line = format!(
+            "watch: {len} byte(s) at {va:#010x} = {value} by {:#010x}",
+            self.pc
+        );
+        if self.watch_hits <= 300 {
+            println!("{line}\n  stack+0..8: {}", stack.join(" "));
+        }
+        self.watch_recent.push_back(format!("{line}"));
+        if self.watch_recent.len() > 48 {
+            self.watch_recent.pop_front();
+        }
+    }
+
+    /// Prints the last watched stores and, for a range watch, the guest
+    /// instructions that wrote into it. A guest that stops on a value nothing in
+    /// the image wrote needs the stores that led to it, not the last 300 of them.
+    pub fn dump_watch(&self) {
+        for line in &self.watch_recent {
+            println!("{line}");
+        }
+        if !self.ranges.is_empty() {
+            println!(
+                "range watches: {:?}, stores {}, all-zero stores {}, distinct writers {}",
+                self.ranges, self.range_hits, self.range_zero_hits, self.cover_eips.len()
+            );
+            let mut writers: Vec<_> = self.cover_eips.iter().collect();
+            writers.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
+            for (pc, count) in writers.into_iter().take(60) {
+                println!("  writer {pc:#010x}: {count} bytes");
+            }
+            let covered = self.cover.iter().filter(|&&byte| byte != 0).count();
+            println!(
+                "  coverage {}/{} bytes ({:.1}%)",
+                covered,
+                self.cover.len(),
+                covered as f64 * 100.0 / self.cover.len().max(1) as f64
+            );
+        }
+    }
+
+    /// Maps a guest DLL image at `base`, the address its header declares.
+    ///
+    /// The bytes arrive already relocated: the payload's compiler
+    /// (`shimkit-link`) placed the module in this window and adjusted every
+    /// absolute address, so the only work here is the copy. That is deliberate --
+    /// the interpreter never runs a relocation pass, so a module that could not
+    /// be moved is refused by the compiler rather than mis-mapped here.
+    pub fn map_module(&mut self, image: &Image, base: u32) -> Result<()> {
+        if base & 0xfff != 0 {
+            return Err(format!("module base {base:#010x} is not page aligned"));
+        }
+        let end = base
+            .checked_add(image.size_of_image)
+            .ok_or_else(|| format!("module at {base:#010x} wraps the address space"))?;
+        if base < self.image_end() {
+            return Err(format!(
+                "module at {base:#010x} overlaps the program, which ends at {:#010x}",
+                self.image_end()
+            ));
+        }
+        if end > MEMORY_TOP {
+            return Err(format!(
+                "module at {base:#010x} ends at {end:#010x}, past the end of guest memory at \
+                 {MEMORY_TOP:#010x}"
+            ));
+        }
+        for (start, stop) in &self.modules {
+            if base < *stop && *start < end {
+                return Err(format!(
+                    "module at {base:#010x} overlaps the one at {start:#010x}"
+                ));
+            }
+        }
+        if image.size_of_headers as usize > image.bytes.len() {
+            return Err("the module's headers are shorter than it declares".into());
+        }
+        let offset = |va: u32| (va - IMAGE_BASE) as usize;
+        let headers = image.size_of_headers as usize;
+        self.store[offset(base)..offset(base) + headers]
+            .copy_from_slice(&image.bytes[..headers]);
+        for section in &image.sections {
+            if section.raw_size == 0 {
+                continue;
+            }
+            let from = section
+                .raw
+                .checked_add(section.raw_size)
+                .filter(|end| *end <= image.bytes.len())
+                .ok_or_else(|| format!("{} reads past the end of the module", section.name))?;
+            let at = offset(base.wrapping_add(section.virtual_address));
+            self.store[at..at + section.raw_size]
+                .copy_from_slice(&image.bytes[section.raw..from]);
+        }
+        self.modules.push((base, end));
+        Ok(())
+    }
+
+    /// Records a guest DLL's import slots, so the session may fill them the way
+    /// it fills the program's own.
+    pub fn add_imports(&mut self, imports: Vec<crate::pe::Import>) {
+        self.imports.extend(imports);
     }
 
     /// Fills an import slot the way the Windows loader does: before the image
@@ -162,6 +468,12 @@ impl GuestMemory {
     /// itself ([`crate::hle`]). The routine bounds its own accesses against the
     /// slice, so a bad guest pointer becomes an error there rather than a panic.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        if !self.watch.is_empty() && self.watch_hits <= 200 {
+            println!(
+                "watch: guest memory handed out writable to {:#010x} (esp {:#010x})",
+                self.pc, self.esp
+            );
+        }
         &mut self.store
     }
 
@@ -210,6 +522,13 @@ impl GuestMemory {
                 ));
             }
             return Ok(());
+        }
+        // A guest DLL's image is writable: its `.data` is what it was loaded for,
+        // and its code is not written by anything here.
+        for (start, stop) in &self.modules {
+            if va >= *start && va as u64 + len as u64 <= u64::from(*stop) {
+                return Ok(());
+            }
         }
         if (TEB_BASE as u64..MEMORY_TOP as u64).contains(&(va as u64))
             && va as u64 + len as u64 <= MEMORY_TOP as u64
@@ -265,6 +584,7 @@ impl GuestMemory {
             if let Some(target) = self.tail_mut(va) {
                 if target.len() >= len {
                     target[..len].copy_from_slice(bytes);
+                    self.watch_store(va, len);
                     return Ok(());
                 }
             }
@@ -272,6 +592,7 @@ impl GuestMemory {
         self.check_writable(va, len)?;
         let start = self.offset(va, len)?;
         self.store[start..start + len].copy_from_slice(bytes);
+        self.watch_store(va, len);
         Ok(())
     }
 
@@ -290,6 +611,7 @@ impl GuestMemory {
         self.check_writable(to, len)?;
         let target = self.offset(to, len)?;
         self.store.copy_within(source..source + len, target);
+        self.watch_store(to, len);
         Ok(())
     }
 
@@ -309,6 +631,13 @@ impl GuestMemory {
             if let Some(target) = self.tail_mut(va) {
                 if let Some(first) = target.first_mut() {
                     *first = value;
+                    // The fast path stores straight into the tail, so it has to
+                    // report the store itself: `write_bytes` is the other branch
+                    // and the only one that would. Without this a watched write
+                    // through a `mov [mem], reg` -- which is most of them -- goes
+                    // unseen, and a watch armed on a value that is visibly moving
+                    // reports nothing at all.
+                    self.watch_store(va, 1);
                     return Ok(());
                 }
             }
@@ -332,6 +661,7 @@ impl GuestMemory {
             if let Some(target) = self.tail_mut(va) {
                 if target.len() >= 2 {
                     target[..2].copy_from_slice(&value.to_le_bytes());
+                    self.watch_store(va, 2);
                     return Ok(());
                 }
             }
@@ -360,6 +690,7 @@ impl GuestMemory {
             if let Some(target) = self.tail_mut(va) {
                 if target.len() >= 4 {
                     target[..4].copy_from_slice(&value.to_le_bytes());
+                    self.watch_store(va, 4);
                     return Ok(());
                 }
             }
@@ -492,5 +823,30 @@ mod tests {
         memory.write_u32(STACK_TOP - 4, 0x1234).unwrap();
         assert_eq!(memory.read_u32(STACK_TOP - 4).unwrap(), 0x1234);
         assert!(memory.write_u32(HEAP_BASE, 1).is_ok());
+    }
+
+    /// A watched store is reported whichever path wrote it.
+    ///
+    /// `write_u8`/`write_u16`/`write_u32` have a fast path that stores straight
+    /// into the tail and returns, and it used to return without reporting. A
+    /// guest's ordinary `mov [mem], reg` takes that path, so a watch armed on a
+    /// value that was visibly moving reported nothing at all -- which reads as
+    /// "nothing writes this" and sends a search the wrong way entirely.
+    #[test]
+    fn a_watched_store_is_reported_on_the_fast_path() {
+        let Ok(mut memory) = GuestMemory::empty(HEAP_BASE as usize + 0x1000) else {
+            return;
+        };
+        // Above the TEB, so `unchecked_write` holds and the fast path is the one
+        // taken; the tail branch is the one that used to go unreported.
+        let at = TEB_BASE;
+        memory.watch.push(at);
+
+        memory.write_u8(at, 0x11).unwrap();
+        memory.write_u16(at, 0x2233).unwrap();
+        memory.write_u32(at, 0x4455_6677).unwrap();
+
+        assert_eq!(memory.watch_hits, 3, "every store is reported");
+        assert_eq!(memory.read_u32(at).unwrap(), 0x4455_6677);
     }
 }

@@ -72,11 +72,18 @@ pub struct Objects {
     parked: HashMap<u32, Vec<u32>>,
     /// Handles handed out so far. Handle 0 is not one.
     next_handle: u32,
+    /// The next thread id to hand out. Ids are never reused; see
+    /// [`Objects::insert_thread`].
+    next_thread_id: u32,
 }
 
 impl Objects {
     pub fn new() -> Self {
-        Self::default()
+        // The main thread is 0, so the first spawned thread is 1.
+        Self {
+            next_thread_id: 1,
+            ..Self::default()
+        }
     }
 
     /// Creates a handle for `object`, distinct from every other.
@@ -97,16 +104,19 @@ impl Objects {
     /// Creates a thread handle, together with the id the guest is told. The id is
     /// handed out here rather than by the session because the guest reads it back
     /// out of the `CreateThread` call, before the session has seen the thread.
+    ///
+    /// Ids are counted up and never reused. Everything the scheduler keeps per
+    /// thread -- its suspend count, the wait it is parked on, which thread a
+    /// woken answer belongs to -- is keyed by this id, so handing one out twice
+    /// aliases two threads into one identity. Deriving the id from the highest
+    /// one still in the handle table did exactly that: a guest that closes a
+    /// thread's handle (or whose thread exits, dropping its object) brought the
+    /// highest id back down, and the next `CreateThread` was told the number of a
+    /// thread that was still running.
     pub fn insert_thread(&mut self) -> (u32, u32) {
-        let id = self
-            .objects
-            .values()
-            .filter_map(|object| match object {
-                Object::Thread { id, .. } => Some(*id),
-                _ => None,
-            })
-            .max()
-            .map_or(1, |id| id + 1);
+        self.next_thread_id = self.next_thread_id.max(1);
+        let id = self.next_thread_id;
+        self.next_thread_id += 1;
         let handle = self.insert(Object::Thread {
             id,
             exited: false,
@@ -356,6 +366,17 @@ impl Objects {
             .collect()
     }
 
+    /// Whether any parked wait still has a deadline ahead of `now`.
+    ///
+    /// This is the run's reason to wait rather than to force: the deadline's
+    /// own [`Self::expire`] will answer it once the guest's clock reaches it,
+    /// and answering it sooner hands the guest progress it has not earned.
+    pub fn any_deadline_after(&self, now: u64) -> bool {
+        self.waiters
+            .values()
+            .any(|waiter| waiter.deadline.is_some_and(|deadline| deadline > now))
+    }
+
     /// The waits that are parked, for the message a stall prints.
     pub fn waiting(&self) -> Vec<(u32, Vec<u32>)> {
         let mut waits: Vec<(u32, Vec<u32>)> = self
@@ -397,6 +418,20 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_id_is_never_reused() {
+        let mut objects = Objects::new();
+        let (handle, id) = objects.insert_thread();
+        assert_eq!(id, 1, "the main thread is 0, so the first spawn is 1");
+
+        // The guest closes the handle it was given. The thread itself keeps
+        // running, so its id must not come back to a later `CreateThread`.
+        assert!(objects.close(handle));
+        let (_, next) = objects.insert_thread();
+        assert_ne!(next, id);
+        assert_eq!(next, 2);
+    }
+
+    #[test]
     fn a_semaphore_serves_one_waiter_per_unit() {
         let mut objects = Objects::new();
         let handle = semaphore(&mut objects, 0, 4);
@@ -431,6 +466,39 @@ mod tests {
             vec![(1, WAIT_OBJECT_0), (2, WAIT_OBJECT_0)]
         );
         assert!(objects.take(handle, 3));
+    }
+
+    /// A sleep with a deadline still ahead of the guest's clock is the run's
+    /// reason to wait rather than force: time itself is about to answer it.
+    #[test]
+    fn a_deadline_ahead_of_now_is_a_reason_to_wait() {
+        let mut objects = Objects::new();
+        assert!(!objects.any_deadline_after(1_000), "nothing parked at all");
+
+        objects.park(1, Vec::new(), false);
+        objects.set_deadline(1, 2_000);
+        assert!(
+            objects.any_deadline_after(1_000),
+            "the deadline has not passed yet"
+        );
+        assert!(
+            !objects.any_deadline_after(2_000),
+            "at the deadline, expire() is what answers it, not a wait"
+        );
+
+        // An INFINITE sleep -- a worker parking for good -- is no reason to
+        // wait: nothing will ever expire it.
+        objects.park(2, Vec::new(), false);
+        objects.set_deadline(2, u64::MAX);
+        assert!(
+            objects.any_deadline_after(3_000),
+            "a second, later deadline still holds the run"
+        );
+        objects.forget(2);
+        assert!(
+            !objects.any_deadline_after(3_000),
+            "a thread parked with no deadline never blocks on time"
+        );
     }
 
     #[test]

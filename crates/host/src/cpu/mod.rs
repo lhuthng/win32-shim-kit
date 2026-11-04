@@ -500,11 +500,15 @@ impl Registers {
         self.get(index) as u16
     }
 
-    /// Writes the low word and zeroes the upper half, which is what a 16-bit
-    /// write does in 32-bit mode. The guest relies on it: `imul ax, cx` followed
-    /// by `mov ecx, eax` reads the zeroed upper half as part of the value.
+    /// Writes the low word and *keeps* the upper half, which is what a 16-bit
+    /// write does on x86: only a 32-bit write replaces the whole register. A
+    /// guest that wants a zero-extended word uses `movzx`/`and` itself. Hercules'
+    /// scaled sprite blitter keeps a fixed-point accumulator in the upper half
+    /// of `eax` while `dec ax` counts the row, so zeroing it here desynchronises
+    /// the source index and leaves transparent (index 0) holes in the sprite.
     pub fn set_word(&mut self, index: u8, value: u16) {
-        self.set(index, u32::from(value));
+        let register = self.get(index) & !0xffff;
+        self.set(index, register | u32::from(value));
     }
 
     /// Low byte of `al`, `cl`, `dl`, `bl`.
@@ -1047,7 +1051,7 @@ mod tests {
         assert_eq!(registers.get_byte(EAX), 0x44);
         assert_eq!(registers.get_high_byte(EAX), 0x33);
         registers.set_word(EAX, 0xbbaa);
-        assert_eq!(registers.get(EAX), 0x0000_bbaa, "a word write zeroes the upper half");
+        assert_eq!(registers.get(EAX), 0x1122_bbaa, "a word write keeps the upper half");
         registers.set(EAX, 0x1122_3344);
         registers.set_byte(EAX, 0xaa);
         registers.set_high_byte(EAX, 0xbb);

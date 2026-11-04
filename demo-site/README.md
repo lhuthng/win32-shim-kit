@@ -30,10 +30,19 @@ accent, such as the label of a yellow button. Components carry no
 One folder per demo, produced by the kit:
 
 ```sh
-tools/build-web.sh /path/to/install demo/payloads/<slug>
+tools/build-web.sh /path/to/install demo/payloads/<slug>             # published
+tools/build-web.sh /path/to/install local/payloads/<slug>           # this machine only
 ```
 
-and named in `demo/payloads/index.json`:
+A published payload is named in `demo/payloads/index.json`; the page reads that
+list and boots whichever `?game=<slug>` names, or the first one listed.
+
+A payload whose game files are not the repository's to ship goes in
+`local/payloads/<slug>/`, described by `local/payloads/index.json`. It is
+gitignored, never built into `demo/`, and read by nothing but the local server
+(`bun demo-site/serve.ts`) and the two `tools/demo-*.ts` checkers -- so it can be
+played and checked here and never be published. The published list is the only
+one that ships. The entry shape is the same either way:
 
 ```json
 {

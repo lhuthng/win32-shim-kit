@@ -57,6 +57,10 @@ pub const WM_QUIT: u32 = 0x0012;
 /// `MK_LBUTTON` and friends, the key-state bits `wParam` carries.
 const MK_BUTTONS: [u32; 3] = [0x0001, 0x0002, 0x0010];
 
+/// The virtual key each mouse button reports as: `VK_LBUTTON`, `VK_RBUTTON`,
+/// `VK_MBUTTON`, in the order [`Input::button`] indexes them.
+const MATCH_VK: [u8; 3] = [0x01, 0x02, 0x04];
+
 /// One buffered DirectInput event: what `GetDeviceData` hands out, in the order
 /// it happened. A game built on buffered input reads keys here rather than from
 /// `GetDeviceState`, and this is the only place the two views differ.
@@ -322,6 +326,15 @@ impl Input {
             MOUSE_BUTTON0 + u32::from(button),
             if down { 0x80 } else { 0 },
         );
+        // A button is a virtual key too: `GetAsyncKeyState(VK_LBUTTON)` is how a
+        // guest that polls rather than reads messages asks whether the mouse is
+        // down, and a menu that highlights on `GetCursorPos` and activates on
+        // that poll went dead when only the message queue was fed.
+        let vk = usize::from(MATCH_VK[usize::from(button)]);
+        self.async_down[vk] = down;
+        if down {
+            self.async_pressed[vk] = true;
+        }
         let message = match (button, down) {
             (LEFT, true) => WM_LBUTTONDOWN,
             (LEFT, false) => WM_LBUTTONUP,
@@ -414,6 +427,19 @@ impl Input {
             x,
             y,
         });
+    }
+
+    /// Whether a message of this kind is already waiting for the window.
+    ///
+    /// This is what coalesces `WM_PAINT`: a window is invalidated as often as its
+    /// state changes, and Windows keeps one paint queued until the guest takes it,
+    /// so a paint that arrives twice is a guest drawing its frame twice for one
+    /// change -- and a guest that invalidates inside its paint handler would never
+    /// leave the handler at all.
+    pub fn waiting(&self, hwnd: u32, message: u32) -> bool {
+        self.messages
+            .iter()
+            .any(|queued| queued.hwnd == hwnd && queued.message == message)
     }
 
     /// Index of the first queued message that matches a `PeekMessageA` filter.

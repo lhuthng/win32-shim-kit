@@ -57,7 +57,15 @@ impl Table {
 
     /// Returns the index the guest's IAT slot must hold for a host function.
     pub fn index_of(&self, iat_va: u32) -> Option<usize> {
-        self.slots.binary_search_by_key(&iat_va, |slot| slot.iat_va).ok()
+        if let Ok(index) = self.slots.binary_search_by_key(&iat_va, |slot| slot.iat_va) {
+            return Some(index);
+        }
+        // A guest DLL loaded after the program appended its slots to the end of
+        // the table, which is no longer sorted: a filled IAT already holds the
+        // index it was given, so the order may not change to restore the
+        // search. The program's own slots are still found above; this walks the
+        // appended group.
+        self.slots.iter().position(|slot| slot.iat_va == iat_va)
     }
 
     pub fn len(&self) -> usize {
@@ -124,6 +132,20 @@ mod tests {
 
         assert!(TABLE.slot(0x0040_0000).is_none());
         assert!(TABLE.index_of(0).is_none());
+
+        // A slot appended after the program's are past the sorted prefix, which
+        // is how a guest DLL's imports join the table once it is loaded.
+        static APPENDED: [Slot; 4] = [
+            Slot { dll: "KERNEL32.dll", name: "GetVersion", iat_va: 0x0040_1000, args: None, sites: 1, agreement: 0, ambiguous: 0 },
+            Slot { dll: "KERNEL32.dll", name: "ReadFile", iat_va: 0x0040_1004, args: Some(20), sites: 2, agreement: 2, ambiguous: 0 },
+            Slot { dll: "USER32.dll", name: "MessageBoxA", iat_va: 0x0040_1008, args: Some(16), sites: 1, agreement: 1, ambiguous: 0 },
+            Slot { dll: "KERNEL32.dll", name: "GetTickCount", iat_va: 0x0040_2000, args: None, sites: 0, agreement: 0, ambiguous: 0 },
+        ];
+        let grown = Table { slots: &APPENDED };
+        assert_eq!(grown.index_of(0x0040_2000), Some(3));
+        assert_eq!(grown.slot(0x0040_2000).map(|slot| slot.name), Some("GetTickCount"));
+        assert_eq!(grown.index_of(0x0040_1008), Some(2));
+        assert!(grown.index_of(0x0040_2004).is_none());
         assert_eq!(TABLE.len(), 3);
         assert!(Table::EMPTY.is_empty());
     }

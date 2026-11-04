@@ -591,6 +591,9 @@ fn x87(cursor: &mut Cursor, pc: u32, opcode: u8) -> Result<Instruction> {
             (0xdd, 0) => Ok(float(Mnemonic::Fld, Size::Dword, true)),
             (0xdd, 2) => Ok(float(Mnemonic::Fst, Size::Dword, true)),
             (0xdd, 3) => Ok(float(Mnemonic::Fstp, Size::Dword, true)),
+            // `dd /7`: the status word to two bytes of memory, which is how a
+            // `fcom`/`fucom` result reaches a branch that does not go through
+            // `ax`.
             // `dd /7`: the status word to memory instead of to `ax`. A compiler
             // uses it when `eax` is busy and reads the flags back as bytes.
             (0xdd, 7) => Ok(float(Mnemonic::Fnstsw, Size::Word, false)),
@@ -692,8 +695,13 @@ fn x87(cursor: &mut Cursor, pc: u32, opcode: u8) -> Result<Instruction> {
                 2 => return Err(unsupported(pc, "x87 de /2 (DE D0-D7) is reserved")),
                 4 => Mnemonic::Fsubp,
                 5 => Mnemonic::Fsubrp,
-                6 => Mnemonic::Fdivp,
-                _ => Mnemonic::Fdivrp,
+                // `de f0`-`de f7` divides the other way round from `de f8`-`de ff`:
+                // FDIVRP is the /6 row and FDIVP the /7 one, unlike the subtract
+                // pair above, which is /4 for the plain form and /5 for the reversed
+                // one. Reading this row as a mirror of that one inverts every
+                // quotient the guest computes.
+                6 => Mnemonic::Fdivrp,
+                _ => Mnemonic::Fdivp,
             };
             Ok(stack(mnemonic, [Operand::None, Operand::Imm8(index), Operand::None]))
         }
@@ -1297,6 +1305,17 @@ mod tests {
     }
 
     #[test]
+    fn decodes_the_status_word_store_to_memory() {
+        // `dd /7 m16`: FNSTSW to memory, which is how a compare result reaches
+        // a branch that does not pass through `ax`.
+        let fnstsw = decode_bytes(&[0xdd, 0x3d, 0x34, 0x12, 0x00, 0x00]);
+        assert_eq!(fnstsw.mnemonic, Mnemonic::Fnstsw);
+        assert_eq!(fnstsw.size, Size::Word);
+        assert!(fnstsw.x87);
+        assert!(!fnstsw.extended && !fnstsw.double && !fnstsw.integer);
+    }
+
+    #[test]
     fn decodes_the_ten_byte_integer_load_and_store() {
         // `db /5 m80` and `db /7 m80`: FILD and FISTP on a ten-byte integer,
         // which the CRT reaches for when a `long long` rounds through a
@@ -1839,6 +1858,20 @@ mod tests {
         assert_eq!(compare.mnemonic, Mnemonic::Fcompp);
         assert!(compare.x87);
         assert!(decode_failure(&[0xde, 0xd8]).contains("rm=0"), "de d8 is not an instruction");
+    }
+
+    #[test]
+    fn the_x87_divide_and_pop_row_is_not_a_mirror_of_the_subtract_one() {
+        // `de f9` is FDIVP and `de f1` is FDIVRP: on this row the reversed form
+        // takes the lower register, the opposite of the `de e1`/`de e9` subtract
+        // pair. Reading the row as a mirror divides every quotient backwards,
+        // which a frame pacer turns into an interval of a hundred seconds.
+        let divide = decode_bytes(&[0xde, 0xf9]);
+        assert_eq!(divide.mnemonic, Mnemonic::Fdivp);
+        assert_eq!(divide.operands[1], Operand::Imm8(1), "its destination is st(1)");
+        assert_eq!(decode_bytes(&[0xde, 0xf1]).mnemonic, Mnemonic::Fdivrp);
+        assert_eq!(decode_bytes(&[0xde, 0xe1]).mnemonic, Mnemonic::Fsubp);
+        assert_eq!(decode_bytes(&[0xde, 0xe9]).mnemonic, Mnemonic::Fsubrp);
     }
 
     #[test]

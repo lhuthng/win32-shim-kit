@@ -16,7 +16,7 @@
 //! single consumer of guest instructions during movement, so the host runs the
 //! whole row decoder instead and touches the same pixels.
 
-use crate::cpu::Cpu;
+use crate::cpu::{Cpu, Flags};
 use crate::memory::GuestMemory;
 use crate::pe::IMAGE_BASE;
 use crate::Result;
@@ -334,6 +334,377 @@ impl Blitter {
     }
 }
 
+// ---- Hercules' software sprite rows ---------------------------------------
+//
+// Hercules draws every frame itself into one 320x240 8-bit DIB and hands it to
+// StretchDIBits. Three inner row loops are about 60% of all gameplay
+// instructions. Each is a pure memory loop -- no imports, no calls, no stack
+// use -- so the host can retire the whole row natively and resume at the first
+// instruction after the loop. A branch scan of .text shows each entry address
+// is reached only by fall-through from its own row setup and by its own back
+// edge, so there is no caller state to reconstruct.
+//
+// These are the exact loops where the partial-register sprite bug lived. The
+// replacements below are transcribed instruction by instruction, including the
+// arithmetic flags, and are checked against the interpreter in the tests at
+// the bottom of this file.
+
+/// `0x0040cbf4`: `mov al, [esi+ebx]; test al,al; je skip; mov [edi+ebx],al`.
+pub const HERCULES_KEYED_ROW: u32 = 0x0040_cbf4;
+/// `0x0040ca51`: the same row through a 256x256 `table[source << 8 | dest]`.
+pub const HERCULES_REMAP_ROW: u32 = 0x0040_ca51;
+/// `0x0040e56c`: the fixed-point scaled row, with `adc` stepping and `dec ax`.
+pub const HERCULES_SCALED_ROW: u32 = 0x0040_e56c;
+
+/// First instruction after each loop. The row setup and the outer row loop
+/// stay interpreted; only the hot inner loop is replaced.
+const HERCULES_KEYED_EXIT: u32 = 0x0040_cc01;
+const HERCULES_REMAP_EXIT: u32 = 0x0040_ca64;
+const HERCULES_SCALED_EXIT: u32 = 0x0040_e5a8;
+
+/// Fixed-point steps and the shade/remap tables the scaled row reads. They are
+/// written before the loop and never change inside it.
+const HERCULES_Y_STEP: u32 = 0x00a9_0998;
+const HERCULES_X_STEP: u32 = 0x00a9_099c;
+const HERCULES_SCALE_LUT: u32 = 0x00a9_09a0;
+
+/// The arithmetic flags after one instruction. `df` is untouched by every
+/// instruction in these loops, so it is carried through rather than modelled.
+struct RowFlags {
+    cf: bool,
+    pf: bool,
+    af: bool,
+    zf: bool,
+    sf: bool,
+    of: bool,
+}
+
+#[derive(Clone, Copy)]
+enum RowAlu {
+    Add,
+    Sub,
+}
+
+/// A byte/word/dword ALU operation, matching `cpu::exec::apply_alu` exactly.
+/// `size` is `(mask, sign)`; the dword pair is `(0xffff_ffff, 0x8000_0000)`.
+fn row_alu(
+    operation: RowAlu,
+    a: u32,
+    b: u32,
+    carry_in: bool,
+    size: (u32, u32),
+) -> (u32, RowFlags) {
+    let (mask, sign) = size;
+    let a = a & mask;
+    let b = b & mask;
+    let (result, carry, overflow, adjust) = match operation {
+        RowAlu::Add => {
+            let wide = u64::from(a) + u64::from(b) + u64::from(carry_in);
+            let result = (wide as u32) & mask;
+            (
+                result,
+                wide > u64::from(mask),
+                ((a ^ result) & (b ^ result) & sign) != 0,
+                ((a ^ b ^ result) & 0x10) != 0,
+            )
+        }
+        RowAlu::Sub => {
+            let lhs = u64::from(a);
+            let rhs = u64::from(b) + u64::from(carry_in);
+            let result = (lhs.wrapping_sub(rhs) as u32) & mask;
+            (
+                result,
+                lhs < rhs,
+                ((a ^ b) & (a ^ result) & sign) != 0,
+                ((a ^ b ^ result) & 0x10) != 0,
+            )
+        }
+    };
+    (
+        result,
+        RowFlags {
+            cf: carry,
+            pf: Flags::parity(result),
+            af: adjust,
+            zf: result == 0,
+            sf: result & sign != 0,
+            of: overflow,
+        },
+    )
+}
+
+const ROW_WORD: (u32, u32) = (0x0000_ffff, 0x0000_8000);
+const ROW_DWORD: (u32, u32) = (0xffff_ffff, 0x8000_0000);
+
+fn row_set_flags(cpu: &mut Cpu, flags: RowFlags) {
+    cpu.regs.flags.cf = flags.cf;
+    cpu.regs.flags.pf = flags.pf;
+    cpu.regs.flags.af = flags.af;
+    cpu.regs.flags.zf = flags.zf;
+    cpu.regs.flags.sf = flags.sf;
+    cpu.regs.flags.of = flags.of;
+}
+
+/// The `test` inside all three row loops feeds nothing but its own conditional
+/// jump. The `inc`/`dec` that closes the same iteration overwrites every flag
+/// except the carry, and `inc`/`dec` leave the carry alone, so the only flag
+/// that outlives the iteration is `cf` -- which `test` clears. Computing parity
+/// and storing five flags per pixel bought nothing; the equivalence tests still
+/// compare every flag after the whole row.
+#[inline(always)]
+fn row_clear_carry(cpu: &mut Cpu) {
+    cpu.regs.flags.cf = false;
+}
+
+/// `inc`/`dec` are `add`/`sub` with the carry flag left alone.
+fn row_inc_dec(cpu: &mut Cpu, value: u32, size: (u32, u32), down: bool) -> u32 {
+    let carry = cpu.regs.flags.cf;
+    let (result, mut flags) = row_alu(
+        if down { RowAlu::Sub } else { RowAlu::Add },
+        value,
+        1,
+        false,
+        size,
+    );
+    flags.cf = carry;
+    row_set_flags(cpu, flags);
+    result
+}
+
+fn row_byte(store: &[u8], va: u32, what: &str) -> Result<u8> {
+    let at = guest_offset(store, va, 1, what)?;
+    Ok(store[at])
+}
+
+fn row_store_byte(store: &mut [u8], va: u32, value: u8, what: &str) -> Result<()> {
+    let at = guest_offset(store, va, 1, what)?;
+    store[at] = value;
+    Ok(())
+}
+
+/// Counters, so an embedder can prove the replacements actually ran.
+#[derive(Default)]
+pub struct HerculesBlitter {
+    calls: u64,
+    pixels: u64,
+    work: u64,
+}
+
+impl HerculesBlitter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn calls(&self) -> u64 {
+        self.calls
+    }
+
+    pub fn pixels(&self) -> u64 {
+        self.pixels
+    }
+
+    /// Guest instructions these rows stood in for. The step loop adds it to the
+    /// instruction counter, so it is also the interpreter work that was skipped.
+    pub fn work(&self) -> u64 {
+        self.work
+    }
+
+    /// `0x40cbf4..0x40cc00`. `ebx` is `-width` on entry and counts up to zero;
+    /// the loop is bottom-tested, so even a zero width runs one iteration.
+    ///
+    /// Only the *last* `inc ebx` leaves a flag for the guest: every earlier one
+    /// is overwritten by the next iteration's `test`. So the loop runs flag-free
+    /// and the final step is the only one that pays for `row_inc_dec`. The carry
+    /// is cleared once up front because `test` clears it on every iteration and
+    /// `inc` preserves it.
+    pub fn keyed_row(&mut self, memory: &mut GuestMemory, cpu: &mut Cpu) -> Result<u32> {
+        let store = memory.as_mut_slice();
+        let mut work = 0_u32;
+        let mut drawn = 0_u64;
+        row_clear_carry(cpu);
+        loop {
+            let index = cpu.regs.ebx;
+            let pixel = row_byte(store, cpu.regs.esi.wrapping_add(index), "keyed source")?;
+            // mov al, [esi+ebx]
+            cpu.regs.eax = (cpu.regs.eax & !0xff) | u32::from(pixel);
+            // test al, al / je (the jump itself is one instruction either way)
+            work += 3;
+            if pixel != 0 {
+                row_store_byte(
+                    store,
+                    cpu.regs.edi.wrapping_add(index),
+                    pixel,
+                    "keyed destination",
+                )?;
+                drawn += 1;
+                work += 1;
+            }
+            // inc ebx / jl
+            let next = index.wrapping_add(1);
+            work += 2;
+            if (next as i32) >= 0 {
+                cpu.regs.ebx = row_inc_dec(cpu, index, ROW_DWORD, false);
+                break;
+            }
+            cpu.regs.ebx = next;
+        }
+        cpu.regs.eip = HERCULES_KEYED_EXIT;
+        self.calls += 1;
+        self.pixels += drawn;
+        self.work += u64::from(work);
+        Ok(work)
+    }
+
+    /// `0x40ca51..0x40ca63`. `ah` is the source pixel, `al` the pixel already
+    /// on the destination, and `[ecx+eax]` the 256x256 shade/remap table.
+    pub fn remap_row(&mut self, memory: &mut GuestMemory, cpu: &mut Cpu) -> Result<u32> {
+        let store = memory.as_mut_slice();
+        let mut work = 0_u32;
+        let mut drawn = 0_u64;
+        // Same shape as the keyed row: the `test` clears the carry, `inc ebx`
+        // preserves it, and every flag but the carry is overwritten before the
+        // loop can exit, so only the last `inc` needs the full computation.
+        row_clear_carry(cpu);
+        loop {
+            let index = cpu.regs.ebx;
+            let destination = cpu.regs.edi.wrapping_add(index);
+            let pixel = row_byte(store, cpu.regs.esi.wrapping_add(index), "remap source")?;
+            // mov ah, [esi+ebx] / test ah, ah / je
+            cpu.regs.eax = (cpu.regs.eax & !0xff00) | (u32::from(pixel) << 8);
+            work += 3;
+            if pixel != 0 {
+                // mov al, [edi+ebx]
+                let under = row_byte(store, destination, "remap destination")?;
+                cpu.regs.eax = (cpu.regs.eax & !0xff) | u32::from(under);
+                // mov al, [ecx+eax]
+                let mapped = row_byte(
+                    store,
+                    cpu.regs.ecx.wrapping_add(cpu.regs.eax),
+                    "remap table",
+                )?;
+                cpu.regs.eax = (cpu.regs.eax & !0xff) | u32::from(mapped);
+                // mov [edi+ebx], al
+                row_store_byte(store, destination, mapped, "remap destination")?;
+                drawn += 1;
+                work += 3;
+            }
+            let next = index.wrapping_add(1);
+            work += 2;
+            if (next as i32) >= 0 {
+                cpu.regs.ebx = row_inc_dec(cpu, index, ROW_DWORD, false);
+                break;
+            }
+            cpu.regs.ebx = next;
+        }
+        cpu.regs.eip = HERCULES_REMAP_EXIT;
+        self.calls += 1;
+        self.pixels += drawn;
+        self.work += u64::from(work);
+        Ok(work)
+    }
+
+    /// `0x40e56c..0x40e5a7`. This is the loop whose `dec ax` must leave the
+    /// upper half of `eax` alone: that half holds a fixed-point source
+    /// coordinate. Every `adc` below consumes the carry of the instruction
+    /// immediately before it, so the native walk keeps the same carry chain.
+    pub fn scaled_row(&mut self, memory: &mut GuestMemory, cpu: &mut Cpu) -> Result<u32> {
+        let y_step = memory.read_u32(HERCULES_Y_STEP)?;
+        let x_step = memory.read_u32(HERCULES_X_STEP)?;
+        let scale_lut = memory.read_u32(HERCULES_SCALE_LUT)?;
+        let store = memory.as_mut_slice();
+        let mut work = 0_u32;
+        let mut drawn = 0_u64;
+        loop {
+            // mov dh, bl
+            cpu.regs.edx = (cpu.regs.edx & !0xff00) | ((cpu.regs.ebx & 0xff) << 8);
+            work += 1;
+            // add eax, [y step]
+            let (result, flags) = row_alu(RowAlu::Add, cpu.regs.eax, y_step, false, ROW_DWORD);
+            row_set_flags(cpu, flags);
+            cpu.regs.eax = result;
+            work += 1;
+            // adc ebx, ecx
+            let carry = cpu.regs.flags.cf;
+            let (result, flags) =
+                row_alu(RowAlu::Add, cpu.regs.ebx, cpu.regs.ecx, carry, ROW_DWORD);
+            row_set_flags(cpu, flags);
+            cpu.regs.ebx = result;
+            work += 1;
+            // mov dl, 0
+            cpu.regs.edx &= !0xff;
+            work += 1;
+            // mov dh, [esi+edx]
+            let pixel = row_byte(store, cpu.regs.esi.wrapping_add(cpu.regs.edx), "scaled source")?;
+            cpu.regs.edx = (cpu.regs.edx & !0xff00) | (u32::from(pixel) << 8);
+            work += 1;
+            // adc esi, [x step] -- the mov instructions above do not touch flags
+            let carry = cpu.regs.flags.cf;
+            let (result, flags) =
+                row_alu(RowAlu::Add, cpu.regs.esi, x_step, carry, ROW_DWORD);
+            row_set_flags(cpu, flags);
+            cpu.regs.esi = result;
+            work += 1;
+            // test dh, dh / je
+            row_clear_carry(cpu);
+            work += 2;
+            if pixel != 0 {
+                // mov dl, dh
+                cpu.regs.edx = (cpu.regs.edx & !0xff) | u32::from(pixel);
+                work += 1;
+                // and edx, 0xff -- flags die here: `add` below overwrites them
+                // and the `and edx, 0xffff` after it clears the carry, which is
+                // the only flag `inc edi`/`dec ax` would carry out of the row.
+                cpu.regs.edx &= 0xff;
+                work += 1;
+                // add edx, [shade table] -- flags die at the `and` below
+                cpu.regs.edx = cpu.regs.edx.wrapping_add(scale_lut);
+                work += 1;
+                // mov dh, [edx]
+                let shade = row_byte(store, cpu.regs.edx, "scaled shade")?;
+                cpu.regs.edx = (cpu.regs.edx & !0xff00) | (u32::from(shade) << 8);
+                work += 1;
+                // and edx, 0xffff
+                cpu.regs.edx &= 0xffff;
+                work += 1;
+                // mov dl, [edi]
+                let under = row_byte(store, cpu.regs.edi, "scaled destination")?;
+                cpu.regs.edx = (cpu.regs.edx & !0xff) | u32::from(under);
+                work += 1;
+                // mov dl, [ebp+edx]
+                let mapped = row_byte(
+                    store,
+                    cpu.regs.ebp.wrapping_add(cpu.regs.edx),
+                    "scaled remap",
+                )?;
+                cpu.regs.edx = (cpu.regs.edx & !0xff) | u32::from(mapped);
+                work += 1;
+                // mov [edi], dl
+                row_store_byte(store, cpu.regs.edi, mapped, "scaled destination")?;
+                drawn += 1;
+                work += 1;
+            }
+            // inc edi -- `dec ax` overwrites every flag it sets, and the carry
+            // is already clear, so this is a plain increment.
+            cpu.regs.edi = cpu.regs.edi.wrapping_add(1);
+            work += 1;
+            // dec ax -- a 16-bit write, so the upper half survives
+            let low = row_inc_dec(cpu, cpu.regs.eax & 0xffff, ROW_WORD, true);
+            cpu.regs.eax = (cpu.regs.eax & !0xffff) | (low & 0xffff);
+            work += 1;
+            // jg: taken while !zf && sf == of
+            work += 1;
+            if cpu.regs.flags.zf || cpu.regs.flags.sf != cpu.regs.flags.of {
+                break;
+            }
+        }
+        cpu.regs.eip = HERCULES_SCALED_EXIT;
+        self.calls += 1;
+        self.pixels += drawn;
+        self.work += u64::from(work);
+        Ok(work)
+    }
+}
+
 /// What the destination clip did to one literal run.
 enum Clipped {
     /// Nothing can be drawn; `skip` source pixels were already consumed by a
@@ -514,6 +885,144 @@ fn emit(
         links += 1;
     }
 }
+
+/// Madagascar's hand-written FPU vertex transform at `0x005c92a0`, in the
+/// image's custom `_rwcseg` ("read-write code") section. The game registers the
+/// address with a dispatcher at startup (`0x4e6860` binds it after setting
+/// MXCSR flush-to-zero), and every call that follows goes through that
+/// dispatcher, which is why no direct call site names it. Two instruction
+/// samples 19 billion instructions apart both landed inside this one function:
+/// it is the largest single consumer of guest instructions during the boot.
+///
+/// The contract, from the kernel's own unrolled body: `mat_transform(dst, src,
+/// matrix)` with three stack arguments the caller cleans up (the kernel ends
+/// in a plain `ret`). `src` holds **four** vertices in 16-byte slots, `dst`
+/// receives four in the same layout, and `matrix` is a column-major 4x4 whose
+/// element (row, column) lives at `matrix + column * 16 + row * 4`. Each
+/// destination vertex gets `x' = m00*x + m01*y + m02*z`, the same for `y` and
+/// `z` through the third column -- and the fourth vertex alone adds the
+/// translation column (`m03`, `m13`, `m23`), which is the shape of three edge
+/// vectors transformed around one absolute position. The fourth slot of each
+/// 16-byte vertex is neither read nor written.
+///
+/// The guest computes in x87 registers, which carry every product of two f32s
+/// exactly and round once, on the store. The host keeps its partial sums in
+/// f64 -- exact for the same products -- and rounds at the same place, so the
+/// values left in guest memory are the values the FPU left.
+pub const MAT_TRANSFORM: u32 = 0x005c_92a0;
+
+/// The unrolled kernel spends its ~153 instructions on four vertices, so that
+/// is what one native call stands for in every budget and trace.
+const MAT_TRANSFORM_COST: u32 = 153;
+
+pub struct MatTransform {
+    calls: u64,
+    vertices: u64,
+}
+
+impl MatTransform {
+    pub fn new() -> Self {
+        Self {
+            calls: 0,
+            vertices: 0,
+        }
+    }
+
+    pub fn calls(&self) -> u64 {
+        self.calls
+    }
+
+    pub fn vertices(&self) -> u64 {
+        self.vertices
+    }
+
+    pub fn apply(&mut self, memory: &mut GuestMemory, cpu: &mut Cpu) -> Result<u32> {
+        let esp = cpu.regs.esp;
+        let return_address = memory.read_u32(esp)?;
+        let dst_va = memory.read_u32(esp.wrapping_add(4))?;
+        let src_va = memory.read_u32(esp.wrapping_add(8))?;
+        let matrix_va = memory.read_u32(esp.wrapping_add(12))?;
+
+        // m[column * 4 + row]: the sixteen entries a column-major 4x4 holds,
+        // of which the kernel reads twelve for rotation and three for the
+        // translation it adds to the fourth vertex.
+        let mut m = [0.0_f32; 16];
+        for (index, entry) in m.iter_mut().enumerate() {
+            *entry = f32::from_bits(memory.read_u32(matrix_va.wrapping_add(index as u32 * 4))?);
+        }
+
+        for vertex in 0..4_u32 {
+            let at = src_va.wrapping_add(vertex * 16);
+            let x = f64::from(f32::from_bits(memory.read_u32(at)?));
+            let y = f64::from(f32::from_bits(memory.read_u32(at.wrapping_add(4))?));
+            let z = f64::from(f32::from_bits(memory.read_u32(at.wrapping_add(8))?));
+            // The translation column joins in only for the fourth vertex.
+            let translate = vertex == 3;
+            for row in 0..3_usize {
+                let mut sum = f64::from(m[row]) * x
+                    + f64::from(m[4 + row]) * y
+                    + f64::from(m[8 + row]) * z;
+                if translate {
+                    sum += f64::from(m[12 + row]);
+                }
+                memory.write_u32(
+                    dst_va.wrapping_add(vertex * 16 + row as u32 * 4),
+                    (sum as f32).to_bits(),
+                )?;
+            }
+        }
+
+        self.calls += 1;
+        self.vertices += 4;
+        cpu.regs.eip = return_address;
+        // A plain `ret`: the return address is popped, the caller cleans its
+        // own twelve argument bytes.
+        cpu.regs.esp = esp.wrapping_add(4);
+        Ok(MAT_TRANSFORM_COST)
+    }
+}
+
+/// The reference image's replacements, which [`crate::session::Session::load`]
+/// arms: a session built without a target of its own is a session against the
+/// image these addresses belong to.
+pub static REFERENCE_HLE: &[crate::target::HleEntry] = &[
+    crate::target::HleEntry {
+        address: LZW_DECODE,
+        kind: crate::target::Hle::Lzw,
+    },
+    crate::target::HleEntry {
+        address: BLIT_OPAQUE,
+        kind: crate::target::Hle::Blit { keyed: false },
+    },
+    crate::target::HleEntry {
+        address: BLIT_KEYED,
+        kind: crate::target::Hle::Blit { keyed: true },
+    },
+];
+
+/// Madagascar's replacement, armed for a payload whose program is `Game.exe`.
+pub static MADAGASCAR_HLE: &[crate::target::HleEntry] = &[crate::target::HleEntry {
+    address: MAT_TRANSFORM,
+    kind: crate::target::Hle::MatTransform,
+}];
+
+/// Hercules' three sprite rows, armed only for a `HERCULES.EXE` payload. These
+/// addresses are code in that image and data in others, so the program name is
+/// what keeps them from answering for the wrong game.
+pub static HERCULES_HLE: &[crate::target::HleEntry] = &[
+    crate::target::HleEntry {
+        address: HERCULES_KEYED_ROW,
+        kind: crate::target::Hle::HerculesKeyedRow,
+    },
+    crate::target::HleEntry {
+        address: HERCULES_REMAP_ROW,
+        kind: crate::target::Hle::HerculesRemapRow,
+    },
+    crate::target::HleEntry {
+        address: HERCULES_SCALED_ROW,
+        kind: crate::target::Hle::HerculesScaledRow,
+    },
+];
 
 #[cfg(test)]
 mod tests {
@@ -1075,6 +1584,396 @@ mod tests {
         ];
         case.dest_y = 3;
         differential_blits(vec![case]);
+    }
+
+    // ---- Madagascar's vertex transform ------------------------------------
+
+    const MAT_STOP: u32 = 0x0117_0000;
+    const MAT_DST: u32 = 0x0117_1000;
+    const MAT_SRC: u32 = 0x0117_2000;
+    const MAT_MATRIX: u32 = 0x0117_3000;
+
+    fn mat_memory() -> GuestMemory {
+        let memory = GuestMemory::empty(crate::memory::HEAP_BASE as usize + 0x1000)
+            .expect("blank memory");
+        memory
+    }
+
+    /// Column-major 4x4: element (row, column) at `matrix + column * 16 + row * 4`.
+    fn write_matrix(memory: &mut GuestMemory, m: [f32; 16]) {
+        for (index, value) in m.iter().enumerate() {
+            memory
+                .write_u32(MAT_MATRIX + index as u32 * 4, value.to_bits())
+                .unwrap();
+        }
+    }
+
+    /// Four vertices in 16-byte slots: x, y, z, and an untouched fourth slot.
+    fn write_vertices(memory: &mut GuestMemory, vertices: &[[f32; 3]; 4]) {
+        for (index, vertex) in vertices.iter().enumerate() {
+            for (row, value) in vertex.iter().enumerate() {
+                memory
+                    .write_u32(
+                        MAT_SRC + index as u32 * 16 + row as u32 * 4,
+                        value.to_bits(),
+                    )
+                    .unwrap();
+            }
+            memory
+                .write_u32(MAT_SRC + index as u32 * 16 + 12, 0xdead_beef)
+                .unwrap();
+        }
+        for index in 0..4_u32 {
+            for row in 0..4_u32 {
+                memory
+                    .write_u32(MAT_DST + index * 16 + row * 4, 0xfeed_face)
+                    .unwrap();
+            }
+        }
+    }
+
+    fn read_vertex(memory: &GuestMemory, index: u32) -> [f32; 3] {
+        let mut out = [0.0_f32; 3];
+        for (row, slot) in out.iter_mut().enumerate() {
+            *slot =
+                f32::from_bits(memory.read_u32(MAT_DST + index * 16 + row as u32 * 4).unwrap());
+        }
+        out
+    }
+
+    fn mat_stack(memory: &mut GuestMemory) -> u32 {
+        let esp = STACK_TOP - 0x400;
+        memory.write_u32(esp, MAT_STOP).unwrap();
+        memory.write_u32(esp + 4, MAT_DST).unwrap();
+        memory.write_u32(esp + 8, MAT_SRC).unwrap();
+        memory.write_u32(esp + 12, MAT_MATRIX).unwrap();
+        esp
+    }
+
+    /// Identity rotation, translation (10, 20, 30): the first three vertices
+    /// pass through untouched, and the fourth alone is translated.
+    #[test]
+    fn the_first_three_vertices_skip_translation_and_the_fourth_gets_it() {
+        let mut memory = mat_memory();
+        write_matrix(
+            &mut memory,
+            [
+                1.0, 0.0, 0.0, 0.0, // column 0
+                0.0, 1.0, 0.0, 0.0, // column 1
+                0.0, 0.0, 1.0, 0.0, // column 2
+                10.0, 20.0, 30.0, 0.0, // column 3, the translation
+            ],
+        );
+        write_vertices(
+            &mut memory,
+            &[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0], [2.0, 4.0, 6.0]],
+        );
+        let esp = mat_stack(&mut memory);
+        let mut cpu = Cpu {
+            regs: crate::cpu::Registers {
+                esp,
+                eip: MAT_TRANSFORM,
+                ..crate::cpu::Registers::default()
+            },
+            ..Default::default()
+        };
+        let mut transform = MatTransform::new();
+
+        let work = transform.apply(&mut memory, &mut cpu).unwrap();
+
+        assert_eq!(read_vertex(&memory, 0), [1.0, 2.0, 3.0]);
+        assert_eq!(read_vertex(&memory, 1), [4.0, 5.0, 6.0]);
+        assert_eq!(read_vertex(&memory, 2), [7.0, 8.0, 9.0]);
+        assert_eq!(read_vertex(&memory, 3), [12.0, 24.0, 36.0]);
+        // The fourth slot of each vertex is neither read nor written.
+        assert_eq!(
+            memory.read_u32(MAT_DST + 12).unwrap(),
+            0xfeed_face,
+            "the slot after vertex 0's z"
+        );
+        // The stack contract: a plain `ret`, so only the return address goes.
+        assert_eq!(cpu.regs.eip, MAT_STOP);
+        assert_eq!(cpu.regs.esp, esp + 4);
+        assert_eq!(work, MAT_TRANSFORM_COST);
+        assert_eq!(transform.calls(), 1);
+        assert_eq!(transform.vertices(), 4);
+    }
+
+    /// Scale with translation, against values a hand computation gets exactly.
+    #[test]
+    fn the_matrix_math_is_the_columns_the_kernel_reads() {
+        let mut memory = mat_memory();
+        // x' = 2x + 100, y' = 3y + 200, z' = 0.5z + 50 for the fourth vertex;
+        // the first three get the scale alone.
+        write_matrix(
+            &mut memory,
+            [
+                2.0, 0.0, 0.0, 0.0, //
+                0.0, 3.0, 0.0, 0.0, //
+                0.0, 0.0, 0.5, 0.0, //
+                100.0, 200.0, 50.0, 0.0, //
+            ],
+        );
+        write_vertices(
+            &mut memory,
+            &[[1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [3.0, 2.0, 8.0], [1.0, 1.0, 1.0]],
+        );
+        let esp = mat_stack(&mut memory);
+        let mut cpu = Cpu {
+            regs: crate::cpu::Registers {
+                esp,
+                eip: MAT_TRANSFORM,
+                ..crate::cpu::Registers::default()
+            },
+            ..Default::default()
+        };
+        let mut transform = MatTransform::new();
+        transform.apply(&mut memory, &mut cpu).unwrap();
+
+        assert_eq!(read_vertex(&memory, 0), [2.0, 3.0, 0.5]);
+        assert_eq!(read_vertex(&memory, 1), [0.0, 0.0, 0.0]);
+        assert_eq!(read_vertex(&memory, 2), [6.0, 6.0, 4.0]);
+        assert_eq!(read_vertex(&memory, 3), [102.0, 203.0, 50.5]);
+    }
+
+    #[test]
+    fn a_vertex_outside_guest_memory_is_an_error_not_a_write() {
+        let mut memory = mat_memory();
+        write_matrix(&mut memory, [0.0; 16]);
+        write_vertices(&mut memory, &[[0.0; 3]; 4]);
+        let esp = mat_stack(&mut memory);
+        memory
+            .write_u32(esp + 8, MAT_SRC + 0x0100_0000)
+            .unwrap();
+        let mut cpu = Cpu {
+            regs: crate::cpu::Registers {
+                esp,
+                eip: MAT_TRANSFORM,
+                ..crate::cpu::Registers::default()
+            },
+            ..Default::default()
+        };
+        let mut transform = MatTransform::new();
+        assert!(transform.apply(&mut memory, &mut cpu).is_err());
+        assert_eq!(
+            memory.read_u32(MAT_DST).unwrap(),
+            0xfeed_face,
+            "nothing was written on the way out"
+        );
+    }
+
+    // ---- Hercules row equivalence -----------------------------------------
+    //
+    // Each test boots the *real* loop bytes through the interpreter, then boots
+    // the same state through the native replacement, and compares every
+    // register, every flag and every byte of guest memory. A mismatch anywhere
+    // -- including the instruction count the replacement claims -- means the
+    // replacement cannot be shipped. This is the A/B the sprite fix demanded.
+
+    const ROW_MEMORY: usize = 0x0100_0000;
+    const ROW_SRC: u32 = 0x0110_0000;
+    const ROW_DST: u32 = 0x0112_0000;
+    const ROW_LUT: u32 = 0x0114_0000;
+    const ROW_SHADE: u32 = 0x0115_0000;
+    const ROW_REMAP: u32 = 0x0116_0000;
+    const ROW_STACK: u32 = 0x0118_0000;
+
+    /// Copied out of `HERCULES.EXE`'s .text, so both sides execute the same
+    /// bytes the game does.
+    const KEYED_ROW_BYTES: &[u8] = &[
+        0x8a, 0x04, 0x1e, 0x84, 0xc0, 0x74, 0x03, 0x88, 0x04, 0x1f, 0x43, 0x7c, 0xf3,
+    ];
+    const REMAP_ROW_BYTES: &[u8] = &[
+        0x8a, 0x24, 0x1e, 0x84, 0xe4, 0x74, 0x09, 0x8a, 0x04, 0x1f, 0x8a, 0x04, 0x01,
+        0x88, 0x04, 0x1f, 0x43, 0x7c, 0xed,
+    ];
+    const SCALED_ROW_BYTES: &[u8] = &[
+        0x8a, 0xf3, 0x03, 0x05, 0x98, 0x09, 0xa9, 0x00, 0x13, 0xd9, 0xb2, 0x00, 0x8a,
+        0x34, 0x16, 0x13, 0x35, 0x9c, 0x09, 0xa9, 0x00, 0x84, 0xf6, 0x74, 0x1e, 0x8a,
+        0xd6, 0x81, 0xe2, 0xff, 0x00, 0x00, 0x00, 0x03, 0x15, 0xa0, 0x09, 0xa9, 0x00,
+        0x8a, 0x32, 0x81, 0xe2, 0xff, 0xff, 0x00, 0x00, 0x8a, 0x17, 0x8a, 0x54, 0x15,
+        0x00, 0x88, 0x17, 0x47, 0x66, 0x48, 0x7f, 0xc4,
+    ];
+
+    fn fill_row(store: &mut [u8], va: u32, length: usize, seed: u32) {
+        let at = (va - IMAGE_BASE) as usize;
+        let mut state = seed;
+        for slot in &mut store[at..at + length] {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            // Roughly one byte in eight is zero, so both the transparent and
+            // the painted path are exercised.
+            *slot = if state >> 28 == 0 { 0 } else { (state >> 24) as u8 };
+        }
+    }
+
+    fn row_machine(code_va: u32, code: &[u8]) -> (GuestMemory, Cpu) {
+        let mut memory = GuestMemory::empty(ROW_MEMORY).unwrap();
+        {
+            let store = memory.as_mut_slice();
+            let at = (code_va - IMAGE_BASE) as usize;
+            store[at..at + code.len()].copy_from_slice(code);
+            fill_row(store, ROW_SRC, 0x2_0000, 0x1234_5678);
+            fill_row(store, ROW_DST, 0x2_0000, 0x8765_4321);
+            fill_row(store, ROW_LUT, 0x1_0000, 0xa5a5_5a5a);
+            fill_row(store, ROW_SHADE, 0x100, 0x0f0f_f0f0);
+            fill_row(store, ROW_REMAP, 0x1_0000, 0xdead_beef);
+        }
+        let mut cpu = Cpu::at(code_va);
+        cpu.regs.esp = ROW_STACK;
+        cpu.regs.flags = Flags {
+            cf: true,
+            pf: false,
+            af: true,
+            zf: false,
+            sf: true,
+            of: false,
+            df: false,
+        };
+        (memory, cpu)
+    }
+
+    fn interpret_row(memory: &mut GuestMemory, cpu: &mut Cpu, exit: u32) -> u64 {
+        let mut decodes = crate::cpu::Decodes::new();
+        let mut steps = 0_u64;
+        while cpu.regs.eip != exit {
+            crate::cpu::step(memory, cpu, &mut decodes).unwrap();
+            steps += 1;
+            assert!(steps < 100_000, "the row never reached {exit:#010x}");
+        }
+        assert_eq!(cpu.instructions, steps);
+        steps
+    }
+
+    fn assert_row_equivalent(
+        label: &str,
+        reference: &Cpu,
+        native: &Cpu,
+        ref_memory: &GuestMemory,
+        native_memory: &GuestMemory,
+        steps: u64,
+        work: u32,
+    ) {
+        assert_eq!(u64::from(work), steps, "{label}: instruction accounting");
+        assert_eq!(native.regs.eax, reference.regs.eax, "{label}: eax");
+        assert_eq!(native.regs.ecx, reference.regs.ecx, "{label}: ecx");
+        assert_eq!(native.regs.edx, reference.regs.edx, "{label}: edx");
+        assert_eq!(native.regs.ebx, reference.regs.ebx, "{label}: ebx");
+        assert_eq!(native.regs.esp, reference.regs.esp, "{label}: esp");
+        assert_eq!(native.regs.ebp, reference.regs.ebp, "{label}: ebp");
+        assert_eq!(native.regs.esi, reference.regs.esi, "{label}: esi");
+        assert_eq!(native.regs.edi, reference.regs.edi, "{label}: edi");
+        assert_eq!(native.regs.eip, reference.regs.eip, "{label}: eip");
+        assert_eq!(native.regs.flags, reference.regs.flags, "{label}: flags");
+        let a = ref_memory.as_slice();
+        let b = native_memory.as_slice();
+        if let Some(at) = a.iter().zip(b).position(|(x, y)| x != y) {
+            panic!(
+                "{label}: first memory difference at {:#010x}: {:#04x} vs {:#04x}",
+                IMAGE_BASE as usize + at,
+                a[at],
+                b[at]
+            );
+        }
+    }
+
+    #[test]
+    fn hercules_keyed_row_matches_the_interpreter_exactly() {
+        let width = 37_i32;
+        let make = || {
+            let (memory, cpu) = row_machine(HERCULES_KEYED_ROW, KEYED_ROW_BYTES);
+            let mut cpu = cpu;
+            cpu.regs.ebx = (-(width as i64)) as u32;
+            cpu.regs.esi = ROW_SRC.wrapping_add(width as u32);
+            cpu.regs.edi = ROW_DST.wrapping_add(width as u32);
+            cpu.regs.eax = 0x1234_5678;
+            cpu.regs.ecx = 0x0bad_f00d;
+            cpu.regs.edx = 0xfeed_face;
+            cpu.regs.ebp = 0x0102_0304;
+            (memory, cpu)
+        };
+        let (mut ref_memory, mut ref_cpu) = make();
+        let steps = interpret_row(&mut ref_memory, &mut ref_cpu, HERCULES_KEYED_EXIT);
+        let (mut native_memory, mut native_cpu) = make();
+        let work = HerculesBlitter::new()
+            .keyed_row(&mut native_memory, &mut native_cpu)
+            .unwrap();
+        assert_row_equivalent(
+            "keyed row",
+            &ref_cpu,
+            &native_cpu,
+            &ref_memory,
+            &native_memory,
+            steps,
+            work,
+        );
+    }
+
+    #[test]
+    fn hercules_remap_row_matches_the_interpreter_exactly() {
+        let width = 41_i32;
+        let make = || {
+            let (memory, cpu) = row_machine(HERCULES_REMAP_ROW, REMAP_ROW_BYTES);
+            let mut cpu = cpu;
+            cpu.regs.ebx = (-(width as i64)) as u32;
+            cpu.regs.esi = ROW_SRC.wrapping_add(width as u32);
+            cpu.regs.edi = ROW_DST.wrapping_add(width as u32);
+            // The row setup does `xor eax,eax` before the loop.
+            cpu.regs.eax = 0;
+            cpu.regs.ecx = ROW_LUT;
+            cpu.regs.edx = 0xfeed_face;
+            cpu.regs.ebp = 0x0102_0304;
+            (memory, cpu)
+        };
+        let (mut ref_memory, mut ref_cpu) = make();
+        let steps = interpret_row(&mut ref_memory, &mut ref_cpu, HERCULES_REMAP_EXIT);
+        let (mut native_memory, mut native_cpu) = make();
+        let work = HerculesBlitter::new()
+            .remap_row(&mut native_memory, &mut native_cpu)
+            .unwrap();
+        assert_row_equivalent(
+            "remap row",
+            &ref_cpu,
+            &native_cpu,
+            &ref_memory,
+            &native_memory,
+            steps,
+            work,
+        );
+    }
+
+    #[test]
+    fn hercules_scaled_row_matches_the_interpreter_exactly() {
+        let make = || {
+            let (mut memory, cpu) = row_machine(HERCULES_SCALED_ROW, SCALED_ROW_BYTES);
+            memory.write_u32(HERCULES_Y_STEP, 0xffff_0000).unwrap();
+            memory.write_u32(HERCULES_X_STEP, 0x0000_0001).unwrap();
+            memory.write_u32(HERCULES_SCALE_LUT, ROW_SHADE).unwrap();
+            let mut cpu = cpu;
+            // (fixed-point coordinate << 16) | row pixel count
+            cpu.regs.eax = 0x0123_0020;
+            cpu.regs.ebx = 0x0456_0078;
+            cpu.regs.ecx = 0x0000_0040;
+            cpu.regs.edx = 0;
+            cpu.regs.esi = ROW_SRC;
+            cpu.regs.edi = ROW_DST;
+            cpu.regs.ebp = ROW_REMAP;
+            (memory, cpu)
+        };
+        let (mut ref_memory, mut ref_cpu) = make();
+        let steps = interpret_row(&mut ref_memory, &mut ref_cpu, HERCULES_SCALED_EXIT);
+        let (mut native_memory, mut native_cpu) = make();
+        let work = HerculesBlitter::new()
+            .scaled_row(&mut native_memory, &mut native_cpu)
+            .unwrap();
+        assert_row_equivalent(
+            "scaled row",
+            &ref_cpu,
+            &native_cpu,
+            &ref_memory,
+            &native_memory,
+            steps,
+            work,
+        );
     }
 }
 

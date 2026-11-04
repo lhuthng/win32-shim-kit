@@ -12,7 +12,8 @@ __pycache__/
 release/
 # A built payload: the module plus the game's own files, which the kit never owns.
 dist/
-# Not shipped yet: the payload is baked and played locally, but the game's files
-# are not in the repository and the demo does not list it.
-demo/payloads/ntsd-community/
-demo/payloads/madagascar/
+# Payloads whose files are not the repository's to ship. `local/payloads/<slug>/`
+# holds them, `local/payloads/index.json` describes them, and `demo-site/serve.ts`
+# serves them to this machine only. One rule, no game named here: the published
+# tree (`demo/payloads/`) is the only one that ships, and it never contains one.
+local/

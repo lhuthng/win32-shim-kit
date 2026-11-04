@@ -221,13 +221,47 @@ fn main() -> ExitCode {
         })
         .map(|(width, height, depth)| (width as u16, height as u16, depth as u8))
         .unwrap_or((640, 480, 8));
+    // `PROBE_HLE=<hexaddr,...>` arms the native replacements at those guest
+    // addresses, all of the vertex-transform kind: a boot whose hotspot is
+    // known can have it answered without a rebuild.
+    let hle: Vec<host::target::HleEntry> = std::env::var("PROBE_HLE")
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|part| {
+                    u32::from_str_radix(part.trim().trim_start_matches("0x"), 16)
+                        .ok()
+                        .map(|address| host::target::HleEntry {
+                            address,
+                            kind: host::target::Hle::MatTransform,
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // `PROBE_WINDOWS=98|me|nt4|2000|xp` is the platform `GetVersion` answers,
+    // the same choice `SHIMKIT_WINDOWS` gives a bake: a start-up check that
+    // refuses the wrong Windows never reaches the rest of its own code.
+    let windows = match std::env::var("PROBE_WINDOWS")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "98" => host::target::Windows::WIN98,
+        "nt4" => host::target::Windows::NT4,
+        "2000" => host::target::Windows::WIN2000,
+        _ => host::target::Windows::XP,
+    };
     let target: &'static Target = Box::leak(Box::new(Target {
         name: "probe",
         exe_name: leak(&name),
         screen,
+        windows,
         table: table_for(&image),
         shims: host::shim::TABLES,
         provided_files: &[],
+        hle: Box::leak(hle.into_boxed_slice()),
     }));
 
     let mut session = Session::load_for(bytes, target).expect("the session loads");
@@ -249,6 +283,27 @@ fn main() -> ExitCode {
             continue;
         }
         session.host.files.provide(&file, contents);
+    }
+
+    // `PROBE_DLL=<name,...>` loads guest DLLs from the payload before the run,
+    // the way `LoadLibraryA` would. It proves the compiler's placement, the
+    // relocated bytes, the import fixups and `DllMain` without the launcher
+    // having to reach the call itself.
+    if let Ok(names) = std::env::var("PROBE_DLL") {
+        for name in names.split(',').filter(|name| !name.trim().is_empty()) {
+            match session.load_module(name.trim()) {
+                Ok(base) if base != 0 => println!("  mapped {name} at {base:#010x}"),
+                Ok(_) => println!("  could not map {name}"),
+                Err(error) => println!("  could not map {name}: {error}"),
+            }
+        }
+        for module in &session.host.guest_modules {
+            let exports: Vec<&str> = module.exports.iter().map(|(name, _)| name.as_str()).collect();
+            println!(
+                "  module {} at {:#010x} exports {exports:?}",
+                module.name, module.base
+            );
+        }
     }
 
     // A game that asks for its own clock needs one to move, or its animation and
@@ -302,8 +357,93 @@ fn main() -> ExitCode {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(33_000)
         .max(1);
+    // `PROBE_SCRIPT="mouse@500:353,230;key@900:1c"` drives the guest the way a
+    // player would, in guest milliseconds: a scripted menu walk is the only way
+    // to read a screen that waits for a click, and the frames it produces say
+    // whether the click was understood.
+    let script: Vec<(u64, String)> = std::env::var("PROBE_SCRIPT")
+        .ok()
+        .map(|value| {
+            value
+                .split(';')
+                .filter_map(|step| {
+                    // `kind@ms:argument`, so the time is between the kind and
+                    // the argument and not the other way round.
+                    let (kind, rest) = step.trim().split_once('@')?;
+                    let (at, argument) = rest.split_once(':').unwrap_or((rest, ""));
+                    Some((at.parse().ok()?, format!("{kind}:{argument}")))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut scripted = 0;
+    // The words `PROBE_POLL` watches, and what they held at the last chunk that
+    // showed them, so only a change prints.
+    let poll: Vec<u32> = std::env::var("PROBE_POLL")
+        .ok()
+        .map(|list| {
+            list.split(',')
+                .filter_map(|text| u32::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut polled: Vec<u32> = vec![0; poll.len()];
+    let mut poll_lines = 0;
+    // `PROBE_POLL_AFTER` holds the poll back until the guest has run that far: the
+    // early load touches most of memory, and only what happens after it is read.
+    let poll_after = std::env::var("PROBE_POLL_AFTER")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    // `PROBE_POLL_EVERY=<chunks>` prints the poll even when nothing changed, so a
+    // value that has settled is still read at intervals rather than only at the
+    // moment it moved last.
+    let poll_every = std::env::var("PROBE_POLL_EVERY")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
     while ran < budget {
         session.set_time_ms(ran / clock);
+        if let Some((at, event)) = script.get(scripted) {
+            let now = ran / clock;
+            if now >= *at {
+                scripted += 1;
+                let (kind, argument) = event.split_once(':').unwrap_or((event.as_str(), ""));
+                let point = |text: &str| {
+                    let (x, y) = text.split_once(',').unwrap_or(("0", "0"));
+                    (x.trim().parse().unwrap_or(0), y.trim().parse().unwrap_or(0))
+                };
+                match kind {
+                    "move" => {
+                        let (x, y) = point(argument);
+                        session.host.pointer(x, y);
+                    }
+                    "click" => {
+                        let (x, y) = point(argument);
+                        session.host.pointer(x, y);
+                        session.host.pointer_button(0, true);
+                        session.host.pointer_button(0, false);
+                    }
+                    "down" => session.host.pointer_button(0, true),
+                    "up" => session.host.pointer_button(0, false),
+                    "key" => {
+                        let dik = u8::from_str_radix(argument.trim(), 16).unwrap_or(0);
+                        session.host.key(dik, true);
+                        session.host.key(dik, false);
+                    }
+                    "keydown" => {
+                        let dik = u8::from_str_radix(argument.trim(), 16).unwrap_or(0);
+                        session.host.key(dik, true);
+                    }
+                    "keyup" => {
+                        let dik = u8::from_str_radix(argument.trim(), 16).unwrap_or(0);
+                        session.host.key(dik, false);
+                    }
+                    other => println!("  unknown script step {other}"),
+                }
+                println!("{now:9} script {event}");
+            }
+        }
         if let Some(at) = press_at {
             let now = ran / clock;
             if pressed == 0 && now >= at {
@@ -344,9 +484,45 @@ fn main() -> ExitCode {
         if log_imports {
             if let Some(label) = &session.last_import {
                 let name = label.split(" args=").next().unwrap_or(label).to_string();
-                if seen_imports.insert(name.clone()) && seen_imports.len() <= 400 {
-                    println!("{ran:12} import {name}");
+                // The guest's return address names the routine that made the
+                // call, which is how a call site that matters is found: the
+                // branch after it is the check that read the answer. The
+                // arguments sit at `esp - 4` and the return address just below
+                // them, so the caller is eight bytes down.
+                let esp = session
+                    .cpu
+                    .registers()
+                    .into_iter()
+                    .find(|(index, _)| *index == 4)
+                    .map_or(0, |(_, value)| value);
+                let from = session.memory.read_u32(esp.wrapping_sub(8)).unwrap_or(0);
+                if std::env::var("PROBE_ANSWERS").is_ok() {
+                    if seen_imports.insert(label.clone()) && seen_imports.len() <= 2000 {
+                        println!("{ran:12} {label} from {from:#010x}");
+                    }
+                } else if seen_imports.insert(name.clone()) && seen_imports.len() <= 400 {
+                    println!("{ran:12} import {name} from {from:#010x}");
                 }
+            }
+        }
+        // `PROBE_POLL=<hex>,<hex>` prints the listed words whenever any of them
+        // changes: a value that is computed from the clock is read as a
+        // trajectory, so the reading that poisoned it is not lost behind the end
+        // state that a single dump would show.
+        if !poll.is_empty() && poll_lines < 5000 && ran >= poll_after {
+            let mut moved = false;
+            let mut line = String::new();
+            for (index, address) in poll.iter().enumerate() {
+                let value = session.memory.read_u32(*address).unwrap_or(0);
+                if value != polled[index] {
+                    polled[index] = value;
+                    moved = true;
+                }
+                line.push_str(&format!(" {address:#010x}={value:#010x}"));
+            }
+            if moved || (poll_every > 0 && ran / chunk.max(1) % poll_every == 0) {
+                poll_lines += 1;
+                println!("{ran:12} poll{line}");
             }
         }
         if live_notices && session.host.notices.len() > printed_notices {
@@ -410,6 +586,11 @@ fn main() -> ExitCode {
             // Why it stopped is the whole point of the probe: a fault names the
             // instruction, a host call names the import the shims did not answer.
             println!("stopped at {ran}: {}", outcome.describe(target.table));
+            // An exited guest's own status is the first thing to read: a game
+            // that quits during start-up usually says why in it.
+            if let Some(code) = session.exit_code() {
+                println!("  exit code {code:#010x} ({code})");
+            }
             session.dump_tail();
             if let Some(last) = &session.last_import {
                 println!("  last import: {last}");
@@ -431,6 +612,19 @@ fn main() -> ExitCode {
         ran += chunk;
     }
     session.dump_watch();
+    if session.watch.is_some() {
+        println!("  watch hits: {}", session.watch_hits());
+    }
+    // `PROBE_READ=<hex>,<hex>` prints guest memory at the end: a flag the guest
+    // polls is read directly instead of being inferred from what it does.
+    if let Ok(list) = std::env::var("PROBE_READ") {
+        for address in list.split(',').filter_map(|text| {
+            u32::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok()
+        }) {
+            let value = session.memory.read_u32(address).unwrap_or(0);
+            println!("  [{address:#010x}] = {value:#010x}");
+        }
+    }
     session.dump_tail();
     for notice in &session.host.notices {
         println!("notice {notice}");
@@ -653,6 +847,106 @@ fn main() -> ExitCode {
         ddraw.back_buffer(),
         lit(ddraw.back_buffer()),
     );
+
+    // The audio the guest reached: each play's format, and whether the voice's
+    // samples still read as silence. A looping buffer of zeroes is a guest
+    // whose music data never arrived, which looks healthy and sounds like
+    // nothing.
+    const EVENT_PLAY: u32 = 0;
+    let audio = &session.host.audio;
+    let memory = session.memory.as_slice();
+    println!(
+        "  audio events: {} total, {} plays, {} stops, {} releases",
+        audio.events().len(),
+        audio.events().iter().filter(|e| e.kind == EVENT_PLAY).count(),
+        audio.events().iter().filter(|e| e.kind == 2).count(),
+        audio.events().iter().filter(|e| e.kind == 3).count(),
+    );
+    let mut printed = 0u32;
+    // The guest's own view of its voices: a buffer it left playing and looping
+    // is a sound that will never stop, whatever the page's mixer does with it.
+    let voices = audio.voices();
+    let looping = voices.iter().filter(|voice| voice.2).count();
+    let sounding = voices.iter().filter(|voice| voice.1).count();
+    println!(
+        "  guest voices: {} held, {} playing, {} looping",
+        voices.len(),
+        sounding,
+        looping
+    );
+    for (voice, playing, loops, size) in &voices {
+        if !*playing {
+            continue;
+        }
+        println!(
+            "    {voice:#010x} {} size {size}",
+            if *loops { "LOOPING" } else { "one-shot" }
+        );
+    }
+    for event in audio.events() {
+        if event.kind != EVENT_PLAY || printed >= 12 {
+            continue;
+        }
+        printed += 1;
+        let live = audio
+            .samples(event.voice)
+            .map(|(address, length)| {
+                let from = (address.wrapping_sub(pe::IMAGE_BASE)) as usize;
+                let Some(span) = memory.get(from..from + length as usize) else {
+                    return "out of memory".to_string();
+                };
+                // For unsigned 8-bit samples silence is 0x80, so the byte
+                // histogram says whether a streamer ever wrote music here.
+                let silent = span.iter().filter(|byte| **byte == 0x80).count();
+                let mut distinct = std::collections::HashSet::new();
+                for byte in span.iter().step_by(7) {
+                    distinct.insert(*byte);
+                }
+                let head: Vec<String> =
+                    span[..16].iter().map(|byte| format!("{byte:02x}")).collect();
+                format!(
+                    "{}/{} silent-0x80, {} distinct, head {}",
+                    silent,
+                    length,
+                    distinct.len(),
+                    head.join(" ")
+                )
+            })
+            .unwrap_or_else(|| "no live samples".to_string());
+    }
+
+    // The threads the guest ended with: where each sits and what it is parked
+    // on. A thread that stops mid audio init names its own stall here.
+    for thread in session.thread_summaries() {
+        let waits = if thread.waits.is_empty() {
+            String::from("-")
+        } else {
+            thread
+                .waits
+                .iter()
+                .map(|handle| format!("{handle:#010x}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let stack = thread
+            .stack
+            .iter()
+            .map(|frame| format!("{frame:#x}"))
+            .collect::<Vec<_>>()
+            .join(" <- ");
+        println!(
+            "  thread {} {:?} pc {:#010x} waits {waits}{}",
+            thread.id,
+            thread.state,
+            thread.pc,
+            if stack.is_empty() {
+                String::new()
+            } else {
+                format!(" stack {stack}")
+            }
+        );
+    }
+
     let _ = Path::new("");
     ExitCode::SUCCESS
 }

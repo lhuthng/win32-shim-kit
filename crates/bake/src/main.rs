@@ -21,9 +21,13 @@
 //! first name in the list; it does not sort, because the list is already sorted
 //! and the default may deliberately be a later entry.
 //!
-//! Two environment variables override what only the build knows: `SHIMKIT_EXE`
-//! names the default executable, and `SHIMKIT_SCREEN` sets `<width>x<height>x<depth>`
-//! (default 640x480x8, the mode the shims answer before the guest asks).
+//! Three environment variables override what only the build knows: `SHIMKIT_EXE`
+//! names the default executable, `SHIMKIT_SCREEN` sets `<width>x<height>x<depth>`
+//! (default 640x480x8, the mode the shims answer before the guest asks), and
+//! `SHIMKIT_WINDOWS` says which Windows the guest is told it runs on (`98`, `me`,
+//! `nt4`, `2000` or `xp`, the default). A title whose start-up refuses anything
+//! newer than the Windows it was written for is the case `SHIMKIT_WINDOWS` exists
+//! for.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,6 +45,9 @@ const ABI: u32 = 1;
 const ARTIFACT_FORMAT: u32 = 2;
 /// The screen the module seeds before the guest asks for its own.
 const DEFAULT_SCREEN: (u32, u32, u32) = (640, 480, 8);
+/// The platform the module claims before the guest asks: Windows XP, 5.1 build
+/// 2600, `VER_PLATFORM_WIN32_NT`.
+const DEFAULT_WINDOWS: (u32, u32, u32, u32) = (5, 1, 2600, 2);
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -52,6 +59,22 @@ fn main() -> ExitCode {
     let out = PathBuf::from(out);
     if !install.is_dir() {
         eprintln!("no such folder: {}", install.display());
+        return ExitCode::from(2);
+    }
+    // The output holds the install's files, so baking a payload into itself makes
+    // every file its own source: the copy step deletes the target before reading
+    // it and the payload eats the game it was given. A payload folder and the
+    // install it was baked from are never the same directory; say so instead.
+    if install
+        .canonicalize()
+        .ok()
+        .zip(out.join("game").canonicalize().ok())
+        .is_some_and(|(install, game)| install == game)
+    {
+        eprintln!(
+            "{} is already the output of a bake; give the folder it was baked from",
+            install.display()
+        );
         return ExitCode::from(2);
     }
 
@@ -142,10 +165,17 @@ fn main() -> ExitCode {
     }
 
     let screen = screen_setting();
+    let windows = windows_setting();
     let mut artifact = json!({
         "format": ARTIFACT_FORMAT,
         "kit": { "version": env!("CARGO_PKG_VERSION"), "abi": ABI },
         "screen": { "width": screen.0, "height": screen.1, "depth": screen.2 },
+        "windows": {
+            "major": windows.0,
+            "minor": windows.1,
+            "build": windows.2,
+            "platform": windows.3,
+        },
         "executables": facts,
         "game": { "root": "game", "files": entries.len(), "bytes": total },
     });
@@ -153,8 +183,21 @@ fn main() -> ExitCode {
         artifact["default"] = json!(name);
     }
     let module = out.join("host_wasm.wasm");
-    if let Ok(metadata) = fs::metadata(&module) {
-        artifact["module"] = json!({ "name": "host_wasm.wasm", "bytes": metadata.len() });
+    if let Ok(bytes) = fs::read(&module) {
+        // The build stamp is the module's content, not its length: a rebuilt
+        // module that happens to come out the same size is still a different
+        // module, and the page keys its fetch on this so a reload cannot replay
+        // the old shims.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in &bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        artifact["module"] = json!({
+            "name": "host_wasm.wasm",
+            "bytes": bytes.len(),
+            "build": format!("{hash:016x}"),
+        });
     }
 
     let text = serde_json::to_string_pretty(&artifact).unwrap_or_default();
@@ -213,6 +256,28 @@ fn describe_executable(path: &Path) -> Result<serde_json::Value, String> {
         "image_bytes": image.size_of_image,
         "imports": image.imports.len(),
     }))
+}
+
+/// `SHIMKIT_WINDOWS=98|me|nt4|2000|xp`, or the platform the shims answer by
+/// default. Named rather than numeric because the number a title wants is a
+/// release, and because `4.10` is not the only odd thing about the era.
+fn windows_setting() -> (u32, u32, u32, u32) {
+    let Ok(text) = std::env::var("SHIMKIT_WINDOWS") else {
+        return DEFAULT_WINDOWS;
+    };
+    match text.trim().to_ascii_lowercase().as_str() {
+        "98" | "win98" | "windows98" => (4, 10, 2222, 1),
+        "me" | "winme" => (4, 90, 3000, 1),
+        "nt4" => (4, 0, 1381, 2),
+        "2000" | "win2000" => (5, 0, 2195, 2),
+        "xp" | "winxp" => DEFAULT_WINDOWS,
+        other => {
+            eprintln!(
+                "warning: SHIMKIT_WINDOWS={other} is not 98, me, nt4, 2000 or xp; using XP"
+            );
+            DEFAULT_WINDOWS
+        }
+    }
 }
 
 /// `SHIMKIT_SCREEN=<w>x<h>x<d>`, or the mode the shims answer by default.

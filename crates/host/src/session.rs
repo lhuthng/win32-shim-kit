@@ -15,6 +15,45 @@ use crate::shim::{self, Action, GuestCall, Host};
 use crate::target::{self, Target};
 use crate::Result;
 
+/// A target's native replacements, indexed for the step loop.
+///
+/// This is asked "is this the entry of a native routine?" once per guest
+/// instruction, so the answer has to cost less than the instruction it guards.
+/// A `HashMap` does not: hashing a `u32` on every step measured 33% slower on
+/// Hercules with three entries armed, which is more than the rows it replaced
+/// saved. A slice of a handful of entries wants a linear scan, and the bloom
+/// mask in front of it rejects every address that is not one of them with a
+/// shift, an `and` and a test -- one branch that is never taken in the common
+/// case.
+struct HleTable {
+    entries: &'static [target::HleEntry],
+    /// Bit `(pc >> 1) & 63` set for every entry address. Instructions are at
+    /// least one byte, and code addresses in practice are two-byte aligned, so
+    /// dropping bit 0 keeps the three Hercules loops in separate slots.
+    mask: u64,
+}
+
+impl HleTable {
+    fn new(entries: &'static [target::HleEntry]) -> Self {
+        let mut mask = 0u64;
+        for entry in entries {
+            mask |= 1 << ((entry.address >> 1) & 63);
+        }
+        Self { entries, mask }
+    }
+
+    #[inline(always)]
+    fn get(&self, pc: u32) -> Option<target::Hle> {
+        if self.mask & (1 << ((pc >> 1) & 63)) == 0 {
+            return None;
+        }
+        self.entries
+            .iter()
+            .find(|entry| entry.address == pc)
+            .map(|entry| entry.kind)
+    }
+}
+
 pub struct Session {
     /// What this machine is running, supplied by the port.
     pub target: &'static Target,
@@ -26,6 +65,13 @@ pub struct Session {
     /// The answer cannot change while the session lives, so it is worked out here
     /// and indexed by slot.
     bindings: Vec<Option<&'static shim::Binding>>,
+    /// The import surface as it stands: the program's slots, plus one appended
+    /// group per guest DLL the guest has loaded.
+    ///
+    /// Appended and never reordered, because a filled IAT holds the index it was
+    /// given; [`Table::index_of`] searches the sorted prefix and then walks the
+    /// appended group.
+    pub table: Table,
     pub memory: GuestMemory,
     pub cpu: Cpu,
     /// The decoded-instruction cache, which lives beside the CPU so the step
@@ -37,6 +83,10 @@ pub struct Session {
     pub host_returns: u64,
     /// The most recent import a shim answered, for tracing what the boot does.
     pub last_import: Option<String>,
+    /// Whether `registry.txt` has been looked for. A payload ships one when a
+    /// prepared tree should boot, and the look happens once because the answer
+    /// cannot change while the files are fixed.
+    registry_seeded: bool,
     /// The register file of the frame a timer callback interrupted, kept until
     /// the callback returns through [`cpu::TIMER_TRAMPOLINE`]. Every register is
     /// part of it: the guest can hold a live value in `ecx` across the call the
@@ -58,6 +108,16 @@ pub struct Session {
     /// The same total split by timer id, which separates the audio refill from
     /// the game's own low-frequency timers.
     timer_by_id: [u64; 16],
+    /// The register file of the frame a queued `ReadFileEx` completion
+    /// interrupted, kept until the routine returns through
+    /// [`cpu::TIMER_TRAMPOLINE`]. Same machinery as a timer callback, and never
+    /// running at the same time as one.
+    apc_frame: Option<(cpu::Registers, cpu::Fpu)>,
+    /// The instruction count when the running completion was entered, for the
+    /// same accounting a timer gets.
+    apc_started: Option<u64>,
+    /// Total instructions retired inside `ReadFileEx` completions so far.
+    apc_instructions: u64,
     /// Host calls that are waiting for a guest routine: a window procedure a
     /// `DispatchMessageA` started, with the import's own frame suspended under
     /// it. A stack because a dispatched procedure can call another import that
@@ -82,6 +142,11 @@ pub struct Session {
     /// to be read at one exact instruction rather than sampled. Set by a
     /// diagnostic harness, never by the page.
     pub watch: Option<u32>,
+    /// The instruction the CPU last started. The interpreter advances `eip`
+    /// before it runs one, so at fault time `eip` is the instruction *after* the
+    /// access that faulted -- and naming that one sends a reader to the wrong
+    /// line of the disassembly.
+    step_pc: u32,
     watch_hits: u32,
     /// The last few arrivals at [`Self::watch`], printed when the run dies: the
     /// state that led to a fault, which sampling cannot show.
@@ -103,6 +168,11 @@ pub struct Session {
     /// calls the way the guest keeps its own.
     lzw: crate::hle::Lzw,
     blitter: crate::hle::Blitter,
+    mat_transform: crate::hle::MatTransform,
+    hercules: crate::hle::HerculesBlitter,
+    /// The native replacements this target declared, by guest address. `None`
+    /// keeps the per-instruction cost of a target without any to one compare.
+    hle: Option<HleTable>,
     entry: u32,
     image_size: u32,
 }
@@ -237,6 +307,7 @@ impl Session {
                 .iter()
                 .map(|slot| shim::binding(target.shims, slot))
                 .collect(),
+            table: target.table,
             memory,
             cpu,
             decodes: cpu::Decodes::new(),
@@ -244,10 +315,14 @@ impl Session {
             host_calls: 0,
             host_returns: 0,
             last_import: None,
+            registry_seeded: false,
             timer_frame: None,
             timer_started: None,
             timer_instructions: 0,
             timer_by_id: [0; 16],
+            apc_frame: None,
+            apc_started: None,
+            apc_instructions: 0,
             call_frames: Vec::new(),
             threads,
             slice_at: THREAD_SLICE,
@@ -256,6 +331,7 @@ impl Session {
             watch: None,
             watch_hits: 0,
             watch_recent: Default::default(),
+            step_pc: 0,
             tail: Default::default(),
             tail_len: std::env::var("SHIMKIT_TRACE_TAIL")
                 .ok()
@@ -268,6 +344,13 @@ impl Session {
             timer_check_at: 0,
             lzw: crate::hle::Lzw::new(),
             blitter: crate::hle::Blitter::new(),
+            mat_transform: crate::hle::MatTransform::new(),
+            hercules: crate::hle::HerculesBlitter::new(),
+            hle: if target.hle.is_empty() {
+                None
+            } else {
+                Some(HleTable::new(target.hle))
+            },
             entry,
             image_size,
         })
@@ -309,13 +392,23 @@ impl Session {
                 } else {
                     0
                 };
+                // A thread's saved registers are written when the CPU leaves it,
+                // so for the thread that is running they still hold the entry
+                // point: reporting those made every stuck run look like it was
+                // parked at the program's first instruction. The live registers
+                // are the CPU's.
+                let (pc, ebp) = if running {
+                    (self.cpu.regs.eip, self.cpu.regs.ebp)
+                } else {
+                    (thread.regs.eip, thread.regs.ebp)
+                };
                 ThreadSummary {
                     id: thread.id,
                     state: thread.state,
-                    pc: thread.regs.eip,
+                    pc,
                     instructions: thread.instructions + in_progress,
                     waits: waits.remove(&thread.id).unwrap_or_default(),
-                    stack: self.frames_from(thread.regs.ebp, 8),
+                    stack: self.frames_from(ebp, 8),
                     current: running,
                 }
             })
@@ -345,13 +438,28 @@ impl Session {
             })
             .collect::<Vec<_>>()
             .join(" ");
-        let line = format!(
+        let mut line = format!(
             "watch {:#010x} at {}: {registers} zf={} cf={}\n  stack+0..8: {stack}",
             self.cpu.regs.eip,
             self.cpu.instructions,
             u8::from(self.cpu.regs.flags.zf),
             u8::from(self.cpu.regs.flags.cf)
         );
+        // A watch address reached through a function pointer, like a driver's
+        // swap, has no caller in its frame: the return addresses sitting further
+        // up the stack are the only record of who asked for it.
+        if std::env::var("WATCH_STACK").is_ok() {
+            let base = self.cpu.regs.esp;
+            for index in 0..256 {
+                let at = base.wrapping_add(index * 4);
+                let Ok(value) = self.memory.read_u32(at) else {
+                    break;
+                };
+                if (0x0040_1000..0x0060_0000).contains(&value) {
+                    line.push_str(&format!("\n    stack +{:#06x}: {value:#010x}", index * 4));
+                }
+            }
+        }
         if self.watch_hits <= 64 {
             println!("{line}");
         }
@@ -407,6 +515,23 @@ impl Session {
         self.blitter.pixels()
     }
 
+    /// Hercules sprite rows the host drew instead of interpreting, and the
+    /// pixels they covered. An embedder can use these to prove the replacements
+    /// are armed rather than silently idle.
+    pub fn hercules_calls(&self) -> u64 {
+        self.hercules.calls()
+    }
+
+    pub fn hercules_pixels(&self) -> u64 {
+        self.hercules.pixels()
+    }
+
+    /// Guest instructions the native rows stood in for, so a measurement can
+    /// separate "the interpreter got faster" from "the host did the work".
+    pub fn hercules_work(&self) -> u64 {
+        self.hercules.work()
+    }
+
     /// Instructions retired inside timer callbacks. Subtract this from
     /// [`Self::instructions`] to get what the game itself ran.
     pub fn timer_instructions(&self) -> u64 {
@@ -416,6 +541,13 @@ impl Session {
     /// Instructions retired inside the callbacks of one timer id.
     pub fn timer_instructions_for(&self, id: u32) -> u64 {
         self.timer_by_id.get(id as usize).copied().unwrap_or(0)
+    }
+
+    /// Instructions retired inside `ReadFileEx` completions. Subtract this from
+    /// [`Self::instructions`] alongside [`Self::timer_instructions`] to get what
+    /// the game itself ran.
+    pub fn apc_instructions(&self) -> u64 {
+        self.apc_instructions
     }
 
     /// Sets the guest's clock in milliseconds. Whoever drives the session supplies
@@ -429,6 +561,7 @@ impl Session {
     /// Executes up to `budget` instructions, stopping early for a halt, a host
     /// call or a fault.
     pub fn run(&mut self, budget: u32) -> Outcome {
+        self.seed_registry_from_payload();
         for _ in 0..budget {
             // The thread the CPU is on may have parked itself at the end of the
             // host call that just completed, or given way to another one, so a
@@ -455,6 +588,9 @@ impl Session {
             // Both trampolines live above the host-call base, and no guest code
             // does, so one compare keeps the two checks out of the common path.
             let eip = self.cpu.regs.eip;
+            if self.memory.watching() {
+                self.memory.set_pc(eip, self.cpu.regs.esp);
+            }
             if self.watch == Some(eip) {
                 self.report_watch();
             }
@@ -488,7 +624,10 @@ impl Session {
                     if let Some(binding) = frame.resume {
                         self.host.guest_result = result;
                         self.host.resumed = true;
-                        self.host.this = self.cpu.regs.ecx;
+                        self.note_host_time();
+                        self.note_host_time();
+            self.note_host_time();
+        self.host.this = self.cpu.regs.ecx;
                         let mut arguments = shim::Call {
                             memory: &mut self.memory,
                             args: frame.args,
@@ -536,48 +675,107 @@ impl Session {
                             self.cpu.fpu = fpu;
                         }
                         None => {
-                            return Outcome::Fault(format!(
-                                "returned to the timer trampoline {:#010x} with no callback running",
-                                cpu::TIMER_TRAMPOLINE
-                            ))
+                            // A `ReadFileEx` completion returns through the same
+                            // trampoline as a timer, and it is the only other
+                            // thing that can be running here, because a timer
+                            // and a completion never interrupt a thread at once.
+                            match self.apc_frame.take() {
+                                Some((regs, fpu)) => {
+                                    if let Some(started) = self.apc_started.take() {
+                                        self.apc_instructions += self.cpu.instructions - started;
+                                    }
+                                    self.cpu.regs = regs;
+                                    self.cpu.fpu = fpu;
+                                }
+                                None => {
+                                    return Outcome::Fault(format!(
+                                        "returned to the timer trampoline {:#010x} with no callback running",
+                                        cpu::TIMER_TRAMPOLINE
+                                    ))
+                                }
+                            }
                         }
                     }
                     continue;
                 }
             }
-            // The image decoder is pure computation on guest memory, and it is
-            // the largest single consumer of guest instructions on the board, so
-            // the host runs it natively. It keeps its own stack contract; only
-            // the instruction budget it stands for is added here.
-            match eip {
-                crate::hle::LZW_DECODE => {
-                    match self.lzw.decode(&mut self.memory, &mut self.cpu) {
-                        Ok(work) => self.cpu.instructions += u64::from(work),
-                        Err(error) => return Outcome::Fault(error),
+            // The native replacements the target declared: the image decoder,
+            // the sprite blitters, Madagascar's vertex transform. An address is
+            // only ever matched for the target that named it, so two images
+            // that put code at the same address never cross.
+            if let Some(kind) = self.hle.as_ref().and_then(|table| table.get(eip)) {
+                match kind {
+                    target::Hle::Lzw => {
+                        // The image decoder is pure computation on guest memory,
+                        // and it is the largest single consumer of guest
+                        // instructions on the board, so the host runs it
+                        // natively. It keeps its own stack contract; only the
+                        // instruction budget it stands for is added here.
+                        match self.lzw.decode(&mut self.memory, &mut self.cpu) {
+                            Ok(work) => self.cpu.instructions += u64::from(work),
+                            Err(error) => return Outcome::Fault(error),
+                        }
                     }
-                    continue;
-                }
-                // The sprite blitters redraw the board on every moving frame.
-                // Their keyed inner loop is ten guest instructions per pixel,
-                // so the host decodes the row stream and writes the pixels
-                // itself, keeping the guest's stack and scratch contract.
-                crate::hle::BLIT_OPAQUE | crate::hle::BLIT_KEYED => {
-                    let keyed = eip == crate::hle::BLIT_KEYED;
-                    match self.blitter.blit(&mut self.memory, &mut self.cpu, keyed) {
-                        Ok(work) => self.cpu.instructions += u64::from(work),
-                        Err(error) => return Outcome::Fault(error),
+                    target::Hle::Blit { keyed } => {
+                        // The sprite blitters redraw the board on every moving
+                        // frame. Their keyed inner loop is ten guest
+                        // instructions per pixel, so the host decodes the row
+                        // stream and writes the pixels itself, keeping the
+                        // guest's stack and scratch contract.
+                        match self.blitter.blit(&mut self.memory, &mut self.cpu, keyed) {
+                            Ok(work) => self.cpu.instructions += u64::from(work),
+                            Err(error) => return Outcome::Fault(error),
+                        }
                     }
-                    continue;
+                    target::Hle::MatTransform => {
+                        match self
+                            .mat_transform
+                            .apply(&mut self.memory, &mut self.cpu)
+                        {
+                            Ok(work) => self.cpu.instructions += u64::from(work),
+                            Err(error) => return Outcome::Fault(error),
+                        }
+                    }
+                    // Hercules' three row loops. They are pure memory walks, so
+                    // the host retires the whole row and resumes at the first
+                    // instruction after the loop; `work` keeps the instruction
+                    // counter identical to a fully interpreted run.
+                    target::Hle::HerculesKeyedRow => {
+                        match self.hercules.keyed_row(&mut self.memory, &mut self.cpu) {
+                            Ok(work) => self.cpu.instructions += u64::from(work),
+                            Err(error) => return Outcome::Fault(error),
+                        }
+                    }
+                    target::Hle::HerculesRemapRow => {
+                        match self.hercules.remap_row(&mut self.memory, &mut self.cpu) {
+                            Ok(work) => self.cpu.instructions += u64::from(work),
+                            Err(error) => return Outcome::Fault(error),
+                        }
+                    }
+                    target::Hle::HerculesScaledRow => {
+                        match self.hercules.scaled_row(&mut self.memory, &mut self.cpu) {
+                            Ok(work) => self.cpu.instructions += u64::from(work),
+                            Err(error) => return Outcome::Fault(error),
+                        }
+                    }
                 }
-                _ => {}
+                continue;
             }
             // Timers change only as guest time moves, which is at most once per
             // chunk when the embedder supplies a clock, so looking one instruction
             // at a time buys nothing and costs a call, a scan and a division on
-            // every instruction of every run.
-            if self.timer_frame.is_none() && self.cpu.instructions >= self.timer_check_at {
+            // every instruction of every run. A queued `ReadFileEx` completion
+            // rides the same check, because it too is the host interrupting the
+            // guest at a point where a register state can be put aside whole.
+            if self.timer_frame.is_none()
+                && self.apc_frame.is_none()
+                && self.cpu.instructions >= self.timer_check_at
+            {
                 self.timer_check_at = self.cpu.instructions + TIMER_CHECK_INSTRUCTIONS;
                 if let Some(fault) = self.fire_timer() {
+                    return Outcome::Fault(fault);
+                }
+                if let Some(fault) = self.fire_apc() {
                     return Outcome::Fault(fault);
                 }
             }
@@ -602,6 +800,7 @@ impl Session {
                     self.tail.pop_front();
                 }
             }
+            self.step_pc = self.cpu.regs.eip;
             match cpu::step(&mut self.memory, &mut self.cpu, &mut self.decodes) {
                 Ok(Step::Continue) => {}
                 Ok(Step::Halt) => return Outcome::Halted,
@@ -638,16 +837,31 @@ impl Session {
     /// and a single-threaded guest is not told, because it has only one.
     fn fault(&self, error: String) -> Outcome {
         self.dump_tail();
+        // A store that made a value bad is the last one before the guest stopped
+        // on it, and a faulting load says nothing about the store that got it
+        // there.
+        self.memory.dump_watch();
         // The arrivals at a watched address that came just before the fault, so
         // the call that produced a bad value is in the log rather than guessable.
         for line in &self.watch_recent {
             println!("{line}");
         }
-        if self.threads.len() > 1 {
-            Outcome::Fault(format!("thread {}: {error}", self.threads.current_id()))
+        // One sentence that says what stopped and where it was standing. The
+        // address alone -- "1 byte(s) at 0xed43f48f are not mapped" -- reads
+        // like a fault in this host; it is the guest following a pointer into
+        // memory that was never handed out, and the instruction that did it is
+        // what a reader needs to find it.
+        let at = self.step_pc;
+        let offset = at.wrapping_sub(crate::pe::IMAGE_BASE);
+        let place = format!("{} + {offset:#x}", self.host.target.exe_name);
+        let who = if self.threads.len() > 1 {
+            format!("thread {} ", self.threads.current_id())
         } else {
-            Outcome::Fault(error)
-        }
+            String::new()
+        };
+        Outcome::Fault(format!(
+            "the guest stopped {who}at {at:#010x} ({place}): {error}"
+        ))
     }
 
     /// Prints the instructions [`Self::tail`] kept. An embedder calls this when
@@ -668,19 +882,78 @@ impl Session {
         }
     }
 
+    /// How many times the guest arrived at [`Self::watch`]. The arrival lines are
+    /// capped, so a run that visits one address over and over needs the count to
+    /// tell a hot call from a loop.
+    pub fn watch_hits(&self) -> u32 {
+        self.watch_hits
+    }
+
     /// Starts a due timer callback, if one is waiting and none is running.
     ///
     /// The callback is entered the way the timer thread would enter it: the five
     /// stdcall arguments are pushed (right to left) and a return address above
     /// them, so the routine's own `ret 20` unwinds exactly as it does under
     /// Windows. The interrupted `eip`/`esp` wait in [`Session::timer_frame`].
+    /// Seeds the registry from the payload's `registry.txt` the first time the
+    /// session runs.
+    ///
+    /// That is the first point at which the tree and the files are both there:
+    /// an embedder fills the file table before it runs the guest (a page fetches
+    /// the payload's files, then drives the module), so a payload that ships a
+    /// prepared tree boots as if an installer had written it -- which is what
+    /// lets a rehost keep the settings a player already has instead of writing
+    /// defaults over them on every boot.
+    fn seed_registry_from_payload(&mut self) {
+        if self.registry_seeded {
+            return;
+        }
+        self.registry_seeded = true;
+        let Some(bytes) = self.host.files.contents("registry.txt").map(<[u8]>::to_vec) else {
+            return;
+        };
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        // A file that reads is routine and says nothing: it is only worth a line
+        // when it is there and wrong, which is a payload that will boot as if it
+        // had never been installed.
+        if let Err(why) = self.host.seed_registry(&text) {
+            self.host
+                .notice(format!("registry: registry.txt was not read: {why}"));
+        }
+    }
+
+    /// The registry as text, which an embedder saves so the next run boots with
+    /// the settings this one left. See [`Session::seed_registry_from_payload`]
+    /// for the other half.
+    pub fn registry_text(&self) -> String {
+        self.host.registry_text()
+    }
+
+    /// The keys and values the guest read and did not find, as `registry.txt`
+    /// with the blanks to fill in. A boot that stops because a title says it is
+    /// not installed is usually this file's first line.
+    pub fn registry_wanted_text(&self) -> String {
+        self.host.registry_wanted_text()
+    }
+
+    /// Stamps the guest's clock before a shim runs.
+    ///
+    /// A shim has no instruction count of its own, so anything it has to measure
+    /// against the guest's clock -- a `SetTimer` deadline, the `WM_TIMER` it comes
+    /// due as -- reads the time the session last computed. This runs per host
+    /// call, which is once per pump iteration, and is two field writes.
+    fn note_host_time(&mut self) {
+        let now = self.host.guest_time_ms(self.cpu.instructions);
+        self.host.note_time(now);
+    }
+
     fn fire_timer(&mut self) -> Option<String> {
         if self.timer_frame.is_some() {
             return None;
         }
         let now = self.host.guest_time_ms(self.cpu.instructions);
         let (id, callback, user) = self.host.timers.due(now)?;
-        if std::env::var("SHIMKIT_LOG_TIMERS").is_ok() && self.host.notices.len() < 600 {
+        if std::env::var("SHIMKIT_LOG_TIMERS").is_ok() && self.host.notices.len() < 100_000 {
             self.host.notice(format!(
                 "timer #{id} fires at {now} ms, callback {callback:#010x}"
             ));
@@ -703,6 +976,55 @@ impl Session {
         None
     }
 
+    /// Enters a queued `ReadFileEx` completion, exactly the way
+    /// [`Self::fire_timer`] enters a timer callback: the interrupted register
+    /// state waits in [`Session::apc_frame`], the routine's stdcall arguments
+    /// `(error, transferred, overlapped)` go on the stack under the trampoline
+    /// return address, and the routine runs as guest code on this thread.
+    ///
+    /// Only a completion for the thread the CPU is on fires here. One queued by
+    /// a parked thread keeps waiting until that thread is entered again, and a
+    /// dead thread's completions were dropped when it ended.
+    fn fire_apc(&mut self) -> Option<String> {
+        if self.apc_frame.is_some() {
+            return None;
+        }
+        let id = self.threads.current_id();
+        let index = self
+            .host
+            .file_apcs
+            .iter()
+            .position(|apc| apc.thread == id)?;
+        let apc = self.host.file_apcs.remove(index);
+        if std::env::var("SHIMKIT_LOG_FILES").is_ok() && self.host.notices.len() < 600 {
+            self.host.notice(format!(
+                "file completion {apc_entry:#010x} runs on thread {id} ({apc_transferred} bytes)",
+                apc_entry = apc.entry,
+                apc_transferred = apc.transferred,
+            ));
+        }
+        let mut esp = self.cpu.regs.esp;
+        for value in [apc.overlapped, apc.transferred, apc.error] {
+            esp = esp.wrapping_sub(4);
+            if let Err(error) = self.memory.write_u32(esp, value) {
+                return Some(format!(
+                    "a file completion could not push its arguments: {error}"
+                ));
+            }
+        }
+        esp = esp.wrapping_sub(4);
+        if let Err(error) = self.memory.write_u32(esp, cpu::TIMER_TRAMPOLINE) {
+            return Some(format!(
+                "a file completion could not push its return address: {error}"
+            ));
+        }
+        self.apc_frame = Some((self.cpu.regs, self.cpu.fpu.clone()));
+        self.apc_started = Some(self.cpu.instructions);
+        self.cpu.regs.esp = esp;
+        self.cpu.regs.eip = apc.entry;
+        None
+    }
+
     /// Runs the shim for a call, or reports that there is none. On success the
     /// stack is popped by the shim's own declared signature, which is what a
     /// stdcall callee does; the dispatch table's arity is a cross-check, never
@@ -718,7 +1040,9 @@ impl Session {
                     call.iat_va
                 ));
             };
-            self.host.this = self.cpu.regs.ecx;
+            self.note_host_time();
+            self.note_host_time();
+        self.host.this = self.cpu.regs.ecx;
             let mut arguments = shim::Call {
                 memory: &mut self.memory,
                 args: call.args,
@@ -744,7 +1068,9 @@ impl Session {
         // the argument count comes from the same table the step loop used.
         if let Some((kind, method)) = call.thunk {
             let arg_bytes = crate::thunks::arg_bytes(kind, method);
-            self.host.this = self.cpu.regs.ecx;
+            self.note_host_time();
+            self.note_host_time();
+        self.host.this = self.cpu.regs.ecx;
             let mut arguments = shim::Call {
                 memory: &mut self.memory,
                 args: call.args,
@@ -760,7 +1086,7 @@ impl Session {
             self.log_call(call.return_address);
             return self.finish(action, call.args, arg_bytes, None).map(Some);
         }
-        let Some(slot) = self.target.table.slots.get(call.slot) else {
+        let Some(slot) = self.table.slots.get(call.slot) else {
             return Err(format!("slot {} is outside the dispatch table", call.slot));
         };
         let Some(binding) = self.bindings.get(call.slot).copied().flatten() else {
@@ -779,6 +1105,7 @@ impl Session {
 
         // `__thiscall` passes `this` in `ecx`, which is the only way a C++ member
         // function can be served: the shim reads it from here.
+        self.note_host_time();
         self.host.this = self.cpu.regs.ecx;
         let mut arguments = shim::Call {
             memory: &mut self.memory,
@@ -859,22 +1186,39 @@ impl Session {
         // below can return: a thread that signalled something while another
         // routine was being run for it still has to be woken.
         self.release_woken();
+        // A DLL the guest asked for: mapping it needs guest memory and the
+        // dispatch table, so the session does it here and answers the import
+        // with the module's base, the way Windows does.
+        if let Some(name) = self.host.load_module.take() {
+            return self.load_guest_module(&name, args, arg_bytes);
+        }
         if let Some(request) = self.host.guest_call.take() {
             let resume = if request.resume { resumable } else { None };
             self.enter_guest_call(request, args, arg_bytes, resume)?;
             return Ok(Served::Call);
         }
         // A thread the shim asked for. It is created here -- its stack is guest
-        // memory -- and it runs as soon as this call finishes, because that is
-        // what the guest assumes: the code after `CreateThread` returns may count
-        // on the new thread having started.
-        let started = match self.host.spawn.take() {
-            Some(spawn) => {
-                self.start_thread(spawn)?;
-                true
-            }
-            None => false,
-        };
+        // memory -- and it becomes runnable now, but the thread that created it
+        // keeps the CPU for a fresh slice first: on a real machine the child
+        // takes time to start, so the code after `CreateThread` returns always
+        // lands its setup stores (the handle, the flags the child reads) before
+        // the child observes them. Letting the child run before the creator's
+        // next instruction turns those stores into a race the guest loses, and
+        // a loader that suspends on its own handle then bursts through work it
+        // was meant to handshake over.
+        if let Some(spawn) = self.host.spawn.take() {
+            self.start_thread(spawn)?;
+            self.slice_at = self.cpu.instructions + THREAD_SLICE;
+        }
+        // Suspend counts live in the host, where the shims keep them; mirror
+        // them into the scheduler before the guest runs on, so a thread that
+        // was just suspended stops at the next switch point instead of
+        // running on into memory another thread owns.
+        if self.host.suspends_dirty {
+            self.host.suspends_dirty = false;
+            let counts = self.host.suspend_counts.clone();
+            self.threads.set_suspends(&counts);
+        }
         // stdcall: the callee pops its arguments.
         self.cpu.regs.esp = args.wrapping_add(arg_bytes);
         let (served, value) = match action {
@@ -906,17 +1250,148 @@ impl Session {
             self.park(want);
             return Ok(Served::Switched);
         }
-        if started {
-            // The thread that was just created gets the CPU, and this one waits
-            // its turn: `CreateThread` returning is the guest asking for that
-            // thread to be started.
-            if let Some(value) = value {
-                self.cpu.regs.eax = value;
-            }
-            self.park(ThreadWant::Yield);
-            return Ok(Served::Switched);
-        }
         Ok(served)
+    }
+
+    /// Loads a guest DLL from the payload as `LoadLibraryA` would, for a port or
+    /// a diagnostic that wants the module mapped before the guest asks for it.
+    ///
+    /// Returns the module's base, or `0` when it could not be placed. A
+    /// `DllMain` the load enters runs on the current frame, and the module's
+    /// exports are registered for `GetProcAddress` either way.
+    pub fn load_module(&mut self, name: &str) -> Result<u32> {
+        let esp = self.cpu.regs.esp;
+        match self.load_guest_module(name, esp, 0)? {
+            Served::Return(handle) => Ok(handle),
+            // `DllMain` was entered. The import's answer is the module's base,
+            // which the routine cannot change.
+            Served::Call => Ok(self
+                .host
+                .guest_modules
+                .last()
+                .map_or(0, |module| module.base)),
+            _ => Ok(0),
+        }
+    }
+
+    /// Maps a guest DLL from the payload and runs its `DllMain`, answering the
+    /// `LoadLibraryA` that asked for it.
+    ///
+    /// The image is placed at the base its header declares, which the payload's
+    /// compiler chose inside the window between the program and the TEB. Its
+    /// imports are appended to the dispatch table as one group -- indices never
+    /// move, because a written IAT holds one -- and each slot is filled with the
+    /// host stub for its `DLL!Function`. A module whose imports this host cannot
+    /// answer is refused instead of mapped: the guest gets `NULL` from
+    /// `LoadLibraryA`, which is what a missing DLL looks like to it.
+    fn load_guest_module(&mut self, name: &str, args: u32, arg_bytes: u32) -> Result<Served> {
+        // Copy the bytes out first: the notice below borrows the host mutably.
+        let Some(bytes) = self.host.files.contents(name).map(<[u8]>::to_vec) else {
+            self.host
+                .notice(format!("LoadLibraryA {name:?}: no such file in the payload"));
+            self.cpu.regs.esp = args.wrapping_add(arg_bytes);
+            return Ok(Served::Return(0));
+        };
+        let image = match crate::pe::Image::parse(bytes) {
+            Ok(image) => image,
+            Err(error) => {
+                self.host.notice(format!("LoadLibraryA {name:?}: {error}"));
+                self.cpu.regs.esp = args.wrapping_add(arg_bytes);
+                return Ok(Served::Return(0));
+            }
+        };
+        let base = image.image_base;
+        // Everything that can refuse the load happens before anything is
+        // written, so a refused module leaves no half-mapped image behind.
+        let mut slots = Vec::with_capacity(image.imports.len());
+        let mut missing = Vec::new();
+        for import in &image.imports {
+            let slot = crate::dispatch::Slot {
+                dll: leak(&import.dll),
+                name: leak(&import.name),
+                iat_va: import.iat_va,
+                args: None,
+                sites: 0,
+                agreement: 0,
+                ambiguous: 0,
+            };
+            if shim::binding(self.target.shims, &slot).is_none() {
+                missing.push(format!("{}!{}", import.dll, import.name));
+            }
+            slots.push(slot);
+        }
+        if !missing.is_empty() {
+            self.host.notice(format!(
+                "LoadLibraryA {name:?} needs {} import(s) this host does not answer: {}",
+                missing.len(),
+                missing.join(", ")
+            ));
+            self.cpu.regs.esp = args.wrapping_add(arg_bytes);
+            return Ok(Served::Return(0));
+        }
+        if let Err(error) = self.memory.map_module(&image, base) {
+            self.host.notice(format!("LoadLibraryA {name:?}: {error}"));
+            self.cpu.regs.esp = args.wrapping_add(arg_bytes);
+            return Ok(Served::Return(0));
+        }
+        self.memory.add_imports(image.imports.clone());
+        // Append the module's slots and give each IAT the stub index its slot
+        // landed on. The group is appended, so no program index moves.
+        let first = self.table.slots.len();
+        let mut merged: Vec<crate::dispatch::Slot> = self.table.slots.to_vec();
+        merged.extend(slots.iter().copied());
+        let combined: &'static [crate::dispatch::Slot] = Box::leak(merged.into_boxed_slice());
+        self.table = Table { slots: combined };
+        self.cpu.table = self.table;
+        for (index, slot) in slots.iter().enumerate() {
+            self.bindings.push(shim::binding(self.target.shims, slot));
+            let stub = crate::cpu::HOST_FUNCTION_BASE + (first + index) as u32 * 4;
+            self.memory.write_import(slot.iat_va, stub)?;
+        }
+        let exports: Vec<(String, u32)> = image
+            .exports
+            .iter()
+            .map(|(export, rva)| (export.clone(), base.wrapping_add(*rva)))
+            .collect();
+        // The module's strings, icons and dialogs are its own: a guest that
+        // passes this module's handle to `LoadStringA` is asking for these, not
+        // for the program's.
+        let resources = match image.resources() {
+            Ok(resources) => resources,
+            Err(error) => {
+                self.host.notice(format!(
+                    "LoadLibraryA {name:?}: the module was mapped, and its resources were not read: {error}"
+                ));
+                Vec::new()
+            }
+        };
+        self.host.guest_modules.push(shim::GuestModule {
+            name: name.to_string(),
+            base,
+            exports,
+            resources,
+        });
+        self.host.notice(format!(
+            "LoadLibraryA {name:?}: mapped at {base:#010x} ({} bytes, {} export(s), {} import(s))",
+            image.size_of_image,
+            image.exports.len(),
+            image.imports.len()
+        ));
+        let entry = image.entry_point;
+        if entry == 0 {
+            self.cpu.regs.esp = args.wrapping_add(arg_bytes);
+            return Ok(Served::Return(base));
+        }
+        // `DllMain(module, DLL_PROCESS_ATTACH, 0)`, and the import answers with
+        // the base whether or not the routine decides on anything.
+        let request = shim::GuestCall {
+            entry,
+            args: [base, 1, 0, 0],
+            answer: Some(base),
+            resume: false,
+        };
+        self.enter_guest_call(request, args, arg_bytes, None)?;
+        Ok(Served::Call)
     }
 
     /// Wakes the threads a shim released by signalling, releasing or ending
@@ -970,10 +1445,21 @@ impl Session {
     /// to the thread trampoline. Its handle is signalled, so a join returns.
     fn end_thread(&mut self, code: u32) {
         let id = self.threads.current_id();
+        // TEMP DIAGNOSTIC: a thread that ends names itself, so an audio init
+        // that dies mid-way is visible in the notice trail. Remove when done.
+        if self.host.notices.len() < 600 {
+            self.host
+                .notice(format!("thread {id} exited, code {code:#x}"));
+        }
         // A thread that is over holds no call frames and no callback.
         self.call_frames.clear();
         self.timer_frame = None;
         self.timer_started = None;
+        self.apc_frame = None;
+        self.apc_started = None;
+        // Its queued completions go with it, which is what Windows does with the
+        // user APCs of a thread that ends without alerting.
+        self.host.file_apcs.retain(|apc| apc.thread != id);
         let (regs, fpu) = (self.cpu.regs, self.cpu.fpu.clone());
         self.threads.park(regs, fpu, &ThreadWant::Exit(code));
         self.release_stack();
@@ -998,11 +1484,14 @@ impl Session {
     fn park(&mut self, want: ThreadWant) {
         let id = self.threads.current_id();
         // The host calls suspended on this thread's stack, and a timer callback
-        // that interrupted it, belong to it rather than to the session.
+        // or `ReadFileEx` completion that interrupted it, belong to it rather
+        // than to the session.
         let thread = self.threads.current_thread_mut();
         std::mem::swap(&mut self.call_frames, &mut thread.frames);
         std::mem::swap(&mut self.timer_frame, &mut thread.timer_frame);
         std::mem::swap(&mut self.timer_started, &mut thread.timer_started);
+        std::mem::swap(&mut self.apc_frame, &mut thread.apc_frame);
+        std::mem::swap(&mut self.apc_started, &mut thread.apc_started);
         let (regs, fpu) = (self.cpu.regs, self.cpu.fpu.clone());
         self.threads.park(regs, fpu, &want);
         match want {
@@ -1029,6 +1518,18 @@ impl Session {
     /// Moves the CPU onto a thread: its registers, its x87 stack, the host calls
     /// and timer callback suspended on its stack, and its thread-local slots.
     fn enter(&mut self, index: usize) {
+        // A thread is only left with its place kept if it was parked: `park` is
+        // what puts the registers and the call frames aside. A switch taken
+        // without it leaves the record holding the context the thread was
+        // spawned with, and it comes back at its entry point -- which is not a
+        // lost register but a lost *place*, and the guest restarts work it had
+        // half done. Suspension is how that happened here: the count alone makes
+        // a thread unrunnable, so the switch goes ahead and nothing saves it.
+        // Parking on the way out is what makes the invariant true of every way a
+        // thread can become unrunnable, rather than of the ones we thought of.
+        if index != self.threads.current() && !self.threads.current_thread().saved {
+            self.park(ThreadWant::Yield);
+        }
         // The thread being left keeps the instructions it retired, which is what
         // makes a stuck thread's share of the run visible.
         let spent = self.cpu.instructions.saturating_sub(self.thread_start);
@@ -1047,6 +1548,8 @@ impl Session {
         std::mem::swap(&mut self.call_frames, &mut thread.frames);
         std::mem::swap(&mut self.timer_frame, &mut thread.timer_frame);
         std::mem::swap(&mut self.timer_started, &mut thread.timer_started);
+        std::mem::swap(&mut self.apc_frame, &mut thread.apc_frame);
+        std::mem::swap(&mut self.apc_started, &mut thread.apc_started);
         self.host.current_thread = id;
         self.host.tls.switch_to(id);
         if std::env::var("SHIMKIT_LOG_THREADS").is_ok() {
@@ -1078,8 +1581,18 @@ impl Session {
         if self.threads.all_exited() {
             return Some(Outcome::Halted);
         }
-        // Every thread is parked. Nothing this host can do will release them, so
-        // the waits are answered rather than left to hang the page.
+        // Every thread is parked, but a parked wait whose deadline is still
+        // ahead needs nothing from this host: the guest's clock will reach it
+        // and [`Objects::expire`] will answer it, here or in a later chunk.
+        // Forcing it now would hand the guest progress it has not earned --
+        // Madagascar's boot sleeps both of its threads and then goes on exactly
+        // because the one with a deadline was answered, not invented.
+        if self.host.objects.any_deadline_after(now) {
+            return Some(Outcome::Steps);
+        }
+        // What is left is parked with no deadline and nothing that can signal
+        // it: a genuine deadlock, which the page cannot hang on. The waits are
+        // answered rather than left to hang.
         self.force_waits();
         match self.threads.schedule() {
             Some(index) => {
@@ -1193,8 +1706,17 @@ impl Session {
 
     /// `DLL!Function` for the slot a host call went through.
     pub fn label(&self, call: &HostCall) -> String {
-        label(call, self.target.table)
+        label(call, self.table)
     }
+}
+
+/// Copies a string into the module's static lifetime.
+///
+/// A target answers with `&'static` facts and a guest DLL's import names are
+/// read at load, so each name is leaked once per module -- which the session
+/// outlives, since the slots it built stay indexed for the rest of the run.
+fn leak(text: &str) -> &'static str {
+    Box::leak(text.to_owned().into_boxed_str())
 }
 
 /// A shim's error, prefixed with the import it came from.

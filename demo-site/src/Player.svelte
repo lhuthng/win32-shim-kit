@@ -155,6 +155,16 @@
     if (!session || locked) return;
     guestCursor = !session.cursorVisible();
     const point = toGuest(event);
+    // A game that asks for an absolute mouse (`"mouse": "absolute"`) reads the
+    // pointer's position -- its menus hit-test the cursor the guest holds -- so
+    // it is given the position, and the guest's cursor is exactly where the
+    // page's pointer is. A game that wants the pointer locked gets the step
+    // instead: only a movement is what a DirectInput mouse reports.
+    if (!session.mouseLock) {
+      session.pointer(point.x, point.y);
+      last = point;
+      return;
+    }
     if (last) {
       const dx = Math.round(point.x - last.x);
       const dy = Math.round(point.y - last.y);
@@ -183,6 +193,10 @@
     // is where the player put it. A window that acts on `WM_LBUTTONDOWN` reads
     // `lParam`, and that is the host's own tracked cursor, so the two agree.
     last = toGuest(event);
+    // In absolute mode the click lands where the page's pointer is, so the guest
+    // is told that position before the button: a menu reads the click against
+    // the cursor it holds, not against where the page thinks it is.
+    if (!session.mouseLock) session.pointer(last.x, last.y);
     held.add(button);
     // Sent before anything else in this handler. Pointer capture used to be
     // taken here first, and while the pointer was locked the browser refused it

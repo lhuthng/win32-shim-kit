@@ -28,6 +28,7 @@ pub fn switch(cell: &'static std::sync::OnceLock<bool>, name: &'static str) -> b
 
 pub mod advapi32;
 pub mod binkw32;
+pub mod comctl32;
 pub mod comdlg32;
 pub mod crt;
 pub mod d3d8;
@@ -49,6 +50,7 @@ pub mod shlwapi;
 pub mod user32;
 pub mod version;
 pub mod winmm;
+pub mod winspool;
 pub mod wsock32;
 
 /// Every implemented import, one table per DLL. `binding` searches them in
@@ -59,6 +61,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::dispatch::Slot;
 use crate::memory::{GuestMemory, HEAP_BASE, MEMORY_TOP};
 use crate::Result;
+
+/// The synthetic handle the message queue waits on. Nothing the guest names
+/// ever lands here, so a park on it can only be answered by this host's own
+/// message producers.
+pub const MESSAGE_QUEUE: u32 = 0x6D73_6710;
 
 /// What a shim did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,12 +203,53 @@ pub struct GuestCall {
     pub resume: bool,
 }
 
+/// A file-read completion `ReadFileEx` queued for the thread that asked for the
+/// read. The bytes are already in the guest's buffer; what is pending is the
+/// guest's own routine, which the session runs the way it runs a timer
+/// callback -- on that thread, at the next point guest code is interrupted.
+///
+/// Windows delivers these in an alertable wait. This guest's waits are not
+/// alertable -- it imports no `*Ex` wait at all -- and its own Win9x fallback
+/// for `ReadFileEx` runs completions from a worker thread, so delivering the
+/// routine at a switch point on the asking thread is inside the behaviour the
+/// game was written against. What is kept from Win32 is the part a guest can
+/// see: the routine runs on the thread that posted the read, with the arguments
+/// `(error, transferred, overlapped)`, after the `OVERLAPPED` already reports
+/// the transfer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileApc {
+    /// The thread the read was posted from, which is the only one the routine
+    /// may run on: its `OVERLAPPED` and buffer are in its own frames.
+    pub thread: u32,
+    pub entry: u32,
+    pub error: u32,
+    pub transferred: u32,
+    pub overlapped: u32,
+}
+
 /// What a `DirectInput` device is, which decides what `GetDeviceState` writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceKind {
     Keyboard,
     Mouse,
     Joystick,
+}
+
+/// A DLL the payload carries and the guest has loaded.
+///
+/// This is not a DLL the host answers from a shim table: one of these is real
+/// guest code, mapped in guest memory by the payload's compiler. Its `base` is
+/// both where it lives and the handle `LoadLibraryA` answered with, and
+/// `exports` are the addresses `GetProcAddress` hands out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestModule {
+    pub name: String,
+    pub base: u32,
+    pub exports: Vec<(String, u32)>,
+    /// The module's own resource tree, which is what a `LoadStringA` (or any
+    /// other `Load*` call) that names this module as its instance has to read.
+    /// Empty for a module whose image carries no `.rsrc`.
+    pub resources: Vec<crate::pe::Resource>,
 }
 
 /// Host state the guest can observe: the last error, the exit code, and the
@@ -279,6 +327,17 @@ pub struct Host {
     /// A thread `CreateThread` asked for. The session creates it, because a
     /// thread's stack is guest memory and a shim has none of its own.
     pub spawn: Option<crate::sched::Spawn>,
+    /// `SuspendThread`/`ResumeThread` nesting depths by thread id, the only
+    /// place these counts live: a shim updates them and answers the previous
+    /// count, and the session mirrors them into the scheduler before the
+    /// guest runs on. Hercules stages video on its worker into the buffer
+    /// the main thread decodes out of, and the two take turns with suspend
+    /// and resume -- a count the session never sees lets the worker lap the
+    /// decoder, which then walks a table the next stage overwrote.
+    pub suspend_counts: HashMap<u32, u32>,
+    /// Whether a suspend count moved since the session last mirrored them.
+    /// Set by the suspend and resume shims; the session takes it.
+    pub suspends_dirty: bool,
     /// Threads a shim just made runnable by signalling something, with the value
     /// each wait answers with. The session wakes them once the shim returns.
     pub woken: Vec<(u32, u32)>,
@@ -293,6 +352,10 @@ pub struct Host {
     /// sets it before every chunk, which is what makes a timer follow real time
     /// instead of how fast the interpreter happens to run.
     clock_ms: Option<u64>,
+    /// That clock as of the last time the session looked at it. A shim has no
+    /// instruction count of its own, so a `SetTimer` deadline has to be measured
+    /// against something: this is the guest time the session last computed.
+    now: u64,
     /// One guest-memory vtable per interface kind, built on first use by
     /// [`crate::thunks`] and shared by every object of that kind.
     pub vtables: [u32; crate::thunks::KIND_LIMIT as usize],
@@ -309,6 +372,10 @@ pub struct Host {
     /// A guest routine the shim that just ran wants called before its import
     /// returns. The session takes it; a shim never leaves this set.
     pub guest_call: Option<GuestCall>,
+    /// `ReadFileEx` completions queued but not yet run, by the thread that
+    /// posted each read. The session runs one on the asking thread at a switch
+    /// point, and drops a dead thread's share of the queue with the thread.
+    pub file_apcs: Vec<FileApc>,
     /// How many times the guest polled `GetDeviceState`, which is the evidence
     /// that input is read by polling rather than by messages. `GetDeviceData` is
     /// counted separately because an empty buffer there would mean the guest is
@@ -353,6 +420,20 @@ pub struct Host {
     /// so a handle stays the same number across calls. The handle is an index into
     /// this, above `kernel32`'s module base.
     pub modules: Vec<String>,
+    /// DLLs the payload carried and the guest has loaded, each mapped in guest
+    /// memory with its own exports.
+    pub guest_modules: Vec<GuestModule>,
+    /// A `LoadLibraryA` the guest made for a DLL in the payload. The session maps
+    /// it -- that needs guest memory and the dispatch table, which a shim has
+    /// neither of -- and replaces the import's answer with the module's base.
+    pub load_module: Option<String>,
+    /// String atoms `GlobalAddAtomA` handed out, by id.
+    pub atoms: HashMap<u32, String>,
+    pub next_atom: u32,
+    /// Property-sheet pages `CreatePropertySheetPageA` made, which is only how
+    /// many handles were handed out: the sheet itself is answered as cancelled
+    /// (`comctl32`).
+    pub comctl_pages: u32,
 }
 
 impl Default for Host {
@@ -396,11 +477,15 @@ impl Host {
             critical_depth: std::collections::HashMap::new(),
             thread_want: None,
             spawn: None,
+            suspend_counts: HashMap::new(),
+            suspends_dirty: false,
             woken: Vec::new(),
+            file_apcs: Vec::new(),
             current_thread: 0,
             timers: winmm::Timers::default(),
             mmio: winmm::Mmio::default(),
             clock_ms: None,
+            now: 0,
             vtables: [0; crate::thunks::KIND_LIMIT as usize],
             notices: Vec::new(),
             input: crate::input::Input::new(),
@@ -420,6 +505,11 @@ impl Host {
             msvcp: msvcp::Strings::default(),
             procs: Vec::new(),
             modules: Vec::new(),
+            guest_modules: Vec::new(),
+            load_module: None,
+            atoms: HashMap::new(),
+            next_atom: 0,
+            comctl_pages: 0,
         }
     }
 
@@ -435,6 +525,20 @@ impl Host {
     /// clock measured 44x real time that way.
     pub fn set_clock(&mut self, milliseconds: u64) {
         self.clock_ms = Some(milliseconds.max(self.clock_ms.unwrap_or(0)));
+        self.now = self.now.max(milliseconds);
+    }
+
+    /// The guest's clock in milliseconds as of the last time the session looked:
+    /// what a timer's deadline is measured against.
+    pub fn now(&self) -> u64 {
+        self.now
+    }
+
+    /// Records the guest's clock. The session calls this once per chunk, so a
+    /// timer comes due on the pump iteration after its deadline instead of at
+    /// whatever instant a shim happened to be running.
+    pub fn note_time(&mut self, milliseconds: u64) {
+        self.now = self.now.max(milliseconds);
     }
 
     /// The guest's time in milliseconds: the embedder's clock when it supplied
@@ -456,6 +560,37 @@ impl Host {
         self.notices.push(text);
     }
 
+    /// Reads the text form of the registry over whatever the session has, which
+    /// is how a payload ships a prepared tree: the keys an installer would have
+    /// written, as a file a person can read and edit.
+    ///
+    /// Answers how many values it added, so a boot can say whether the file was
+    /// there and whether it was worth anything.
+    pub fn seed_registry(&mut self, text: &str) -> Result<usize> {
+        self.registry.from_text(text)
+    }
+
+    /// The registry as text, for the embedder to save. A page puts it in
+    /// `localStorage`; a probe writes it beside the install. Either way the next
+    /// run boots with what this one left.
+    pub fn registry_text(&self) -> String {
+        self.registry.to_text()
+    }
+
+    /// What the guest read and did not find, as the text form: the blanks a
+    /// payload has to fill in, discovered from the run that needed them rather
+    /// than from a debugger. See [`crate::shim::advapi32::Registry::wanted_text`].
+    pub fn registry_wanted_text(&self) -> String {
+        self.registry.wanted_text()
+    }
+
+    /// Wakes a thread parked in `GetMessageA`: every producer that queues a
+    /// message calls this, since a queue that gained a message is a wait that
+    /// can end. Waking with nothing parked is harmless.
+    pub fn wake_message_waiters(&mut self) {
+        self.woken.extend(self.objects.wake(MESSAGE_QUEUE));
+    }
+
     /// Allocates out of the heap arena. `VirtualAlloc` gets the same memory, so
     /// the two are interchangeable here.
     ///
@@ -465,6 +600,18 @@ impl Host {
     /// the free list. Memory is not zeroed here: a fresh page is already zero
     /// because the arena starts zeroed, and a reused block holds what its last
     /// owner left, exactly as `HeapAlloc` does.
+    /// Where a voice's playhead is, in bytes: the same number
+    /// `GetCurrentPosition` answers the guest with.
+    ///
+    /// A page that mixes DirectSound itself has to read this rather than keep a
+    /// position of its own. A streaming guest decides what to refill from where
+    /// this says the playhead is; two independent positions drift apart, and the
+    /// mixer then reads the part of the buffer the guest has not written yet --
+    /// clean music for a few seconds, then full-scale hash.
+    pub fn audio_position(&self, voice: u32) -> u32 {
+        crate::shim::dsound::position_of(self, voice)
+    }
+
     pub fn allocate(&mut self, size: u32, align: u32) -> Result<u32> {
         let size = size.max(1);
         let align = align.max(4).next_power_of_two();
@@ -488,14 +635,37 @@ impl Host {
         if end > MEMORY_TOP {
             return Err(format!(
                 "cannot allocate {size} bytes at {start:#010x}: the arena ends at {MEMORY_TOP:#010x} \
-                 ({} bytes are free in {} hole(s))",
-                self.free_bytes,
-                self.free_by_address.len()
+                 ({})",
+                self.arena_report()
             ));
         }
         self.arena = end;
         self.allocations.insert(start, size);
         Ok(start)
+    }
+
+    /// What the arena holds when a request does not fit, so a run that stops on
+    /// it says whether the guest needs more room or is leaking: the largest hole
+    /// separates fragmentation from exhaustion, and the split between live
+    /// blocks and bitmap pixels says whether a guest that loads pictures is
+    /// holding them or creating them twice.
+    fn arena_report(&self) -> String {
+        let live: u64 = self.allocations.values().map(|size| u64::from(*size)).sum();
+        let largest = self.free_by_size.keys().next_back().copied().unwrap_or(0);
+        let (created, released) = self.gdi.pixel_totals();
+        let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+        format!(
+            "{} bytes are free in {} hole(s), the largest {largest}; \
+             {} blocks live holding {:.1} MiB, {:.1} MiB of it bitmap pixels \
+             ({:.1} MiB decoded, {:.1} MiB given back)",
+            self.free_bytes,
+            self.free_by_address.len(),
+            self.allocations.len(),
+            mib(live),
+            mib(self.gdi.pixel_bytes()),
+            mib(created),
+            mib(released)
+        )
     }
 
     /// The smallest free block that can hold `size` at `align`, as
@@ -678,6 +848,7 @@ impl Host {
     pub fn key(&mut self, dik: u8, down: bool) {
         let hwnd = self.input_window();
         self.input.key(dik, down, hwnd);
+        self.wake_message_waiters();
     }
 
     /// The pointer moved to a client position.
@@ -693,6 +864,7 @@ impl Host {
         let (cx, cy) = self.windows.cursor();
         self.windows.set_cursor(x, y);
         self.input.move_by(x.saturating_sub(cx), y.saturating_sub(cy), x, y, hwnd);
+        self.wake_message_waiters();
     }
 
     /// The pointer moved by a delta, as a locked pointer reports it.
@@ -724,12 +896,14 @@ impl Host {
         );
         self.windows.set_cursor(x, y);
         self.input.move_by(dx, dy, x, y, hwnd);
+        self.wake_message_waiters();
     }
 
     /// A pointer button changed state.
     pub fn pointer_button(&mut self, button: u8, down: bool) {
         let hwnd = self.input_window();
         self.input.button(button, down, hwnd);
+        self.wake_message_waiters();
     }
 
     pub fn command_line(&mut self, memory: &mut GuestMemory) -> Result<u32> {
@@ -774,7 +948,16 @@ pub const TABLES: &[&[Binding]] = &[
     comdlg32::SHIMS,
     shell32::SHIMS,
     user32::SHIMS,
+    user32::dialog::SHIMS,
+    user32::menu::SHIMS,
+    user32::misc::SHIMS,
+    user32::paint::SHIMS,
+    user32::rect::SHIMS,
+    user32::state::SHIMS,
+    user32::window::SHIMS,
     gdi32::SHIMS,
+    comctl32::SHIMS,
+    winspool::SHIMS,
     gdiplus::SHIMS,
     msimg32::SHIMS,
     advapi32::SHIMS,

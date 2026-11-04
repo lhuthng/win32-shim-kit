@@ -2026,8 +2026,9 @@ mod tests {
         )
         .unwrap();
         // The carry comes out of bit 15, not bit 31, and the destination is a
-        // 16-bit register, so the write zeroes the upper half as hardware does.
-        assert_eq!(cpu.regs.eax, 0x0000_0000);
+        // 16-bit register, so only the low word changes: hardware keeps the
+        // upper half of `eax` on a partial write.
+        assert_eq!(cpu.regs.eax, 0x1234_0000);
         assert!(cpu.regs.flags.cf && cpu.regs.flags.zf);
         assert!(!cpu.regs.flags.of && !cpu.regs.flags.sf);
 
@@ -2045,6 +2046,45 @@ mod tests {
         .unwrap();
         assert!(cpu.regs.flags.of && cpu.regs.flags.sf);
         assert!(!cpu.regs.flags.cf, "no unsigned carry out of 16 bits");
+    }
+
+    #[test]
+    fn a_word_move_keeps_the_upper_half_of_a_fixed_point_accumulator() {
+        // Hercules' scaled sprite blitter at 0x40d2c7 builds `eax` as
+        // `(source_x << 16) | pixel_count`: `mov ax, dx` writes only the
+        // counter, while the upper half holds the fixed-point coordinate. The
+        // inner loop then adds a step whose low word is zero (`add eax, step`)
+        // and counts with `dec ax`. If a word write zero-extends, the source
+        // coordinate is lost, the sampler reads index 0 and the sprite comes
+        // out with transparent holes punched through it.
+        let (mut memory, mut cpu) = machine();
+        let code: &[u8] = &[
+            0xa1, 0x00, 0x20, 0x40, 0x00, // mov eax, [0x402000]
+            0xc1, 0xe0, 0x10, // shl eax, 0x10
+            0x8b, 0x15, 0x04, 0x20, 0x40, 0x00, // mov edx, [0x402004]
+            0x66, 0x89, 0xd0, // mov ax, dx
+            0x03, 0x05, 0x08, 0x20, 0x40, 0x00, // add eax, [0x402008]
+            0x66, 0x48, // dec ax
+        ];
+        memory.write_bytes(IMAGE_BASE + 0x100, code).unwrap();
+        memory.write_u32(IMAGE_BASE + 0x2000, 0x12).unwrap();
+        memory.write_u32(IMAGE_BASE + 0x2004, 0xa0).unwrap();
+        memory.write_u32(IMAGE_BASE + 0x2008, 0x0003_0000).unwrap();
+
+        let offsets = [0x100_u32, 0x105, 0x108, 0x10e, 0x111, 0x117];
+        let expected = [
+            0x0000_0012,
+            0x0012_0000,
+            0x0012_0000,
+            0x0012_00a0,
+            0x0015_00a0,
+            0x0015_009f,
+        ];
+        for (offset, want) in offsets.into_iter().zip(expected) {
+            let decoded = crate::cpu::decode(&memory, IMAGE_BASE + offset).unwrap();
+            run(&mut memory, &mut cpu, &decoded).unwrap();
+            assert_eq!(cpu.regs.eax, want, "after the instruction at +{offset:#x}");
+        }
     }
 
     #[test]
@@ -2342,6 +2382,25 @@ mod tests {
         run(&mut memory, &mut cpu, &x87_instruction(Mnemonic::Fstp, Operand::Mem(Mem::direct(out)), true)).unwrap();
         assert_eq!(read_double(&memory, out), 1.5);
         assert_eq!(cpu.fpu.st(0), 4.0, "the exchanged value is what remains");
+    }
+
+    #[test]
+    fn floating_point_divide_and_pop_divides_the_deeper_slot_by_the_top() {
+        // `fdivp st(1), st`: 6.0 / 4.0, with the result landing on top once the
+        // stack pops. A quotient read the other way round is 0.66, and nothing
+        // downstream of an interval, a speed or a scale notices until it is
+        // absurd.
+        let (mut memory, mut cpu) = machine();
+        cpu.fpu.push(6.0);
+        cpu.fpu.push(4.0);
+        let mut divide = instruction(
+            Mnemonic::Fdivp,
+            Size::Dword,
+            [Operand::None, Operand::Imm8(1), Operand::None],
+        );
+        divide.x87 = true;
+        run(&mut memory, &mut cpu, &divide).unwrap();
+        assert_eq!(cpu.fpu.st(0), 1.5, "6 / 4 on the top of the stack");
     }
 
     #[test]

@@ -12,15 +12,36 @@
 //! the page hands to its AudioWorklet. The mixer -- resampling, volume, pan and
 //! looping -- lives in JavaScript, next to the audio hardware.
 //!
-//! # Status has to match exactly
+//! # Status is a bit set, and guests test the bits
 //!
-//! The guest's cleanup routine at `0x0048989e` compares `GetStatus` against `1`
-//! (`DSBSTATUS_PLAYING`) and `4` (`DSBSTATUS_LOOPING`) with equality, not a bit
-//! test. Returning `PLAYING | LOOPING` would look like neither and the guest
-//! would stop every looping sound on the next frame, so this host returns the
-//! single bit the guest expects.
+//! `GetStatus` answers `DSBSTATUS_PLAYING | DSBSTATUS_LOOPING` for a buffer that
+//! is playing and looping, which is what a real device answers: a looping
+//! buffer is still a playing one.
+//!
+//! This host used to answer `DSBSTATUS_LOOPING` alone, on the theory that a
+//! guest comparing with equality would be confused by a value it had not been
+//! told about. Hercules is the counter-example. Its per-frame sound update at
+//! `0x0040f820` reads the status and then tests one bit of it:
+//!
+//! ```text
+//! 40f877: call [ecx + 0x24]           ; GetStatus(&status)
+//! 40f87a: test byte [esp + 0x10], 1   ; DSBSTATUS_PLAYING
+//! 40f87e: jne  0x40f888               ; playing: leave the voice alone
+//! 40f880: mov  [esi + 0xb99848], -1   ; finished: forget the voice
+//! ```
+//!
+//! A looping buffer reported as `4` therefore reads as *not playing*. The guest
+//! forgets the voice and never calls `Stop` on it again, and because nothing but
+//! a stop can end a looping buffer, the sound it started plays for the rest of
+//! the session. Two of them were audible in the menu: 17,318-byte 11,025 Hz
+//! loops, played with `DSBPLAY_LOOPING`, never stopped and never released.
+//!
+//! Nothing here needs the equality reading. Cave Story never asks for a status
+//! at all -- `GetStatus` is not called anywhere in its sound code -- and the
+//! only other status test in Hercules is against `DSBSTATUS_BUFFERLOST`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::shim::{Action, Binding, Call, Host};
 use crate::thunks::{self, m, Method};
@@ -123,6 +144,16 @@ pub const EVENT_DATA: u32 = 4;
 pub const EVENT_SEEK: u32 = 5;
 /// Event record: eleven little-endian dwords.
 pub const EVENT_WORDS: usize = 11;
+
+/// Whether the playback lifecycle is written to the notice trail.
+///
+/// The trail answers the one question the event stream cannot: *which object a
+/// guest aimed a call at*. `Stop` and `Release` are keyed on `this`, and a guest
+/// that stops the buffer it did not play looks exactly like a guest that never
+/// stopped anything, from the events alone. `SHIMKIT_LOG_AUDIO` cannot be the
+/// switch in a browser -- `std::env` does not exist in the wasm module -- so a
+/// page turns this on through `wh_audio_trace`.
+pub static LOG_AUDIO: AtomicBool = AtomicBool::new(false);
 
 /// One record the page reads. `#[repr(C)]` keeps the field order the page's
 /// `Uint32Array` view assumes.
@@ -285,6 +316,24 @@ impl DirectSound {
 
     pub fn voice_count(&self) -> usize {
         self.buffers.values().filter(|buffer| !buffer.primary).count()
+    }
+
+    /// Every secondary buffer the guest still holds: its object, whether it is
+    /// playing, whether it is looping, and how many bytes it holds.
+    ///
+    /// The page keeps its own table built from the event stream, so this is the
+    /// *guest's* side of the same thing. The two disagreeing is the whole
+    /// question when a sound will not stop: a buffer the guest never told to
+    /// stop is a stuck voice no matter what the page does with it.
+    pub fn voices(&self) -> Vec<(u32, bool, bool, u32)> {
+        let mut out: Vec<(u32, bool, bool, u32)> = self
+            .buffers
+            .iter()
+            .filter(|(_, buffer)| !buffer.primary)
+            .map(|(voice, buffer)| (*voice, buffer.playing, buffer.looping, buffer.size))
+            .collect();
+        out.sort_unstable_by_key(|entry| entry.0);
+        out
     }
 
     pub fn events(&self) -> &[AudioEvent] {
@@ -743,12 +792,43 @@ pub(crate) fn serve(
             call.arg(3).unwrap_or(0),
         );
     }
-    if std::env::var("SHIMKIT_LOG_AUDIO").is_ok()
-        && host.notices.len() < 600
-        && matches!(name, "Play" | "Stop" | "GetCurrentPosition" | "GetStatus")
+    // The playback lifecycle, traced only on request. These notices were once
+    // unconditional so a browser session could name its audio calls without an
+    // env var, and every `Lock` and `Unlock` of a streaming buffer then landed
+    // in the page's diagnostic pane -- in the same buffer the page reads a stop
+    // reason from, so the last audio call was shown in place of the fault.
+    // `GetCurrentPosition` is still left out: a guest that polls it every frame
+    // would drown the trail.
+    //
+    // `LOG_AUDIO` is the way in for a page: `std::env` does not exist in the
+    // wasm module, so `var` fails there and the one caller that most needs the
+    // trail -- a browser session -- could never ask for it. `native_probe` keeps
+    // using the variable, which costs nothing when the flag is already set.
+    if (LOG_AUDIO.load(Ordering::Relaxed) || std::env::var("SHIMKIT_LOG_AUDIO").is_ok())
+        && host.notices.len() < 200_000
+        && matches!(
+            name,
+            "Play"
+                | "Stop"
+                | "SetFormat"
+                | "Lock"
+                | "Unlock"
+                | "GetStatus"
+                | "SetCurrentPosition"
+                | "SetFrequency"
+                | "SetVolume"
+                | "DuplicateSoundBuffer"
+                | "Release"
+        )
     {
+        // The return address on this call's own stack, so a Play names the
+        // routine that started it.
+        let caller = call
+            .memory
+            .read_u32(call.args.wrapping_sub(4))
+            .unwrap_or(0);
         host.notice(format!(
-            "audio {name} this={:#010x} args={:08x},{:08x},{:08x},{:08x}",
+            "audio {name} this={:#010x} args={:08x},{:08x},{:08x},{:08x} from {caller:#010x}",
             call.arg(0).unwrap_or(0),
             call.arg(1).unwrap_or(0),
             call.arg(2).unwrap_or(0),
@@ -756,7 +836,7 @@ pub(crate) fn serve(
             call.arg(4).unwrap_or(0)
         ));
     }
-    match (kind, name) {
+    let outcome = match (kind, name) {
         (_, "QueryInterface") => query_interface(host, call),
         (_, "AddRef") => Ok(Return(add_ref(host, call.arg(0)?))),
         (_, "Release") => Ok(Return(release(host, call.arg(0)?))),
@@ -1111,6 +1191,7 @@ pub(crate) fn serve(
 
         // ---- IDirectSound -------------------------------------------------
         (thunks::DSOUND, "CreateSoundBuffer") => create_sound_buffer(host, call),
+        (thunks::DSOUND, "DuplicateSoundBuffer") => duplicate_sound_buffer(host, call),
         (thunks::DSOUND, "SetCooperativeLevel") => {
             host.audio.cooperative_level = call.arg(2)?;
             Ok(Return(DS_OK))
@@ -1370,7 +1451,23 @@ pub(crate) fn serve(
             "{}::{name} has no shim: the object exists but this method does",
             thunks::kind_name(kind)
         )),
+    };
+
+    // A refusal is the one thing the call trail cannot show any other way: the
+    // guest is told `DSERR_INVALIDPARAM` and does something else with its
+    // voice, and from the outside that is indistinguishable from a guest that
+    // simply never asked. `DuplicateSoundBuffer` is where it matters -- a
+    // duplicate that fails is a sound the guest thinks it owns and cannot stop.
+    if let Ok(Return(code)) = &outcome {
+        if code & 0x8000_0000 != 0 && (LOG_AUDIO.load(Ordering::Relaxed) || std::env::var("SHIMKIT_LOG_AUDIO").is_ok())
+        {
+            host.notice(format!(
+                "audio {name} refused {code:#010x} this={:#010x}",
+                call.arg(0).unwrap_or(0)
+            ));
+        }
     }
+    outcome
 }
 
 fn add_ref(host: &mut Host, this: u32) -> u32 {
@@ -1402,7 +1499,15 @@ fn release(host: &mut Host, this: u32) -> u32 {
         host.audio.primary = None;
     }
     if !buffer.primary {
-        if buffer.data != 0 {
+        // A duplicated buffer shares the original's bytes, so the block goes back
+        // to the arena only when the last buffer over it is released: the guest is
+        // free to release either one first, and the survivor must still lock.
+        let shared = host
+            .audio
+            .buffers
+            .values()
+            .any(|other| other.data == buffer.data);
+        if buffer.data != 0 && !shared {
             host.release(buffer.data);
             buffer.data = 0;
         }
@@ -1441,6 +1546,68 @@ fn read_format(call: &Call<'_>, address: u32) -> Result<Format> {
     })
 }
 
+/// `IDirectSound::DuplicateSoundBuffer(original, &duplicate)`: a second buffer
+/// over the same samples.
+///
+/// DirectSound's duplicate shares the original's memory, and so does this: the
+/// copy gets the same guest address, so `Lock` hands out the same bytes and a
+/// write through either is seen by both. What it does not share is playback --
+/// a play cursor, a volume and a frequency of its own is the whole point, which
+/// is how a game plays one sample as two voices -- so those start from the
+/// original's settings but nothing about it is already sounding.
+///
+/// The samples are one arena allocation seen twice, so [`release`] keeps the
+/// block until both objects are gone.
+fn duplicate_sound_buffer(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let this = call.arg(0)?;
+    let source = call.arg(1)?;
+    let destination = call.arg(2)?;
+    if host.audio.device != Some(this) {
+        return Ok(Return(DSERR_INVALIDPARAM));
+    }
+    if destination == 0 {
+        return Ok(Return(DSERR_INVALIDPARAM));
+    }
+    let Some(original) = host.audio.buffers.get(&source) else {
+        return Ok(Return(DSERR_INVALIDPARAM));
+    };
+    // Copied out field by field: `new_object` needs the host mutably, so the
+    // borrow of the original has to end here. The samples are the one thing
+    // cloned, because `pcm` is the copy's own snapshot of them.
+    let (primary, caps, size, data, format, volume, pan, frequency, looping, pcm) = (
+        original.primary,
+        original.caps,
+        original.size,
+        original.data,
+        original.format,
+        original.volume,
+        original.pan,
+        original.frequency,
+        original.looping,
+        original.pcm.clone(),
+    );
+    let object = thunks::new_object(call.memory, host, thunks::DSOUND_BUFFER)?;
+    let duplicate = SoundBuffer {
+        refs: 1,
+        primary,
+        caps,
+        size,
+        data,
+        format,
+        volume,
+        pan,
+        frequency,
+        playing: false,
+        looping,
+        started_ms: 0,
+        start_bytes: 0,
+        pcm,
+    };
+    host.audio.buffers.insert(object, duplicate);
+    call.write_u32(destination, object)?;
+    Ok(Return(DS_OK))
+}
+
 fn create_sound_buffer(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let this = call.arg(0)?;
     let desc = call.arg(1)?;
@@ -1465,6 +1632,8 @@ fn create_sound_buffer(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let primary = flags & DSBCAPS_PRIMARYBUFFER != 0;
     let bytes = call.memory.read_u32(desc + DESC_BYTES)?;
     let format_address = call.memory.read_u32(desc + DESC_FORMAT)?;
+    // Behind the audio log: every stream a game opens reports one of these, and
+    // the sizes are only interesting to whoever is chasing a silence.
     if std::env::var("SHIMKIT_LOG_AUDIO").is_ok() && host.notices.len() < 600 {
         // The caller's address, so a stream of buffer creations names the routine
         // that asked for them rather than only their sizes.
@@ -1619,7 +1788,13 @@ fn play(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     host.audio.plays += 1;
     let event = {
         let buffer = host.audio.buffers.get_mut(&this).expect("the buffer was just read");
-        let resuming = !buffer.playing;
+        // A one-shot that has already run out is a buffer to start again, not a
+        // waveform to retune: `playing` alone stays true because only a status
+        // query clears it, so the sound a guest asks for twice would be silent
+        // the second time.
+        let finished = !buffer.looping
+            && now.saturating_sub(buffer.started_ms) >= buffer.duration_ms();
+        let resuming = !buffer.playing || finished;
         buffer.playing = true;
         buffer.looping = flags & DSBPLAY_LOOPING != 0;
         if resuming {
@@ -1686,7 +1861,13 @@ fn status_of(host: &mut Host, this: u32) -> u32 {
         return 0;
     }
     if buffer.looping {
-        return DSBSTATUS_LOOPING;
+        // Both bits, the way a device reports it: a looping buffer is a playing
+        // buffer that does not end. Answering `LOOPING` alone is a value no
+        // device produces, and a guest that tests `DSBSTATUS_PLAYING` -- which
+        // is how Hercules decides a voice is finished -- reads it as stopped,
+        // forgets the voice, and leaves the loop running with nobody able to
+        // stop it. See the module note.
+        return DSBSTATUS_PLAYING | DSBSTATUS_LOOPING;
     }
     let elapsed = now.saturating_sub(buffer.started_ms);
     if elapsed < buffer.duration_ms() {
@@ -1697,7 +1878,7 @@ fn status_of(host: &mut Host, this: u32) -> u32 {
     }
 }
 
-fn position_of(host: &Host, this: u32) -> u32 {
+pub(crate) fn position_of(host: &Host, this: u32) -> u32 {
     let Some(buffer) = host.audio.buffers.get(&this) else {
         return 0;
     };
@@ -1711,7 +1892,16 @@ fn position_of(host: &Host, this: u32) -> u32 {
         / 1000;
     let mut position = (buffer.start_bytes as u128).saturating_add(bytes);
     if buffer.size != 0 {
-        position %= buffer.size as u128;
+        // Only a looping buffer wraps. A one-shot that has run out reports the
+        // end of its buffer: wrapping it reports a small position instead, and a
+        // mixer that follows the playhead then starts the sound again from there.
+        // Every one-shot then plays forever, and a minute of them mixes into the
+        // hash that never recovers.
+        if buffer.looping {
+            position %= buffer.size as u128;
+        } else {
+            position = position.min(u128::from(buffer.size));
+        }
     }
     position.min(u128::from(u32::MAX)) as u32
 }
@@ -1785,6 +1975,41 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicated_buffer_shares_the_original_samples() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let device = open(&mut host, &mut memory);
+        let buffer = create_secondary(&mut host, &mut memory, device, 8, 1, 22_050);
+        let out = STACK_BASE + 0x7600;
+        let mut call = invoke(&mut memory, &[device, buffer, out]);
+        assert_eq!(
+            serve(&mut host, &mut call, thunks::DSOUND, "DuplicateSoundBuffer").unwrap(),
+            Return(DS_OK)
+        );
+        let duplicate = call.memory.read_u32(out).unwrap();
+        assert_ne!(duplicate, buffer, "the copy is an object of its own");
+        let samples = host.audio.buffers[&buffer].data;
+        assert_eq!(host.audio.buffers[&duplicate].data, samples);
+        assert_eq!(host.audio.buffers[&duplicate].size, host.audio.buffers[&buffer].size);
+        assert!(!host.audio.buffers[&duplicate].playing, "nothing is already sounding");
+
+        // Releasing the original must not hand its bytes back to the arena: the
+        // duplicate is still playing them.
+        let mut call = invoke(&mut memory, &[buffer]);
+        serve(&mut host, &mut call, thunks::DSOUND_BUFFER, "Release").unwrap();
+        assert!(host.audio.buffers.contains_key(&duplicate));
+        let pointer = STACK_BASE + 0x7400;
+        let length = STACK_BASE + 0x7404;
+        let mut call = invoke(&mut memory, &[duplicate, 0, 8, pointer, length, 0, 0, 0]);
+        assert_eq!(
+            serve(&mut host, &mut call, thunks::DSOUND_BUFFER, "Lock").unwrap(),
+            Return(DS_OK)
+        );
+        assert_eq!(call.memory.read_u32(pointer).unwrap(), samples);
+    }
+
+    #[test]
     fn creating_a_device_hands_back_an_object() {
         let Some((mut host, mut memory)) = machine() else {
             return;
@@ -1830,17 +2055,22 @@ mod tests {
         assert_eq!(event.rate, 22_050);
         assert_eq!(event.flags, 1);
         assert_eq!(host.audio.pcm(buffer), &[1, 2, 3, 4, 5, 6, 7, 8]);
-        // Looping reports exactly 4, which is what the guest compares against.
+        // A looping buffer reports both bits, as a device does. Hercules tests
+        // bit 0 to decide whether a voice is still busy, so `4` alone reads as
+        // "finished" and leaves the loop sounding with no owner.
         let mut status = invoke(&mut memory, &[buffer, 0]);
+        let answered = serve(
+            &mut host,
+            &mut status,
+            thunks::DSOUND_BUFFER,
+            "GetStatus",
+        )
+        .unwrap();
+        assert_eq!(answered, Return(DSBSTATUS_PLAYING | DSBSTATUS_LOOPING));
         assert_eq!(
-            serve(
-                &mut host,
-                &mut status,
-                thunks::DSOUND_BUFFER,
-                "GetStatus"
-            )
-            .unwrap(),
-            Return(DSBSTATUS_LOOPING)
+            answered,
+            Return(5),
+            "PLAYING is bit 0 and LOOPING is bit 2, which is what a device answers"
         );
     }
 

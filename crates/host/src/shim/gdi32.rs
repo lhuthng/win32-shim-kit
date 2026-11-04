@@ -33,15 +33,15 @@
 //! shows.
 //!
 //! Of the font a guest asks for, one field is kept -- the cell height, which
-//! decides how large the glyphs are drawn. The face is this host's own 8x20 ASCII
-//! face, not the system's: there are no system fonts to load, so a guest that
-//! asks for "Arial" or "Courier New" gets the pixels this file carries. It is
-//! drawn at the size Courier New would be -- twelve pixels of advance at
-//! twenty pixels of height -- so a guest's line layout is the same as the layout
-//! it computed for the font it asked for. That is a substitution a player can see,
-//! so it is said once per session, and a character the face does not have is drawn
-//! as a box rather than dropped.
+//! decides how large the glyphs are drawn. The faces are the Bitstream Vera
+//! family embedded in the module (`assets/fonts/`), rasterised at whatever
+//! height the guest's `LOGFONT` asks for: "Courier New" resolves to Vera Mono,
+//! "Arial" to Vera, "Times New Roman" to Vera Serif, and a heavy weight picks
+//! the bold twin. That is a substitution a player can see, so it is said once
+//! per session, and a character the face does not have is drawn as a box rather
+//! than dropped.
 
+use ab_glyph::{Font as _, ScaleFont as _};
 use std::collections::HashMap;
 
 use crate::memory::GuestMemory;
@@ -92,6 +92,50 @@ const LAST_STOCK_INDEX: u32 = 19;
 const BITMAPINFOHEADER: u32 = 40;
 const BI_RGB: u32 = 0;
 
+/// Palette handles, in the object space above the brushes so a log line can say
+/// which kind of object a number is.
+const FIRST_PALETTE: u32 = FIRST_OBJECT + 0x400;
+
+/// A palette entry index no palette has written, so a palette that was created
+/// and never filled realizes nothing instead of clearing the display to black.
+const NO_INDEX: usize = usize::MAX;
+
+/// `CreateDIBitmap`'s `CBM_INIT`: the caller supplies the pixels.
+const CBM_INIT: u32 = 4;
+
+/// The only `LOGPALETTE` version Windows has ever defined.
+const PALETTE_VERSION: u16 = 0x0300;
+
+/// `ETO_CLIPPED`: the call carries a rectangle its text must not leave.
+const ETO_CLIPPED: u32 = 4;
+
+/// `GetClipBox`'s region complexities, and the error code: a guest that asks
+/// whether anything is visible reads them.
+const REGION_ERROR: u32 = 0;
+const COMPLEXREGION: u32 = 1;
+const SIMPLEREGION: u32 = 2;
+const NULLREGION: u32 = 3;
+
+/// The `GetDeviceCaps` indices this host answers. The rest answer zero, which is
+/// what a device without that capability reports.
+const HORZRES: u32 = 8;
+const VERTRES: u32 = 10;
+const BITSPIXEL: u32 = 12;
+const PLANES: u32 = 14;
+const NUMCOLORS: u32 = 24;
+const RASTERCAPS: u32 = 38;
+const LOGPIXELSX: u32 = 88;
+const LOGPIXELSY: u32 = 90;
+const SIZEPALETTE: u32 = 104;
+
+/// `RC_BITBLT`: the one raster capability this device has, since every blit it
+/// is asked for is a copy through `Painter`.
+const RC_BITBLT: u32 = 1;
+
+/// The dots per inch this host reports. A browser canvas has no physical size, so
+/// the conventional 96 keeps a guest that sizes a dialog in inches consistent.
+const DOTS_PER_INCH: u32 = 96;
+
 /// `SRCCOPY`: the only raster operation a blit is asked for here.
 const SRCCOPY: u32 = 0x00cc_0020;
 
@@ -101,15 +145,127 @@ const PATCOPY: u32 = 0x00f0_0021;
 const WHITENESS: u32 = 0x00ff_0062;
 const BLACKNESS: u32 = 0x0000_0042;
 const DSTINVERT: u32 = 0x0055_0009;
+/// The ops a game composes sprites with: `SRCAND` blits a mask, which keeps the
+/// sprite's shape and clears everything else, then `SRCPAINT` blits the image
+/// through the cleared shape. A host that refuses them draws neither pass, and
+/// the character reads as holes punched through the background.
+const SRCAND: u32 = 0x0088_00c6;
+const SRCPAINT: u32 = 0x00ee_0086;
+const SRCINVERT: u32 = 0x0066_0046;
+const NOTSRCCOPY: u32 = 0x0033_0008;
+const SRCERASE: u32 = 0x0044_0328;
+/// Every op that combines a source pixel with a destination one and needs no
+/// brush. `BLACKNESS` and `WHITENESS` fill and never read a source, so they are
+/// answered before this list is consulted.
+const ROP_MASKING: [u32; 6] = [SRCCOPY, SRCAND, SRCPAINT, SRCINVERT, NOTSRCCOPY, SRCERASE];
 
 /// The built-in face's cell: twelve pixels of advance, of which two are the left
 /// bearing, eight are the glyph's own columns and two are letter spacing. Twenty
 /// rows are cap height plus descenders, the size Courier New would be drawn at
 /// when a guest asks for a twenty-pixel font.
-const ADVANCE: i32 = 12;
-const GLYPH_LEFT: i32 = 2;
-const GLYPH_WIDTH: i32 = 8;
 const GLYPH_HEIGHT: i32 = 20;
+
+// ---- the embedded faces ----------------------------------------------------
+
+/// The faces embedded in the module, which `TextOutA` rasterises instead of the
+/// hand-drawn table this shim used to carry. Bitstream Vera, taken from Wine's
+/// font share: `VeraMono` is the standard "Courier New" substitute, `Vera` the
+/// sans, `VeraSe` the serif — each with a bold twin for heavy weights.
+mod embedded {
+    pub const SANS: &[u8] = include_bytes!("../../assets/fonts/Vera.ttf");
+    pub const SANS_BOLD: &[u8] = include_bytes!("../../assets/fonts/VeraBd.ttf");
+    pub const MONO: &[u8] = include_bytes!("../../assets/fonts/VeraMono.ttf");
+    pub const MONO_BOLD: &[u8] = include_bytes!("../../assets/fonts/VeraMoBd.ttf");
+    pub const SERIF: &[u8] = include_bytes!("../../assets/fonts/VeraSe.ttf");
+    pub const SERIF_BOLD: &[u8] = include_bytes!("../../assets/fonts/VeraSeBd.ttf");
+}
+
+/// Which embedded face a `LOGFONT` resolves to. The name picks the family, the
+/// weight picks the twin; `u8` so a raster cache can key on it directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Face(pub u8);
+
+impl Face {
+    pub const SANS: u8 = 0;
+    pub const SANS_BOLD: u8 = 1;
+    pub const MONO: u8 = 2;
+    pub const MONO_BOLD: u8 = 3;
+    pub const SERIF: u8 = 4;
+    pub const SERIF_BOLD: u8 = 5;
+
+    /// Resolves a `LOGFONT`'s face name and weight. Wine's own substitution
+    /// table maps "Courier New" to Vera Mono, "Arial" to Vera and "Times New
+    /// Roman" to Vera Serif, and this follows it.
+    pub fn of(face: &str, weight: i32) -> Self {
+        let bold = weight >= 700;
+        let name = face.to_ascii_lowercase();
+        let family = if name.contains("courier")
+            || name.contains("mono")
+            || name.contains("consol")
+        {
+            "mono"
+        } else if name.contains("times")
+            || name.contains("serif")
+            || name.contains("georgia")
+            || name.contains("roman")
+        {
+            "serif"
+        } else {
+            "sans"
+        };
+        let base = match (family, bold) {
+            ("mono", false) => Self::MONO,
+            ("mono", true) => Self::MONO_BOLD,
+            ("serif", false) => Self::SERIF,
+            ("serif", true) => Self::SERIF_BOLD,
+            (_, false) => Self::SANS,
+            (_, true) => Self::SANS_BOLD,
+        };
+        Self(base)
+    }
+}
+
+/// One rasterised glyph: coverage per pixel, the metrics to place it, and the
+/// advance the next character starts at.
+struct RasterGlyph {
+    /// Pixels between the draw x and the glyph's first column.
+    left: i32,
+    /// Pixels between the draw y (the cell's top) and the glyph's first row.
+    top: i32,
+    width: u32,
+    height: u32,
+    /// 0-255 per pixel, row-major.
+    coverage: Vec<u8>,
+    advance: i32,
+}
+
+/// The six embedded faces, parsed once per session.
+struct Faces {
+    faces: [ab_glyph::FontVec; 6],
+}
+
+impl Faces {
+    fn embedded() -> Self {
+        let parse = |bytes: &'static [u8]| {
+            ab_glyph::FontVec::try_from_vec(bytes.to_vec())
+                .expect("the embedded font parses")
+        };
+        Self {
+            faces: [
+                parse(embedded::SANS),
+                parse(embedded::SANS_BOLD),
+                parse(embedded::MONO),
+                parse(embedded::MONO_BOLD),
+                parse(embedded::SERIF),
+                parse(embedded::SERIF_BOLD),
+            ],
+        }
+    }
+
+    fn get(&self, variant: u8) -> &ab_glyph::FontVec {
+        &self.faces[variant as usize % self.faces.len()]
+    }
+}
 
 pub const SHIMS: &[Binding] = &[
     Binding { dll: GDI32, name: "GetStockObject", arg_bytes: 4, shim: get_stock_object },
@@ -133,6 +289,32 @@ pub const SHIMS: &[Binding] = &[
     Binding { dll: GDI32, name: "CreateSolidBrush", arg_bytes: 4, shim: create_solid_brush },
     Binding { dll: GDI32, name: "BitBlt", arg_bytes: 36, shim: bit_blt },
     Binding { dll: GDI32, name: "PatBlt", arg_bytes: 24, shim: pat_blt },
+    Binding { dll: GDI32, name: "CreatePalette", arg_bytes: 4, shim: create_palette },
+    Binding { dll: GDI32, name: "SetPaletteEntries", arg_bytes: 16, shim: set_palette_entries },
+    Binding { dll: GDI32, name: "SelectPalette", arg_bytes: 12, shim: select_palette },
+    Binding { dll: GDI32, name: "RealizePalette", arg_bytes: 4, shim: realize_palette },
+    Binding { dll: GDI32, name: "UnrealizeObject", arg_bytes: 4, shim: unrealize_object },
+    Binding { dll: GDI32, name: "GetDeviceCaps", arg_bytes: 8, shim: get_device_caps },
+    Binding { dll: GDI32, name: "GetTextExtentPointA", arg_bytes: 16, shim: get_text_extent_point },
+    Binding { dll: GDI32, name: "ExtTextOutA", arg_bytes: 32, shim: ext_text_out },
+    Binding { dll: GDI32, name: "GetClipBox", arg_bytes: 8, shim: get_clip_box },
+    Binding { dll: GDI32, name: "IntersectClipRect", arg_bytes: 20, shim: intersect_clip_rect },
+    Binding { dll: GDI32, name: "PtVisible", arg_bytes: 12, shim: pt_visible },
+    Binding { dll: GDI32, name: "RectVisible", arg_bytes: 8, shim: rect_visible },
+    Binding { dll: GDI32, name: "SaveDC", arg_bytes: 4, shim: save_dc },
+    Binding { dll: GDI32, name: "RestoreDC", arg_bytes: 8, shim: restore_dc },
+    Binding { dll: GDI32, name: "SetMapMode", arg_bytes: 8, shim: set_map_mode },
+    Binding { dll: GDI32, name: "SetWindowExtEx", arg_bytes: 16, shim: set_window_ext },
+    Binding { dll: GDI32, name: "SetViewportExtEx", arg_bytes: 16, shim: set_viewport_ext },
+    Binding { dll: GDI32, name: "SetViewportOrgEx", arg_bytes: 16, shim: set_viewport_org },
+    Binding { dll: GDI32, name: "OffsetViewportOrgEx", arg_bytes: 16, shim: offset_viewport_org },
+    Binding { dll: GDI32, name: "ScaleWindowExtEx", arg_bytes: 24, shim: scale_window_ext },
+    Binding { dll: GDI32, name: "ScaleViewportExtEx", arg_bytes: 24, shim: scale_viewport_ext },
+    Binding { dll: GDI32, name: "CreateBitmap", arg_bytes: 20, shim: create_bitmap },
+    Binding { dll: GDI32, name: "CreateDIBitmap", arg_bytes: 24, shim: create_di_bitmap },
+    Binding { dll: GDI32, name: "StretchDIBits", arg_bytes: 52, shim: stretch_dibits },
+    Binding { dll: GDI32, name: "Escape", arg_bytes: 20, shim: escape },
+    Binding { dll: GDI32, name: "GdiFlush", arg_bytes: 0, shim: gdi_flush },
 ];
 
 /// `TextOutA(dc, x, y, string, count)`: draws the glyphs of `string` at `x, y`.
@@ -153,6 +335,21 @@ fn text_out(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         call.memory.read_cstr(string)?
     } else {
         let bytes = call.memory.read_bytes(string, count as usize)?;
+        // TEMP DIAGNOSTIC: dump raw ANSI bytes that are not plain ASCII, so a
+        // mis-decoded code page names itself. Capped so a frame loop cannot flood.
+        if bytes.iter().any(|byte| *byte >= 0x80) {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static DUMPS: AtomicU32 = AtomicU32::new(0);
+            if DUMPS.load(Ordering::Relaxed) < 40 && host.notices.len() < 600 {
+                DUMPS.fetch_add(1, Ordering::Relaxed);
+                let hex: Vec<String> =
+                    bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+                host.notice(format!(
+                    "TextOutA non-ascii bytes: {}",
+                    hex.join(" ")
+                ));
+            }
+        }
         String::from_utf8_lossy(bytes).into_owned()
     };
     draw_text(host, call, "TextOutA", text)
@@ -186,72 +383,159 @@ fn draw_text(host: &mut Host, call: &mut Call<'_>, method: &str, text: String) -
         host.notice(format!("{method} at {x},{y} into {dc:#x}: {text:?}"));
     }
 
-    let Some(context) = host.gdi.dcs.get(&dc) else {
+    if !host.gdi.dcs.contains_key(&dc) {
         return Err(format!("{method} into DC {dc:#010x}, which does not exist"));
+    }
+    name_the_font(host, dc, method);
+    draw_run(host, call.memory, dc, x, y, &text)?;
+    Ok(Return(1))
+}
+
+/// Says once per session which face GDI text is drawn with, naming the one the
+/// guest asked for: a substitution is something a player can see, so it is said
+/// once rather than per line.
+fn name_the_font(host: &mut Host, dc: u32, method: &str) {
+    if host.gdi.font_notice {
+        return;
+    }
+    host.gdi.font_notice = true;
+    let height = font_height(host, dc);
+    let face = host
+        .gdi
+        .dcs
+        .get(&dc)
+        .and_then(|context| context.font)
+        .and_then(|font| host.gdi.fonts.get(&font))
+        .map_or_else(|| "the current font".to_string(), |font| format!("\"{}\"", font.face));
+    host.notice(format!(
+        "{method}: this host has no system fonts, so GDI text is drawn with its embedded \
+         Bitstream Vera face at {height} pixels (the guest selected {face})"
+    ));
+}
+
+/// The cell height of the font selected into a context, in pixels.
+///
+/// A guest asks for a height in a `LOGFONT` and then lays its lines out against
+/// the one it gets back, so this is what `GetTextExtentPointA` reports and what a
+/// run of text occupies.
+pub(crate) fn font_height(host: &Host, dc: u32) -> i32 {
+    host.gdi
+        .dcs
+        .get(&dc)
+        .and_then(|context| context.font)
+        .and_then(|font| host.gdi.fonts.get(&font))
+        .map_or(GLYPH_HEIGHT, |font| font.height.unsigned_abs() as i32)
+        .max(1)
+}
+
+/// Draws one run of text at `x, y` into a context, with the context's own font,
+/// colours and background mode, and answers the advance the run took.
+///
+/// Every text call in this host is this loop. `TextOutA` draws one run; a game's
+/// `ExtTextOutA`, `DrawTextA` and `TabbedTextOutA` break their strings into runs
+/// and draw each with it. Sharing the loop is what makes the glyphs of a line --
+/// and the width a guest measures off them -- the same whichever entry point drew
+/// them, which matters because a guest measures with one call and draws with
+/// another.
+pub(crate) fn draw_run(
+    host: &mut Host,
+    memory: &mut GuestMemory,
+    dc: u32,
+    x: i32,
+    y: i32,
+    text: &str,
+) -> Result<i32> {
+    let Some(context) = host.gdi.dcs.get(&dc) else {
+        return Err(format!("text into DC {dc:#010x}, which does not exist"));
     };
-    let (foreground, background, opaque, scale) = {
+    let (foreground, background, opaque, variant, height) = {
         let text = context.text_color;
         let fill = context.background_color;
         let opaque = context.background == 2;
-        let height = context
+        let (variant, height) = context
             .font
             .and_then(|font| host.gdi.fonts.get(&font))
-            .map_or(GLYPH_HEIGHT, |font| font.height.unsigned_abs() as i32);
-        // The built-in face is twenty pixels tall including its descender rows,
-        // and a guest's `lfHeight` is the cell it wants: at twenty the glyphs are
-        // drawn as designed, and above that they are doubled, because a
-        // fractional stretch would break their one-pixel strokes.
-        let scale = ((height + 10) / GLYPH_HEIGHT).clamp(1, 2);
-        (colour_of(text), colour_of(fill), opaque, scale)
+            .map_or((Face::MONO, GLYPH_HEIGHT as i32), |font| {
+                (font.variant, font.height.unsigned_abs() as i32)
+            });
+        (colour_of(text), colour_of(fill), opaque, variant, height.max(1))
     };
-
-    if !host.gdi.font_notice {
-        host.gdi.font_notice = true;
-        let face = host
-            .gdi
-            .dcs
-            .get(&dc)
-            .and_then(|context| context.font)
-            .and_then(|font| host.gdi.fonts.get(&font))
-            .map_or_else(|| "the current font".to_string(), |font| format!("\"{}\"", font.face));
-        host.notice(format!(
-            "{method}: this host has no system fonts, so GDI text is drawn with its built-in 8x20 ASCII face (the guest selected {face})"
-        ));
-    }
 
     // The context's own device: a surface for a game drawing straight to the
     // screen, a bitmap for one laying its text out off screen to blit up later.
     let mut painter = Painter::new(device_of(host, dc)?);
+    // Ink and background are both cut to the clip: a guest that scrolls a panel
+    // sets one and draws the whole list through it, and `ExtTextOutA` may narrow
+    // it further for a single call.
+    let clip = clip_of(host, dc, &painter.device);
 
-    // The face is fixed pitch, so a string's width is its length times this,
-    // whatever it says -- which is what a guest's line layout was computed
-    // against when it chose the font.
-    let advance = ADVANCE * scale;
+    // The raster comes from the cache, so a guest that draws a string per frame
+    // pays for each glyph once. The ascent places the cell's top: a glyph's
+    // outline bounds are relative to the baseline, which sits `ascent` pixels
+    // below the draw y.
+    let ascent = host.gdi.ascent(variant, height);
     let mut cursor = x;
     for character in text.chars() {
-        let glyph = glyph(character);
+        let glyph = host.gdi.raster(variant, height, character);
+        let (glyph_left, glyph_top) = (glyph.left, glyph.top);
+        let (glyph_width, glyph_height) = (glyph.width as usize, glyph.height as usize);
+        let advance = glyph.advance.max(1);
         if opaque {
-            for row in 0..GLYPH_HEIGHT * scale {
+            // The cell fills with the background colour; a pixel inside the
+            // glyph's outline blends the two by its coverage, which the palette
+            // turns into the closest entries it has.
+            for row in 0..height {
                 for column in 0..advance {
-                    painter.put(call.memory, cursor + column, y + row, background)?;
+                    let (cell_x, cell_y) = (cursor + column, y + row);
+                    if clipped(clip, cell_x, cell_y) {
+                        continue;
+                    }
+                    painter.put(memory, cell_x, cell_y, background)?;
                 }
             }
         }
-        for (row, bits) in glyph.iter().enumerate() {
-            for column in 0..GLYPH_WIDTH {
-                // Bit 7 is the leftmost column of the row.
-                if bits & (0x80 >> column) == 0 {
+        // A 32-bit device carries per-pixel alpha, so the coverage lands
+        // directly and the edges antialias; a palettised one has no room for
+        // partial inking, so opaque mode mixes ink into the background colour
+        // and transparent mode inks at a coverage threshold.
+        let antialiased = painter.device.bits == 32;
+        for row in 0..glyph_height {
+            for column in 0..glyph_width {
+                let coverage = glyph.coverage[row * glyph_width + column];
+                if coverage == 0 {
                     continue;
                 }
-                for dy in 0..scale {
-                    for dx in 0..scale {
-                        painter.put(
-                            call.memory,
-                            cursor + (GLYPH_LEFT + column) * scale + dx,
-                            y + row as i32 * scale + dy,
-                            foreground,
-                        )?;
-                    }
+                let ink_x = cursor + glyph_left + column as i32;
+                let ink_y = y + ascent + glyph_top + row as i32;
+                if clipped(clip, ink_x, ink_y) {
+                    continue;
+                }
+                if antialiased {
+                    painter.put_with_alpha(
+                        memory,
+                        ink_x,
+                        ink_y,
+                        foreground,
+                        coverage,
+                    )?;
+                } else if opaque {
+                    let mix = |ink: u8, paper: u8| {
+                        ((u16::from(ink) * u16::from(coverage)
+                            + u16::from(paper) * (255 - u16::from(coverage)))
+                            / 255) as u8
+                    };
+                    painter.put(
+                        memory,
+                        ink_x,
+                        ink_y,
+                        (
+                            mix(foreground.0, background.0),
+                            mix(foreground.1, background.1),
+                            mix(foreground.2, background.2),
+                        ),
+                    )?;
+                } else if coverage >= 128 {
+                    painter.put(memory, ink_x, ink_y, foreground)?;
                 }
             }
         }
@@ -261,7 +545,112 @@ fn draw_text(host: &mut Host, call: &mut Call<'_>, method: &str, text: String) -
     if let Some(surface) = painter.surface() {
         host.ddraw.touch(surface);
     }
-    Ok(Return(1))
+    Ok(cursor)
+}
+
+/// The width and cell height of a run of text in a context's font.
+///
+/// The width is the sum of the advances the same glyphs are drawn with, so a
+/// guest that measures a string and then draws it gets the line it laid out.
+/// This is what `GetTextExtentPointA` reports.
+pub(crate) fn text_extent(host: &mut Host, dc: u32, text: &str) -> (i32, i32) {
+    let (variant, height) = host
+        .gdi
+        .dcs
+        .get(&dc)
+        .and_then(|context| context.font)
+        .and_then(|font| host.gdi.fonts.get(&font))
+        .map_or((Face::MONO, GLYPH_HEIGHT), |font| {
+            (font.variant, font.height.unsigned_abs() as i32)
+        });
+    let height = height.max(1);
+    let width = text
+        .chars()
+        .map(|character| host.gdi.raster(variant, height, character).advance.max(1))
+        .sum();
+    (width, height)
+}
+
+/// The rectangle a context's drawing is cut to: its clip, held inside the device.
+///
+/// A context with no clip draws over the whole device, which is the common case;
+/// one that set a clip (`IntersectClipRect`, or `BeginPaint` on a region) is cut
+/// to it, and to the device either way, because a fill outside the pixels would
+/// be a write past the surface.
+pub(crate) fn clip_of(host: &Host, dc: u32, device: &Device) -> [i32; 4] {
+    let whole = [0, 0, device.width, device.height];
+    let Some(clip) = host.gdi.dcs.get(&dc).and_then(|context| context.clip) else {
+        return whole;
+    };
+    [
+        clip[0].max(whole[0]),
+        clip[1].max(whole[1]),
+        clip[2].min(whole[2]),
+        clip[3].min(whole[3]),
+    ]
+}
+
+/// Fills a rectangle with one colour through the destination's palette, cut to
+/// the context's clip.
+///
+/// `FillRect`, the background of a dialog's control and every `PatBlt` with a
+/// solid brush are this: a run of pixels, converted to the entries the device
+/// actually has. (`fill_rect`, below, is the blit path's inner loop: a rectangle
+/// into a painter that already knows its device.)
+pub(crate) fn paint_rect(
+    host: &mut Host,
+    memory: &mut GuestMemory,
+    dc: u32,
+    rect: [i32; 4],
+    colour: u32,
+) -> Result<()> {
+    let device = device_of(host, dc)?;
+    let clip = clip_of(host, dc, &device);
+    let (left, top) = (rect[0].max(clip[0]), rect[1].max(clip[1]));
+    let (right, bottom) = (rect[2].min(clip[2]), rect[3].min(clip[3]));
+    if right <= left || bottom <= top {
+        return Ok(());
+    }
+    let ink = colour_of(colour);
+    let mut painter = Painter::new(device);
+    for y in top..bottom {
+        for x in left..right {
+            painter.put(memory, x, y, ink)?;
+        }
+    }
+    if let Some(surface) = painter.surface() {
+        host.ddraw.touch(surface);
+    }
+    Ok(())
+}
+
+/// Inverts the pixels of a rectangle, which is what `DrawFocusRect` is: the
+/// focus ring a dialog draws around the control the keyboard is on.
+pub(crate) fn invert_rect(
+    host: &mut Host,
+    memory: &mut GuestMemory,
+    dc: u32,
+    rect: [i32; 4],
+) -> Result<()> {
+    let device = device_of(host, dc)?;
+    let clip = clip_of(host, dc, &device);
+    let (left, top) = (rect[0].max(clip[0]), rect[1].max(clip[1]));
+    let (right, bottom) = (rect[2].min(clip[2]), rect[3].min(clip[3]));
+    if right <= left || bottom <= top {
+        return Ok(());
+    }
+    let mut painter = Painter::new(device);
+    for y in top..bottom {
+        for x in left..right {
+            if let Some((red, green, blue)) = read_pixel(memory, &painter.device, x, y)? {
+                painter.put(memory, x, y, (255 - red, 255 - green, 255 - blue))?;
+            }
+        }
+    }
+    if let Some(surface) = painter.surface() {
+        host.ddraw.touch(surface);
+    }
+    Ok(())
 }
 
 /// `SetBkMode(dc, mode)`: the previous mode.
@@ -298,135 +687,6 @@ fn set_text_color(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
 }
 
 /// A `COLORREF` split into red, green and blue.
-fn colour_of(colour: u32) -> (u8, u8, u8) {
-    (
-        colour as u8,
-        ((colour >> 8) & 0xff) as u8,
-        ((colour >> 16) & 0xff) as u8,
-    )
-}
-
-/// One glyph of the built-in face: eight columns of twenty rows, bit 7 leftmost.
-fn glyph(character: char) -> [u8; 20] {
-    let index = character as u32;
-    if (0x20..0x7f).contains(&index) {
-        FONT[(index - 0x20) as usize]
-    } else {
-        // Anything the face does not have is drawn as a hollow box, which is what
-        // a rasteriser does rather than dropping the character.
-        [
-            0x00, 0x00, 0x00, 0xff, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0xff,
-            0x00, 0x00, 0x00, 0x00, 0x00,
-        ]
-    }
-}
-
-/// The built-in face: ASCII 0x20 to 0x7e, eight columns of ink in a twelve-pixel
-/// advance and twenty rows tall -- Courier New's own cell at the size games ask
-/// for, which is twenty pixels.
-///
-/// The rows are the design's bands: row 3 is cap height, rows 7 to 15 the
-/// x-height, row 15 the baseline, and rows 16 to 19 the descenders. Bit 7 is the
-/// leftmost of the eight columns; the two pixels of left bearing and the two of
-/// letter spacing that complete the advance are not part of a glyph.
-const FONT: [[u8; 20]; 95] = [
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], //  
-    [0x00, 0x00, 0x00, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x00, 0x00, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00], // !
-    [0x00, 0x00, 0x00, 0x24, 0x24, 0x24, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // quote
-    [0x00, 0x00, 0x00, 0x00, 0x24, 0x24, 0x24, 0xff, 0x24, 0xff, 0x24, 0x24, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // #
-    [0x00, 0x00, 0x00, 0x10, 0x7c, 0x92, 0x90, 0x7c, 0x12, 0x92, 0x7c, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // $
-    [0x00, 0x00, 0x00, 0x62, 0x92, 0x92, 0x64, 0x08, 0x10, 0x20, 0x36, 0x49, 0x49, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // %
-    [0x00, 0x00, 0x00, 0x30, 0x48, 0x48, 0x30, 0x4a, 0x8e, 0x84, 0x84, 0x46, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // &
-    [0x00, 0x00, 0x00, 0x10, 0x10, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // apostrophe
-    [0x00, 0x00, 0x04, 0x08, 0x10, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x10, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00], // (
-    [0x00, 0x00, 0x20, 0x10, 0x08, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x08, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00], // )
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x92, 0x44, 0x38, 0x44, 0x92, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00], // *
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x10, 0x10, 0xff, 0x10, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00], // +
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x20, 0x40, 0x00, 0x00], // ,
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // -
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x30, 0x00, 0x00, 0x00], // .
-    [0x00, 0x00, 0x02, 0x02, 0x04, 0x04, 0x08, 0x08, 0x10, 0x10, 0x20, 0x20, 0x40, 0x40, 0x80, 0x80, 0x00, 0x00, 0x00, 0x00], // /
-    [0x00, 0x00, 0x00, 0x3c, 0x42, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x42, 0x3c, 0x00, 0x00, 0x00, 0x00], // 0
-    [0x00, 0x00, 0x00, 0x10, 0x30, 0x50, 0x90, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x7e, 0x00, 0x00, 0x00, 0x00], // 1
-    [0x00, 0x00, 0x00, 0x3c, 0x42, 0x81, 0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0xff, 0x00, 0x00, 0x00, 0x00], // 2
-    [0x00, 0x00, 0x00, 0x3c, 0x42, 0x81, 0x01, 0x01, 0x01, 0x1c, 0x01, 0x01, 0x01, 0x81, 0x42, 0x3c, 0x00, 0x00, 0x00, 0x00], // 3
-    [0x00, 0x00, 0x00, 0x02, 0x06, 0x0a, 0x12, 0x22, 0x42, 0x82, 0x82, 0xff, 0x02, 0x02, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00], // 4
-    [0x00, 0x00, 0x00, 0xff, 0x80, 0x80, 0x80, 0x80, 0xf8, 0x02, 0x01, 0x01, 0x01, 0x81, 0x42, 0x3c, 0x00, 0x00, 0x00, 0x00], // 5
-    [0x00, 0x00, 0x00, 0x1c, 0x20, 0x40, 0x80, 0x80, 0x80, 0xfc, 0x82, 0x81, 0x81, 0x81, 0x42, 0x3c, 0x00, 0x00, 0x00, 0x00], // 6
-    [0x00, 0x00, 0x00, 0xff, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x00], // 7
-    [0x00, 0x00, 0x00, 0x3c, 0x42, 0x81, 0x81, 0x81, 0x42, 0x3c, 0x42, 0x81, 0x81, 0x81, 0x42, 0x3c, 0x00, 0x00, 0x00, 0x00], // 8
-    [0x00, 0x00, 0x00, 0x3c, 0x42, 0x81, 0x81, 0x81, 0x41, 0x3f, 0x01, 0x01, 0x01, 0x01, 0x22, 0x1c, 0x00, 0x00, 0x00, 0x00], // 9
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x30, 0x00, 0x00, 0x00, 0x00], // :
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x20, 0x40, 0x00, 0x00, 0x00], // ;
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x04, 0x08, 0x10, 0x20, 0x10, 0x08, 0x04, 0x02, 0x00, 0x00, 0x00], // <
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7e, 0x00, 0x7e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // =
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x40, 0x20, 0x10, 0x08, 0x10, 0x20, 0x40, 0x80, 0x00, 0x00, 0x00], // >
-    [0x00, 0x00, 0x00, 0x3c, 0x42, 0x81, 0x01, 0x01, 0x02, 0x04, 0x08, 0x08, 0x00, 0x00, 0x08, 0x08, 0x00, 0x00, 0x00, 0x00], // ?
-    [0x00, 0x00, 0x00, 0x3c, 0x42, 0x99, 0xa5, 0xa5, 0xa5, 0x99, 0x80, 0x80, 0x40, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // @
-    [0x00, 0x00, 0x00, 0x18, 0x24, 0x42, 0x42, 0x81, 0x81, 0x81, 0xff, 0x81, 0x81, 0x81, 0x81, 0x81, 0x00, 0x00, 0x00, 0x00], // A
-    [0x00, 0x00, 0x00, 0xfc, 0x82, 0x82, 0x82, 0xfc, 0x82, 0x82, 0x82, 0x82, 0x82, 0x82, 0x82, 0xfc, 0x00, 0x00, 0x00, 0x00], // B
-    [0x00, 0x00, 0x00, 0x3e, 0x41, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x41, 0x3e, 0x00, 0x00, 0x00, 0x00], // C
-    [0x00, 0x00, 0x00, 0xf8, 0x84, 0x82, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x82, 0x84, 0xf8, 0x00, 0x00, 0x00, 0x00], // D
-    [0x00, 0x00, 0x00, 0xff, 0x80, 0x80, 0x80, 0x80, 0x80, 0xf8, 0x80, 0x80, 0x80, 0x80, 0x80, 0xff, 0x00, 0x00, 0x00, 0x00], // E
-    [0x00, 0x00, 0x00, 0xff, 0x80, 0x80, 0x80, 0x80, 0xf8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00, 0x00, 0x00], // F
-    [0x00, 0x00, 0x00, 0x3e, 0x41, 0x80, 0x80, 0x80, 0x80, 0x8f, 0x81, 0x81, 0x81, 0x81, 0x41, 0x3e, 0x00, 0x00, 0x00, 0x00], // G
-    [0x00, 0x00, 0x00, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0xff, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x00, 0x00, 0x00, 0x00], // H
-    [0x00, 0x00, 0x00, 0x7e, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x7e, 0x00, 0x00, 0x00, 0x00], // I
-    [0x00, 0x00, 0x00, 0x3f, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x82, 0x44, 0x38, 0x00, 0x00, 0x00, 0x00], // J
-    [0x00, 0x00, 0x00, 0x81, 0x82, 0x84, 0x88, 0x90, 0xe0, 0x90, 0x88, 0x84, 0x82, 0x81, 0x81, 0x81, 0x00, 0x00, 0x00, 0x00], // K
-    [0x00, 0x00, 0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0xff, 0x00, 0x00, 0x00, 0x00], // L
-    [0x00, 0x00, 0x00, 0x81, 0xc3, 0xc3, 0xa5, 0xa5, 0x95, 0x99, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x00, 0x00, 0x00, 0x00], // M
-    [0x00, 0x00, 0x00, 0x81, 0xc1, 0xa1, 0x91, 0x89, 0x85, 0x83, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x00, 0x00, 0x00, 0x00], // N
-    [0x00, 0x00, 0x00, 0x3c, 0x42, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x42, 0x3c, 0x00, 0x00, 0x00, 0x00], // O
-    [0x00, 0x00, 0x00, 0xfc, 0x82, 0x82, 0x82, 0x82, 0xfc, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00, 0x00, 0x00], // P
-    [0x00, 0x00, 0x00, 0x3c, 0x42, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x89, 0x85, 0x42, 0x3d, 0x00, 0x00, 0x00, 0x00], // Q
-    [0x00, 0x00, 0x00, 0xfc, 0x82, 0x82, 0x82, 0xfc, 0x88, 0x84, 0x82, 0x81, 0x81, 0x81, 0x81, 0x80, 0x00, 0x00, 0x00, 0x00], // R
-    [0x00, 0x00, 0x00, 0x3e, 0x41, 0x80, 0x80, 0x40, 0x3c, 0x01, 0x01, 0x01, 0x01, 0x81, 0x42, 0x3c, 0x00, 0x00, 0x00, 0x00], // S
-    [0x00, 0x00, 0x00, 0xff, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00], // T
-    [0x00, 0x00, 0x00, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x42, 0x3c, 0x00, 0x00, 0x00, 0x00], // U
-    [0x00, 0x00, 0x00, 0x81, 0x81, 0x81, 0x81, 0x66, 0x66, 0x42, 0x42, 0x24, 0x24, 0x24, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00], // V
-    [0x00, 0x00, 0x00, 0x81, 0x81, 0x81, 0x81, 0x81, 0x89, 0x89, 0xaa, 0xaa, 0xaa, 0xc6, 0xc6, 0x82, 0x00, 0x00, 0x00, 0x00], // W
-    [0x00, 0x00, 0x00, 0x81, 0x81, 0x42, 0x42, 0x24, 0x24, 0x18, 0x18, 0x24, 0x24, 0x42, 0x42, 0x81, 0x00, 0x00, 0x00, 0x00], // X
-    [0x00, 0x00, 0x00, 0x81, 0x81, 0x42, 0x42, 0x24, 0x24, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00], // Y
-    [0x00, 0x00, 0x00, 0xff, 0x02, 0x04, 0x04, 0x08, 0x08, 0x10, 0x10, 0x20, 0x20, 0x40, 0x40, 0xff, 0x00, 0x00, 0x00, 0x00], // Z
-    [0x00, 0x00, 0x7c, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x7c, 0x00, 0x00, 0x00, 0x00], // [
-    [0x00, 0x00, 0x80, 0x80, 0x40, 0x40, 0x20, 0x20, 0x10, 0x10, 0x08, 0x08, 0x04, 0x04, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00], // backslash
-    [0x00, 0x00, 0x7c, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x7c, 0x00, 0x00, 0x00, 0x00], // ]
-    [0x00, 0x00, 0x00, 0x10, 0x28, 0x44, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // ^
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff], // _
-    [0x00, 0x00, 0x00, 0x20, 0x10, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // `
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3e, 0x01, 0x01, 0x3f, 0x41, 0x41, 0x41, 0x3f, 0x00, 0x00, 0x00], // a
-    [0x00, 0x00, 0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0xfc, 0x82, 0x81, 0x81, 0x81, 0x81, 0x82, 0xfc, 0x00, 0x00, 0x00, 0x00], // b
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3e, 0x41, 0x80, 0x80, 0x80, 0x80, 0x41, 0x3e, 0x00, 0x00, 0x00], // c
-    [0x00, 0x00, 0x00, 0x02, 0x02, 0x02, 0x02, 0x02, 0x3f, 0x41, 0x81, 0x81, 0x81, 0x81, 0x41, 0x3f, 0x00, 0x00, 0x00, 0x00], // d
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3c, 0x42, 0x81, 0xff, 0x80, 0x80, 0x42, 0x3c, 0x00, 0x00, 0x00], // e
-    [0x00, 0x00, 0x00, 0x1e, 0x21, 0x20, 0x20, 0x20, 0xfc, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x00], // f
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0x41, 0x81, 0x81, 0x81, 0x41, 0x3f, 0x01, 0x82, 0x7c, 0x00], // g
-    [0x00, 0x00, 0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0xf8, 0x84, 0x82, 0x81, 0x81, 0x81, 0x81, 0x81, 0x00, 0x00, 0x00, 0x00], // h
-    [0x00, 0x00, 0x00, 0x10, 0x10, 0x00, 0x00, 0x00, 0x30, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x38, 0x00, 0x00, 0x00, 0x00], // i
-    [0x00, 0x00, 0x00, 0x08, 0x08, 0x00, 0x00, 0x00, 0x18, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x88, 0x70], // j
-    [0x00, 0x00, 0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0x84, 0x88, 0x90, 0xe0, 0x90, 0x88, 0x84, 0x82, 0x00, 0x00, 0x00, 0x00], // k
-    [0x00, 0x00, 0x00, 0x30, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x38, 0x00, 0x00, 0x00, 0x00], // l
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfc, 0x84, 0x84, 0x84, 0x84, 0x84, 0x84, 0x84, 0x00, 0x00, 0x00], // m
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x84, 0x82, 0x81, 0x81, 0x81, 0x81, 0x81, 0x00, 0x00, 0x00], // n
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3c, 0x42, 0x81, 0x81, 0x81, 0x42, 0x3c, 0x00, 0x00, 0x00, 0x00], // o
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfc, 0x82, 0x81, 0x81, 0x81, 0x82, 0xfc, 0x80, 0x80, 0x80, 0x80], // p
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0x41, 0x81, 0x81, 0x81, 0x41, 0x3f, 0x01, 0x01, 0x01, 0x01], // q
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xbc, 0xc2, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00, 0x00], // r
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3e, 0x41, 0x80, 0x7c, 0x02, 0x02, 0x82, 0x7c, 0x00, 0x00, 0x00], // s
-    [0x00, 0x00, 0x00, 0x20, 0x20, 0x20, 0x20, 0xfc, 0x20, 0x20, 0x20, 0x20, 0x20, 0x21, 0x1e, 0x00, 0x00, 0x00, 0x00, 0x00], // t
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x82, 0x7e, 0x00, 0x00, 0x00], // u
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81, 0x81, 0x81, 0x42, 0x42, 0x24, 0x18, 0x00, 0x00, 0x00, 0x00], // v
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81, 0x81, 0x81, 0x91, 0x91, 0x91, 0xd3, 0x46, 0x00, 0x00, 0x00], // w
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81, 0x42, 0x24, 0x18, 0x24, 0x42, 0x81, 0x00, 0x00, 0x00, 0x00], // x
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x41, 0x3f, 0x01, 0x82, 0x7c], // y
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x04, 0x08, 0x10, 0x20, 0x40, 0xff, 0x00, 0x00, 0x00, 0x00], // z
-    [0x00, 0x00, 0x0e, 0x10, 0x10, 0x10, 0x10, 0x10, 0x20, 0x40, 0x20, 0x10, 0x10, 0x10, 0x10, 0x0e, 0x00, 0x00, 0x00, 0x00], // {
-    [0x00, 0x00, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x00], // |
-    [0x00, 0x00, 0x70, 0x08, 0x08, 0x08, 0x08, 0x08, 0x04, 0x02, 0x04, 0x08, 0x08, 0x08, 0x08, 0x70, 0x00, 0x00, 0x00, 0x00], // }
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x61, 0x92, 0x8c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // ~
-];
-
 /// `SetPixel(dc, x, y, colour)`: writes one pixel and answers the colour it
 /// actually stored, which on a palettised device is the nearest entry.
 fn set_pixel(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
@@ -455,11 +715,6 @@ fn set_pixel(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
 /// `CLR_INVALID`: the colour a point outside the device or an unknown DC answers.
 const CLR_INVALID: u32 = 0xffff_ffff;
 
-/// `GetPixel(dc, x, y)`: the colour of one pixel, as a `COLORREF` -- `0x00BBGGRR`
-/// whatever the surface stores, because that is what the guest reads next.
-///
-/// Cave Story samples its pixel font's mask this way: the glyph bitmap is on a
-/// surface, and the game asks the device context for each dot.
 fn get_pixel(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let dc = call.arg(0)?;
     let x = call.arg(1)? as i32;
@@ -471,6 +726,14 @@ fn get_pixel(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         Some((red, green, blue)) => Ok(Return(colour_ref(red, green, blue))),
         None => Ok(Return(CLR_INVALID)),
     }
+}
+
+fn colour_of(colour: u32) -> (u8, u8, u8) {
+    (
+        colour as u8,
+        ((colour >> 8) & 0xff) as u8,
+        ((colour >> 16) & 0xff) as u8,
+    )
 }
 
 /// `COLORREF`'s packing: blue in the high byte, then green, then red.
@@ -499,6 +762,27 @@ fn read_colours(memory: &GuestMemory, at: u32, count: usize) -> Result<Vec<[u8; 
     Ok(colours)
 }
 
+/// The colours of a `PALETTEENTRY` run: `peRed`, `peGreen`, `peBlue`, flags.
+///
+/// A `PALETTEENTRY` starts at red and a colour table's `RGBQUAD` starts at blue,
+/// so reading a palette with `read_colours` swaps the red and blue of every
+/// entry. Two writers share the one table the page decodes with -- GDI through
+/// `RealizePalette` and DirectDraw through `SetEntries` -- and when they disagree
+/// about the order the screen takes its colours from whichever wrote last, which
+/// is a picture that loses its detail without anything being drawn wrongly.
+fn read_palette_entries(memory: &GuestMemory, at: u32, count: usize) -> Result<Vec<[u8; 3]>> {
+    let mut colours = Vec::with_capacity(count);
+    for index in 0..count as u32 {
+        let entry = at + index * 4;
+        colours.push([
+            memory.read_u8(entry)?,
+            memory.read_u8(entry + 1)?,
+            memory.read_u8(entry + 2)?,
+        ]);
+    }
+    Ok(colours)
+}
+
 /// A bitmap the image carries or GDI allocated, as a device-independent bitmap.
 struct Bitmap {
     width: i32,
@@ -522,10 +806,16 @@ struct Bitmap {
 struct Font {
     height: i32,
     face: String,
+    /// Which embedded face this `LOGFONT` resolves to.
+    variant: u8,
 }
 
 /// A device context: where it draws, what is selected into it, and the text state
 /// a string is drawn with.
+///
+/// Cloning one is what `SaveDC` and `RestoreDC` are: a saved context is a copy of
+/// every field here, and restoring it puts the copy back.
+#[derive(Clone)]
 struct Dc {
     /// The DirectDraw surface this is the DC of, when it is one.
     surface: Option<u32>,
@@ -545,6 +835,21 @@ struct Dc {
     background: u32,
     /// `SetBkColor`, when a guest sets one. Windows defaults it to white.
     background_color: u32,
+    /// The palette `SelectPalette` put in this context, which `RealizePalette`
+    /// writes into the device it draws on.
+    palette: Option<u32>,
+    /// The clip rectangle, which every fill, blit and run of text is cut to. A
+    /// guest that scrolls a panel sets one and draws inside it.
+    clip: Option<[i32; 4]>,
+    /// `SetMapMode`'s mode, and the extents and origins the `Set...Ex` calls set.
+    /// Only `MM_TEXT` maps a unit to a pixel, which is the mode every game here
+    /// uses; the rest are kept so a `Get` answers what was set.
+    map_mode: i32,
+    window_ext: (i32, i32),
+    viewport_ext: (i32, i32),
+    viewport_org: (i32, i32),
+    /// `SaveDC`'s saved states, most recent last.
+    saved: Vec<Dc>,
 }
 
 impl Default for Dc {
@@ -559,7 +864,68 @@ impl Default for Dc {
             text_color: 0,
             background: 2,
             background_color: 0x00ff_ffff,
+            palette: None,
+            clip: None,
+            // `MM_TEXT`: one device unit is one pixel.
+            map_mode: 1,
+            window_ext: (1, 1),
+            viewport_ext: (1, 1),
+            viewport_org: (0, 0),
+            saved: Vec::new(),
         }
+    }
+}
+
+/// The bytes a bitmap's pixels occupy: one row of `stride_of`, `height` times.
+fn pixel_bytes(bitmap: &Bitmap) -> u64 {
+    u64::from(stride_of(bitmap.width, bitmap.bits)) * u64::from(bitmap.height.unsigned_abs())
+}
+
+/// A `LOGPALETTE` the guest created, and the entries `SetPaletteEntries` wrote.
+///
+/// A game from this era fades its screen by rewriting a run of entries and then
+/// calling `RealizePalette` -- no blit, no flip -- so the entries have to reach
+/// the display's own table, and the count that changed is what tells the page
+/// the picture moved. The lowest index written is kept because that is the run
+/// realized: a guest that sets entries 16..32 must not overwrite entry 0, which
+/// a palette created without `DDPCAPS_ALLOW256` reserves for black.
+struct Palette {
+    /// The lowest index written, or [`NO_INDEX`] when nothing was.
+    first: usize,
+    /// The entries from `first` on.
+    entries: Vec<[u8; 3]>,
+}
+
+impl Palette {
+    fn new() -> Self {
+        Self {
+            first: NO_INDEX,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Writes `colours` at `start`, growing the run at either end so a guest may
+    /// set a high index before a low one and both stay where it put them.
+    fn write(&mut self, start: usize, colours: &[[u8; 3]]) {
+        if colours.is_empty() {
+            return;
+        }
+        if self.first == NO_INDEX || start < self.first {
+            let gap = match self.first {
+                NO_INDEX => start,
+                first => first - start,
+            };
+            let mut grown = vec![[0_u8; 3]; gap];
+            grown.extend_from_slice(&self.entries);
+            self.entries = grown;
+            self.first = start;
+        }
+        let offset = start - self.first;
+        let wanted = offset + colours.len();
+        if self.entries.len() < wanted {
+            self.entries.resize(wanted, [0; 3]);
+        }
+        self.entries[offset..wanted].copy_from_slice(colours);
     }
 }
 
@@ -568,6 +934,9 @@ impl Default for Dc {
 pub struct Gdi {
     bitmaps: HashMap<u32, Bitmap>,
     fonts: HashMap<u32, Font>,
+    /// The palettes the guest created, by handle.
+    palettes: HashMap<u32, Palette>,
+    next_palette: u32,
     /// Solid brushes, by handle, holding the `COLORREF` they were created with.
     brushes: HashMap<u32, u32>,
     dcs: HashMap<u32, Dc>,
@@ -579,8 +948,99 @@ pub struct Gdi {
     /// One per session: a guest draws a string per line, and the fact does not
     /// change between them.
     font_notice: bool,
+    /// The six embedded faces, parsed on first use.
+    faces_once: std::sync::OnceLock<Faces>,
+    /// Rasterised glyphs, by face, pixel height and character. A guest draws a
+    /// string per line and the credits draw hundreds, so each glyph is built
+    /// once and blitted many times.
+    glyph_cache: HashMap<(u8, i32, char), std::rc::Rc<RasterGlyph>>,
+    /// Pixel bytes this host has handed to `CreateDIBSection` and taken back
+    /// through `DeleteObject`. A guest that holds what it loads shows the first
+    /// total growing while the second barely moves, which is the difference
+    /// between a game that needs the memory and a host that loses it.
+    pixel_bytes_created: u64,
+    pixel_bytes_released: u64,
 }
 
+
+impl Gdi {
+    /// The embedded faces, parsed on first use.
+    fn embedded_faces(&self) -> &Faces {
+        self.faces_once.get_or_init(Faces::embedded)
+    }
+
+    /// The pixels between a string's draw y and its glyphs' baselines.
+    fn ascent(&self, variant: u8, height: i32) -> i32 {
+        self.embedded_faces()
+            .get(variant)
+            .as_scaled(height.max(1) as f32)
+            .ascent()
+            .round() as i32
+    }
+
+    /// One glyph of `variant` at `height` pixels, rasterised from the embedded
+    /// face and cached: a guest draws a string per line and the credits draw
+    /// hundreds, so each glyph is built once and blitted many times. A
+    /// character the face has no outline for comes back as the font's `.notdef`.
+    fn raster(&mut self, variant: u8, height: i32, character: char) -> std::rc::Rc<RasterGlyph> {
+        let key = (variant, height, character);
+        if let Some(cached) = self.glyph_cache.get(&key) {
+            return std::rc::Rc::clone(cached);
+        }
+        let scaled = self.embedded_faces().get(variant).as_scaled(height.max(1) as f32);
+        let advance = scaled.h_advance(scaled.glyph_id(character)).round() as i32;
+        let outlined = scaled
+            .outline_glyph(scaled.scaled_glyph(character))
+            .map(|outlined| {
+                let bounds = outlined.px_bounds();
+                let left = bounds.min.x.round() as i32;
+                let top = bounds.min.y.round() as i32;
+                let width = bounds.width().ceil() as u32;
+                let height = bounds.height().ceil() as u32;
+                let mut coverage = vec![0_u8; (width * height) as usize];
+                outlined.draw(|x, y, c| {
+                    let index = (y * width + x) as usize;
+                    if index < coverage.len() {
+                        coverage[index] = (c * 255.0).round() as u8;
+                    }
+                });
+                RasterGlyph {
+                    left,
+                    top,
+                    width,
+                    height,
+                    coverage,
+                    advance,
+                }
+            });
+        let raster = outlined.unwrap_or_else(|| RasterGlyph {
+            left: 1,
+            top: 0,
+            width: 8,
+            height: height.max(8) as u32,
+            coverage: {
+                // A hollow box, which is what a rasteriser draws for a character
+                // it has no outline of rather than dropping it.
+                let rows = (height.max(8) as usize).max(8);
+                let mut box_rows = vec![0_u8; 8 * rows];
+                for row in 0..rows {
+                    for column in 0..8 {
+                        let edge =
+                            row == 0 || row == rows - 1 || column == 0 || column == 7;
+                        if edge {
+                            box_rows[row * 8 + column] = 255;
+                        }
+                    }
+                }
+                box_rows
+            },
+            advance: 12,
+        });
+        let raster = std::rc::Rc::new(raster);
+        self.glyph_cache.insert(key, std::rc::Rc::clone(&raster));
+        raster
+    }
+}
 impl Gdi {
     /// Registers a bitmap resource: its handle is the one the guest already
     /// holds, so `GetObjectA` and a blit find it by that.
@@ -663,6 +1123,25 @@ impl Gdi {
         self.bitmaps.get(&handle)
     }
 
+    /// The bytes the bitmaps this host allocated for themselves hold: the ones
+    /// `CreateDIBSection` made, since a resource bitmap's pixels are part of its
+    /// module instead. Reported when the arena runs out, because a guest that
+    /// loads pictures is the one that fills it.
+    pub fn pixel_bytes(&self) -> u64 {
+        self.bitmaps
+            .values()
+            .filter(|bitmap| bitmap.owned.is_some())
+            .map(pixel_bytes)
+            .sum()
+    }
+
+    /// The same figure as a running pair, `(created, released)`: a guest that
+    /// draws from what it loaded never releases any of it, which is why its
+    /// footprint is the sum of both decodes rather than the last one.
+    pub fn pixel_totals(&self) -> (u64, u64) {
+        (self.pixel_bytes_created, self.pixel_bytes_released)
+    }
+
     /// The DC that draws into `surface`, made on first use so a second `GetDC`
     /// answers the same handle.
     pub fn dc_for_surface(&mut self, surface: u32) -> u32 {
@@ -713,7 +1192,8 @@ fn create_font(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         .filter(|address| *address != 0)
         .and_then(|address| call.memory.read_cstr(address).ok())
         .unwrap_or_default();
-    Ok(make_font(host, call.arg(0)? as i32, face))
+    let weight = call.arg(4)? as i32;
+    Ok(make_font(host, call.arg(0)? as i32, weight, face))
 }
 
 /// `CreateFontW`: the same `LOGFONT`, with the face name as UTF-16.
@@ -724,14 +1204,18 @@ fn create_font_w(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         .filter(|address| *address != 0)
         .and_then(|address| call.wstr(address).ok())
         .unwrap_or_default();
-    Ok(make_font(host, call.arg(0)? as i32, face))
+    Ok(make_font(host, call.arg(0)? as i32, call.arg(4)? as i32, face))
 }
 
-/// The font both creators register: one face, tall what the guest asked for.
-fn make_font(host: &mut Host, height: i32, face: String) -> Action {
+/// The font both creators register: one face, tall what the guest asked for,
+/// resolved to the embedded face its name and weight name.
+fn make_font(host: &mut Host, height: i32, weight: i32, face: String) -> Action {
+    let variant = Face::of(&face, weight).0;
     let handle = FONT_HANDLE + host.gdi.next_font * 4;
     host.gdi.next_font += 1;
-    host.gdi.fonts.insert(handle, Font { height, face });
+    host.gdi
+        .fonts
+        .insert(handle, Font { height, face, variant });
     Return(handle)
 }
 
@@ -789,6 +1273,7 @@ fn delete_object(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     if let Some(bitmap) = host.gdi.bitmaps.remove(&handle) {
         if let Some(pixels) = bitmap.owned {
             host.release(pixels);
+            host.gdi.pixel_bytes_released += pixel_bytes(&bitmap);
         }
         // A context holding it as its target has nothing to draw into now, which
         // is what Windows leaves a guest with after deleting a selected bitmap.
@@ -929,6 +1414,7 @@ fn create_dib_section(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
             format!("CreateDIBSection was handed a {width}x{height} DIB that is too large")
         })?;
     let pixels = host.allocate(size, 4)?;
+    host.gdi.pixel_bytes_created += u64::from(size);
     // A palettised DIB carries one entry per colour, or as many as `biClrUsed`
     // says when the guest described fewer than the depth allows.
     let entries = if bits <= 8 {
@@ -1051,11 +1537,53 @@ pub(crate) fn ensure_window_screen(host: &mut Host) -> Result<()> {
     if width == 0 || height == 0 {
         return Ok(());
     }
-    // Truecolour, whatever depth the port's DirectDraw screen is: GDI has no
-    // palette of its own, so a palettised screen would have no entries to map the
-    // guest's colours through and every pixel would come out black.
-    let bits = 32_u8;
-    let pitch = width * 4;
+    // The depth the guest asked its display for. A palettised screen holds
+    // indices and the page colours them when the frame is shown, so a palette
+    // change reaches the pixels already on screen -- which is what a fade is, and
+    // what baking the colour at blit time cannot do. A truecolour screen holds
+    // the colours themselves and the page reads them as they stand.
+    //
+    // 24 is refused because a page reads 8, 16 or 32: a mode whose pixels are not
+    // laid out the way a page can read them would be shown wrong rather than not
+    // at all, so it falls back to 32.
+    let bits = match host.ddraw.display_depth() {
+        8 | 16 | 32 => host.ddraw.display_depth(),
+        _ => 32,
+    };
+    let pitch = width * u32::from(bits / 8);
+    let size = pitch * height;
+    let buffer = host.allocate(size, 4)?;
+    host.ddraw
+        .make_window_surface(buffer, width, height, pitch, size, bits);
+    Ok(())
+}
+
+/// Gives the window's screen the size the guest just asked its display for.
+///
+/// The window's context makes the screen on its first `GetDC`, at whatever size
+/// the window happened to be then. A guest that sets its display mode afterwards
+/// would otherwise draw a 640-wide layout into a 320-wide surface, and the part
+/// past the edge is not just missing: it is where the next row of the picture
+/// lands, which reads as a frame that has been folded in half.
+pub(crate) fn resize_window_screen(host: &mut Host, width: u32, height: u32) -> Result<()> {
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+    let Some(handle) = host.ddraw.window_surface() else {
+        // No screen yet: the first `GetDC` makes one at this size.
+        return Ok(());
+    };
+    let Some((_, on_screen_width, on_screen_height, _, _)) = host.ddraw.surface(handle) else {
+        return Ok(());
+    };
+    if on_screen_width == width && on_screen_height == height {
+        return Ok(());
+    }
+    let bits = match host.ddraw.display_depth() {
+        8 | 16 | 32 => host.ddraw.display_depth(),
+        _ => 32,
+    };
+    let pitch = width * u32::from(bits / 8);
     let size = pitch * height;
     let buffer = host.allocate(size, 4)?;
     host.ddraw
@@ -1103,7 +1631,7 @@ pub(crate) fn device_of(host: &Host, dc: u32) -> Result<Device> {
         pitch: stride_of(bitmap.width, bitmap.bits),
         bits: bitmap.bits as u8,
         bottom_up: bitmap.height > 0,
-        colours: bitmap.colours.clone(),
+        colours: bitmap_colours(host, bitmap),
         surface: None,
     })
 }
@@ -1191,6 +1719,116 @@ pub(crate) fn read_alpha(
     let row = device.buffer + device.pitch * device.row(y);
     let value = memory.read_u32(row + x as u32 * 4)?;
     Ok((value >> 24) as u8)
+}
+
+/// The value a raster operation reads from one device pixel.
+///
+/// A raster op is bitwise arithmetic on the device's own pixel values -- the
+/// palette index on an 8-bit surface, the packed 16-bit colour on a 16-bit one --
+/// so it has to see the bytes, not the colour they stand for.
+fn read_raw(memory: &GuestMemory, device: &Device, x: i32, y: i32) -> Result<Option<u32>> {
+    if !device.holds(x, y) {
+        return Ok(None);
+    }
+    let row = device.buffer + device.pitch * device.row(y);
+    let column = x as u32;
+    let value = match device.bits {
+        8 => u32::from(memory.read_u8(row + column)?),
+        16 => u32::from(memory.read_u16(row + column * 2)?),
+        24 => {
+            let at = row + column * 3;
+            u32::from(memory.read_u8(at)?)
+                | u32::from(memory.read_u8(at + 1)?) << 8
+                | u32::from(memory.read_u8(at + 2)?) << 16
+        }
+        _ => memory.read_u32(row + column * 4)?,
+    };
+    Ok(Some(value))
+}
+
+/// Writes the value a raster operation produced back into a device pixel.
+fn write_raw(
+    memory: &mut GuestMemory,
+    device: &Device,
+    x: i32,
+    y: i32,
+    value: u32,
+) -> Result<()> {
+    if !device.holds(x, y) {
+        return Ok(());
+    }
+    let row = device.buffer + device.pitch * device.row(y);
+    let column = x as u32;
+    match device.bits {
+        8 => memory.write_u8(row + column, value as u8),
+        16 => memory.write_u16(row + column * 2, value as u16),
+        24 => {
+            let at = row + column * 3;
+            memory.write_u8(at, value as u8)?;
+            memory.write_u8(at + 1, (value >> 8) as u8)?;
+            memory.write_u8(at + 2, (value >> 16) as u8)
+        }
+        _ => memory.write_u32(row + column * 4, value),
+    }
+}
+
+/// The bits one pixel of a device occupies, so an inversion cannot spill into
+/// the pixel beside it.
+fn pixel_mask(bits: u8) -> u32 {
+    match bits {
+        8 => 0xff,
+        16 => 0xffff,
+        24 => 0x00ff_ffff,
+        _ => u32::MAX,
+    }
+}
+
+/// Composes one destination pixel from one source pixel under `rop`.
+fn rop_pixel(
+    memory: &mut GuestMemory,
+    source: &Device,
+    dest: &Device,
+    rop: u32,
+    at: (i32, i32, i32, i32),
+) -> Result<()> {
+    let (source_x, source_y, dest_x, dest_y) = at;
+    let Some(from) = read_raw(memory, source, source_x, source_y)? else {
+        // A source pixel outside the device is left alone, exactly as an
+        // unkeyed copy at an edge does.
+        return Ok(());
+    };
+    if !dest.holds(dest_x, dest_y) {
+        return Ok(());
+    }
+    let onto = read_raw(memory, dest, dest_x, dest_y)?.unwrap_or(0);
+    // The op combines pixels of one format: Windows converts a source of another
+    // depth to the destination's before it runs. Combining a palette index with a
+    // 32-bit colour instead -- `0xff & 0x00ffffff` -- paints noise across the
+    // whole bitmap, and ANDing a monochrome mask with 1 clears nearly every pixel
+    // of the sprite. A 1-bit source is black and white, not the indices 0 and 1.
+    let from = if source.bits == dest.bits {
+        from
+    } else if source.bits == 1 {
+        if from != 0 { pixel_mask(dest.bits) } else { 0 }
+    } else {
+        let Some((red, green, blue)) = read_pixel(memory, source, source_x, source_y)? else {
+            return Ok(());
+        };
+        match dest.bits {
+            8 => u32::from(nearest(&dest.colours, (red, green, blue))),
+            16 => u32::from(pack_565(red, green, blue)),
+            _ => u32::from(red) << 16 | u32::from(green) << 8 | u32::from(blue),
+        }
+    };
+    let value = match rop {
+        SRCAND => from & onto,
+        SRCPAINT => from | onto,
+        SRCINVERT => from ^ onto,
+        NOTSRCCOPY => !from,
+        SRCERASE => from & !onto,
+        _ => from,
+    } & pixel_mask(dest.bits);
+    write_raw(memory, dest, dest_x, dest_y, value)
 }
 
 /// A device being drawn into, with its colour conversion memoised.
@@ -1409,6 +2047,9 @@ fn bit_blt(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
             host.gdi.dcs.get(&source_dc).map_or(false, |context| context.window),
         ));
     }
+    if width <= 0 || height <= 0 {
+        return Ok(Return(1));
+    }
     // A context that is not there is a call Windows answers FALSE, so it is
     // answered rather than stopping the machine: a guest clearing a window it has
     // no usable context for carries on.
@@ -1424,9 +2065,10 @@ fn bit_blt(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         }
         return Ok(Return(1));
     }
-    if rop != SRCCOPY {
+    if !ROP_MASKING.contains(&rop) {
         return Err(format!(
-            "BitBlt with raster op {rop:#010x}: this host copies (SRCCOPY) and fills (BLACKNESS, \
+            "BitBlt with raster op {rop:#010x}: this host copies (SRCCOPY), masks (SRCAND, \
+             SRCPAINT, SRCERASE), inverts (SRCINVERT, NOTSRCCOPY) and fills (BLACKNESS, \
              WHITENESS) and no other op"
         ));
     }
@@ -1434,6 +2076,29 @@ fn bit_blt(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         return Ok(Return(0));
     };
     if width <= 0 || height <= 0 {
+        return Ok(Return(1));
+    }
+    // A masking op is pixel arithmetic, so it never takes the row-move path.
+    if rop != SRCCOPY {
+        for row in 0..height {
+            for column in 0..width {
+                rop_pixel(
+                    call.memory,
+                    &source,
+                    &dest.device,
+                    rop,
+                    (
+                        source_x + column,
+                        source_y + row,
+                        dest_x + column,
+                        dest_y + row,
+                    ),
+                )?;
+            }
+        }
+        if let Some(surface) = dest.surface() {
+            host.ddraw.touch(surface);
+        }
         return Ok(Return(1));
     }
     // A copy between two 32-bit devices moves the alpha byte with the colour, so
@@ -1535,6 +2200,33 @@ fn pat_blt(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     Ok(Return(1))
 }
 
+/// One `StretchBlt` rectangle as a corner, a size and which ways to flip.
+///
+/// A negative size means the rectangle runs backwards from the corner given, so
+/// `w = -4` at `x = 4` covers columns `0..4`. The size comes back positive, the
+/// corner is the rectangle's left/top edge, and the flip says whether the copy
+/// reads its source that way round.
+fn oriented(x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32, bool, bool) {
+    let flip_x = width < 0;
+    let flip_y = height < 0;
+    (
+        if flip_x {
+            x.saturating_add(width)
+        } else {
+            x
+        },
+        if flip_y {
+            y.saturating_add(height)
+        } else {
+            y
+        },
+        width.unsigned_abs() as i32,
+        height.unsigned_abs() as i32,
+        flip_x,
+        flip_y,
+    )
+}
+
 /// `StretchBlt(dest, x, y, w, h, source, sx, sy, sw, sh, rop)`.
 fn stretch_blt(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     let dest_dc = call.arg(0)?;
@@ -1569,9 +2261,10 @@ fn stretch_blt(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
         }
         return Ok(Return(1));
     }
-    if rop != SRCCOPY {
+    if !ROP_MASKING.contains(&rop) {
         return Err(format!(
-            "StretchBlt with raster op {rop:#010x}: this host copies (SRCCOPY) and fills (BLACKNESS, \
+            "StretchBlt with raster op {rop:#010x}: this host copies (SRCCOPY), masks (SRCAND, \
+             SRCPAINT, SRCERASE), inverts (SRCINVERT, NOTSRCCOPY) and fills (BLACKNESS, \
              WHITENESS) and no other op"
         ));
     }
@@ -1622,12 +2315,26 @@ fn stretch_blt(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
              from {source_dc:#x} {source_w}x{source_h}"
         ));
     }
-    if dest_w <= 0 || dest_h <= 0 || source_w <= 0 || source_h <= 0 {
+    // A negative extent is a mirror, not an empty rectangle: Windows reads the
+    // rectangle as running the other way from the corner it was given, and the
+    // copy comes back flipped. That is how a sprite facing left is drawn -- the
+    // game keeps one bitmap per facing and blits it backwards -- so the two
+    // rectangles are normalised here and the flip carried into the sampling
+    // below. A negative size on *both* sides is a straight copy, because the two
+    // flips cancel, which is why the copy flips where the rectangles disagree.
+    let (dest_x, dest_y, dest_w, dest_h, dest_flip_x, dest_flip_y) =
+        oriented(dest_x, dest_y, dest_w, dest_h);
+    let (source_x, source_y, source_w, source_h, source_flip_x, source_flip_y) =
+        oriented(source_x, source_y, source_w, source_h);
+    let (mirror_x, mirror_y) = (dest_flip_x != source_flip_x, dest_flip_y != source_flip_y);
+    if dest_w == 0 || dest_h == 0 || source_w == 0 || source_h == 0 {
         return Ok(Return(1));
     }
     // At one for one, a copy between two 32-bit devices is a row move -- and a
     // menu that is composed on a surface and then put up is exactly that.
-    if source_w == dest_w
+    if !mirror_x
+        && !mirror_y
+        && source_w == dest_w
         && source_h == dest_h
         && copy_rows_32(
             call.memory,
@@ -1649,10 +2356,34 @@ fn stretch_blt(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
     // which way a device stores its rows.
     let alpha_source = source.bits == 32;
     for row in 0..dest_h {
-        let source_row = source_y + (row as i64 * i64::from(source_h) / i64::from(dest_h)) as i32;
+        let down = (row as i64 * i64::from(source_h) / i64::from(dest_h)) as i32;
+        let source_row = if mirror_y {
+            source_y + source_h - 1 - down
+        } else {
+            source_y + down
+        };
         for column in 0..dest_w {
-            let source_column =
-                source_x + (column as i64 * i64::from(source_w) / i64::from(dest_w)) as i32;
+            let across = (column as i64 * i64::from(source_w) / i64::from(dest_w)) as i32;
+            let source_column = if mirror_x {
+                source_x + source_w - 1 - across
+            } else {
+                source_x + across
+            };
+            if rop != SRCCOPY {
+                rop_pixel(
+                    call.memory,
+                    &source,
+                    &dest.device,
+                    rop,
+                    (
+                        source_column,
+                        source_row,
+                        dest_x + column,
+                        dest_y + row,
+                    ),
+                )?;
+                continue;
+            }
             let Some(colour) = read_pixel(call.memory, &source, source_column, source_row)? else {
                 continue;
             };
@@ -1707,6 +2438,753 @@ fn unpack_565(value: u16) -> (u8, u8, u8) {
         ((value >> 5) & 0x3f) as u8 * 255 / 63,
         (value & 0x1f) as u8 * 255 / 31,
     )
+}
+
+// ---- palettes, caps, clipping and map modes -------------------------------
+
+/// Whether a point falls outside the rectangle a context draws inside.
+fn clipped(clip: [i32; 4], x: i32, y: i32) -> bool {
+    x < clip[0] || y < clip[1] || x >= clip[2] || y >= clip[3]
+}
+
+/// Whether a rectangle holds no pixels at all.
+fn empty(rect: [i32; 4]) -> bool {
+    rect[2] <= rect[0] || rect[3] <= rect[1]
+}
+
+/// The overlap of two rectangles, which is empty when they miss each other.
+fn intersect(first: [i32; 4], second: [i32; 4]) -> [i32; 4] {
+    [
+        first[0].max(second[0]),
+        first[1].max(second[1]),
+        first[2].min(second[2]),
+        first[3].min(second[3]),
+    ]
+}
+
+/// A `RECT` from guest memory: four signed `LONG`s, left, top, right, bottom.
+fn read_rect(memory: &GuestMemory, at: u32) -> Result<[i32; 4]> {
+    Ok([
+        memory.read_u32(at)? as i32,
+        memory.read_u32(at + 4)? as i32,
+        memory.read_u32(at + 8)? as i32,
+        memory.read_u32(at + 12)? as i32,
+    ])
+}
+
+/// Writes the two `LONG`s of a `POINT`, `SIZE` or `SIZEL` the call hands in as an
+/// out parameter. A null one is how a guest asks not to be told.
+fn write_pair(call: &mut Call<'_>, at: u32, first: i32, second: i32) -> Result<()> {
+    if at == 0 {
+        return Ok(());
+    }
+    call.write_u32(at, first as u32)?;
+    call.write_u32(at + 4, second as u32)
+}
+
+/// The text a call points at: `count` bytes, or up to the terminator when `count`
+/// is negative, which is how GDI spells "the whole string".
+fn read_text(memory: &GuestMemory, address: u32, count: i32) -> Result<String> {
+    if count < 0 {
+        return memory.read_cstr(address);
+    }
+    let bytes = memory.read_bytes(address, count as usize)?;
+    Ok(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// The colour table a bitmap created without one indexes with: a greyscale ramp,
+/// which is what `CreateBitmap` hands a palettised bitmap it made itself.
+fn grey_table(bits: u16) -> Vec<[u8; 3]> {
+    let count = 1_usize << bits;
+    (0..count)
+        .map(|index| {
+            let level = (index * 255 / (count - 1).max(1)) as u8;
+            [level, level, level]
+        })
+        .collect()
+}
+
+/// The colour table a bitmap is read through.
+///
+/// A device-dependent bitmap holds indices into the palette of the device that
+/// drew it, so it is read through the screen's table -- the one current when it is
+/// drawn, not the one it had when it was made, because a game builds its artwork
+/// before it sets its palette. A bitmap with a table of its own keeps that table,
+/// and a monochrome one keeps black and white.
+fn bitmap_colours(host: &Host, bitmap: &Bitmap) -> Vec<[u8; 3]> {
+    if bitmap.bits <= 8 && bitmap.colours.is_empty() {
+        return host.ddraw.palette().to_vec();
+    }
+    bitmap.colours.clone()
+}
+
+/// A scaled extent: the numerator and denominator of a `Scale...ExtEx` call
+/// applied to a value. A zero on either side leaves the extent as it was, which
+/// is Windows' own answer when a guest passes nothing to scale by.
+fn scaled(value: i32, numerator: u32, denominator: u32) -> i32 {
+    if numerator == 0 || denominator == 0 {
+        return value;
+    }
+    (i64::from(value) * i64::from(numerator) / i64::from(denominator)) as i32
+}
+
+/// `CreatePalette(LOGPALETTE*)`: a palette the guest fills and then selects into
+/// a context.
+///
+/// The structure is the version word, a count, and one `PALETTEENTRY` per colour:
+/// red, green, blue, flags. That is the opposite order to a `BITMAPINFO` colour
+/// table, whose `RGBQUAD` starts at blue, so these entries are read with
+/// `read_palette_entries` rather than `read_colours`.
+fn create_palette(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let source = call.arg(0)?;
+    if source == 0 {
+        return Ok(Return(0));
+    }
+    let version = call.memory.read_u16(source)?;
+    if version != PALETTE_VERSION {
+        return Err(format!(
+            "CreatePalette was handed a {version:#06x} LOGPALETTE; this host reads the 0x0300 \
+             structure"
+        ));
+    }
+    let count = call.memory.read_u16(source + 2)?;
+    let mut palette = Palette::new();
+    let entries = read_palette_entries(call.memory, source + 4, count as usize)?;
+    palette.write(0, &entries);
+    let handle = FIRST_PALETTE + host.gdi.next_palette * 4;
+    host.gdi.next_palette += 1;
+    host.gdi.palettes.insert(handle, palette);
+    Ok(Return(handle))
+}
+
+/// `SetPaletteEntries(hpal, iStart, cEntries, entries)`: writes a run of entries,
+/// answering how many it took.
+///
+/// This is the whole of a screen fade in a game of this era: the guest rewrites
+/// the table and realizes it with no blit in between, so the entries have to stay
+/// addressable by index until `RealizePalette` copies them onto the device.
+fn set_palette_entries(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let handle = call.arg(0)?;
+    let start = call.arg(1)? as usize;
+    let count = call.arg(2)? as usize;
+    let source = call.arg(3)?;
+    let Some(palette) = host.gdi.palettes.get_mut(&handle) else {
+        return Ok(Return(0));
+    };
+    if source == 0 {
+        return Ok(Return(0));
+    }
+    let entries = read_palette_entries(call.memory, source, count)?;
+    palette.write(start, &entries);
+    Ok(Return(count as u32))
+}
+
+/// `SelectPalette(hdc, hpal, forceBackground)`: the palette the context will
+/// realize, with the one it had as the answer.
+fn select_palette(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let palette = call.arg(1)?;
+    let Some(context) = host.gdi.dcs.get_mut(&dc) else {
+        return Ok(Return(0));
+    };
+    Ok(Return(context.palette.replace(palette).unwrap_or(0)))
+}
+
+/// `RealizePalette(hdc)`: writes the selected palette onto the device the context
+/// draws on, and answers how many entries actually changed.
+///
+/// The count is what a guest watches: a fade realizes the same entries with new
+/// colours every frame, and the ones that changed are what a page has to repaint
+/// for. The write goes through the display's own table, because that is the one
+/// the presented surface is decoded with -- a palette realized nowhere else would
+/// leave the screen the colour it was.
+fn realize_palette(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let Some(handle) = host.gdi.dcs.get(&dc).and_then(|context| context.palette) else {
+        return Ok(Return(0));
+    };
+    let Some(palette) = host.gdi.palettes.get(&handle) else {
+        return Ok(Return(0));
+    };
+    if palette.first == NO_INDEX || palette.entries.is_empty() {
+        return Ok(Return(0));
+    }
+    let (first, entries) = (palette.first, palette.entries.clone());
+    let changed = host.ddraw.write_palette_entries(first as u32, &entries);
+    // Realising a palette over the surface the page shows is a frame like any
+    // other: there is no flip to count, so the touched surface is what the page
+    // notices.
+    if let Ok(device) = device_of(host, dc) {
+        if let Some(surface) = device.surface {
+            host.ddraw.touch(surface);
+        }
+    }
+    Ok(Return(changed))
+}
+
+/// `UnrealizeObject(hpal)`: nothing to do, because a palette here is the device's
+/// own table rather than one a driver has to be told to stop using.
+fn unrealize_object(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(1))
+}
+
+/// `GetDeviceCaps(hdc, index)`: what the device can do.
+///
+/// The numbers are the real ones: a game of this era asks for the depth and the
+/// colour count to decide whether it is drawing in eight bits, and asks for the
+/// resolution to lay out a screen.
+fn get_device_caps(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let index = call.arg(1)?;
+    let bits = device_of(host, dc).map_or(8, |device| device.bits);
+    let (width, height) = (host.ddraw.width(), host.ddraw.height());
+    let answer = match index {
+        HORZRES => width,
+        VERTRES => height,
+        BITSPIXEL => u32::from(bits),
+        PLANES => 1,
+        NUMCOLORS => 1_u32 << u32::from(bits).min(31),
+        RASTERCAPS => RC_BITBLT,
+        LOGPIXELSX | LOGPIXELSY => DOTS_PER_INCH,
+        SIZEPALETTE => {
+            if bits == 8 {
+                256
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    };
+    Ok(Return(answer))
+}
+
+/// `GetTextExtentPointA(hdc, string, count, size)`: the width and height a run of
+/// text occupies in the context's font.
+///
+/// The width is measured with the same glyph advances the drawing call uses, so a
+/// centred line is centred: a guest that measured with one font and drew with
+/// another would drift half a word to the right.
+fn get_text_extent_point(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let string = call.arg(1)?;
+    let count = call.arg(2)? as i32;
+    let size = call.arg(3)?;
+    let text = read_text(call.memory, string, count)?;
+    let (width, height) = text_extent(host, dc, &text);
+    write_pair(call, size, width, height)?;
+    Ok(Return(1))
+}
+
+/// `ExtTextOutA(hdc, x, y, options, rect, string, count, spacings)`.
+///
+/// Two options matter to a game of this era: `ETO_OPAQUE` fills the rectangle
+/// before drawing (which the context's opaque background mode already does for
+/// the cell) and `ETO_CLIPPED` narrows the clip for this call alone -- a scrolled
+/// list draws every row through one rectangle and expects the rows above and
+/// below it to be cut. The per-character `spacings` array is ignored: this host
+/// has one face, and a guest that passes one has already laid the text out.
+fn ext_text_out(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let (x, y) = (call.arg(1)? as i32, call.arg(2)? as i32);
+    let options = call.arg(3)?;
+    let rectangle = call.arg(4)?;
+    let string = call.arg(5)?;
+    let count = call.arg(6)? as i32;
+    let text = read_text(call.memory, string, count)?;
+    if !host.gdi.dcs.contains_key(&dc) {
+        return Ok(Return(0));
+    }
+    let previous = host.gdi.dcs.get(&dc).and_then(|context| context.clip);
+    if options & ETO_CLIPPED != 0 && rectangle != 0 {
+        let asked = read_rect(call.memory, rectangle)?;
+        let narrowed = match previous {
+            Some(clip) => intersect(clip, asked),
+            None => asked,
+        };
+        if let Some(context) = host.gdi.dcs.get_mut(&dc) {
+            context.clip = Some(narrowed);
+        }
+    }
+    draw_run(host, call.memory, dc, x, y, &text)?;
+    if let Some(context) = host.gdi.dcs.get_mut(&dc) {
+        context.clip = previous;
+    }
+    Ok(Return(1))
+}
+
+/// `GetClipBox(hdc, rect)`: the part of the device the context may draw on, and
+/// how complicated that region is.
+fn get_clip_box(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let destination = call.arg(1)?;
+    let Ok(device) = device_of(host, dc) else {
+        return Ok(Return(REGION_ERROR));
+    };
+    let clip = clip_of(host, dc, &device);
+    if destination != 0 {
+        call.write_u32(destination, clip[0] as u32)?;
+        call.write_u32(destination + 4, clip[1] as u32)?;
+        call.write_u32(destination + 8, clip[2] as u32)?;
+        call.write_u32(destination + 12, clip[3] as u32)?;
+    }
+    Ok(Return(if empty(clip) { NULLREGION } else { SIMPLEREGION }))
+}
+
+/// `IntersectClipRect(hdc, left, top, right, bottom)`: narrows the context's clip
+/// and answers the complexity of what is left.
+///
+/// This is one rectangle rather than the list of bands Windows keeps, and that is
+/// enough because every game here intersects with a plain box: a panel, or the
+/// list of a scroll. A second intersection coming out empty is what tells the
+/// guest that nothing it draws will be seen.
+fn intersect_clip_rect(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let asked = [
+        call.arg(1)? as i32,
+        call.arg(2)? as i32,
+        call.arg(3)? as i32,
+        call.arg(4)? as i32,
+    ];
+    let Ok(device) = device_of(host, dc) else {
+        return Ok(Return(REGION_ERROR));
+    };
+    let whole = [0, 0, device.width, device.height];
+    let current = host
+        .gdi
+        .dcs
+        .get(&dc)
+        .and_then(|context| context.clip)
+        .unwrap_or(whole);
+    let narrowed = intersect(current, intersect(asked, whole));
+    if let Some(context) = host.gdi.dcs.get_mut(&dc) {
+        context.clip = Some(narrowed);
+    }
+    Ok(Return(if empty(narrowed) {
+        NULLREGION
+    } else if narrowed == whole {
+        SIMPLEREGION
+    } else {
+        COMPLEXREGION
+    }))
+}
+
+/// `PtVisible(hdc, x, y)`: whether a point is inside what the context may draw on.
+fn pt_visible(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let (x, y) = (call.arg(1)? as i32, call.arg(2)? as i32);
+    let Ok(device) = device_of(host, dc) else {
+        return Ok(Return(u32::MAX));
+    };
+    let clip = clip_of(host, dc, &device);
+    Ok(Return(u32::from(!clipped(clip, x, y))))
+}
+
+/// `RectVisible(hdc, rect)`: whether any part of a rectangle would be drawn.
+fn rect_visible(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let rectangle = call.arg(1)?;
+    if rectangle == 0 {
+        return Ok(Return(0));
+    }
+    let asked = read_rect(call.memory, rectangle)?;
+    let Ok(device) = device_of(host, dc) else {
+        return Ok(Return(u32::MAX));
+    };
+    let clip = clip_of(host, dc, &device);
+    Ok(Return(u32::from(!empty(intersect(clip, asked)))))
+}
+
+/// `SaveDC(hdc)`: pushes a copy of the context's state, answering the level it is
+/// at.
+fn save_dc(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let Some(context) = host.gdi.dcs.get_mut(&dc) else {
+        return Ok(Return(0));
+    };
+    let state = context.clone();
+    context.saved.push(state);
+    Ok(Return(context.saved.len() as u32))
+}
+
+/// `RestoreDC(hdc, level)`: puts a saved state back.
+///
+/// A negative level means "the most recent", which is how a guest that saved one
+/// context around a piece of drawing calls it; a positive one names the level
+/// and discards everything saved above it, as Windows does.
+fn restore_dc(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let level = call.arg(1)? as i32;
+    let Some(context) = host.gdi.dcs.get_mut(&dc) else {
+        return Ok(Return(0));
+    };
+    if level < 0 {
+        let Some(state) = context.saved.pop() else {
+            return Ok(Return(0));
+        };
+        *context = state;
+        return Ok(Return(1));
+    }
+    let level = level as usize;
+    if level == 0 || level > context.saved.len() {
+        return Ok(Return(0));
+    }
+    let state = context.saved[level - 1].clone();
+    *context = state;
+    Ok(Return(1))
+}
+
+/// `SetMapMode(hdc, mode)`: the previous mode, or zero for a context that is not
+/// there.
+///
+/// Only `MM_TEXT` -- one device unit to one pixel -- is given meaning. The other
+/// modes are recorded and answered back so a guest that saves and restores a
+/// context sees its own value, but no call is scaled through them: every game
+/// this host runs sets `MM_TEXT` and computes its own coordinates.
+fn set_map_mode(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let mode = call.arg(1)? as i32;
+    let Some(context) = host.gdi.dcs.get_mut(&dc) else {
+        return Ok(Return(0));
+    };
+    Ok(Return(
+        std::mem::replace(&mut context.map_mode, mode) as u32
+    ))
+}
+
+/// `SetWindowExtEx(hdc, x, y, previous)`: the logical extent, with the one it had
+/// written back.
+fn set_window_ext(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let (x, y) = (call.arg(1)? as i32, call.arg(2)? as i32);
+    let previous_at = call.arg(3)?;
+    let Some(context) = host.gdi.dcs.get_mut(&dc) else {
+        return Ok(Return(0));
+    };
+    let previous = std::mem::replace(&mut context.window_ext, (x, y));
+    write_pair(call, previous_at, previous.0, previous.1)?;
+    Ok(Return(1))
+}
+
+/// `SetViewportExtEx(hdc, x, y, previous)`: the device extent, with the one it had
+/// written back.
+fn set_viewport_ext(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let (x, y) = (call.arg(1)? as i32, call.arg(2)? as i32);
+    let previous_at = call.arg(3)?;
+    let Some(context) = host.gdi.dcs.get_mut(&dc) else {
+        return Ok(Return(0));
+    };
+    let previous = std::mem::replace(&mut context.viewport_ext, (x, y));
+    write_pair(call, previous_at, previous.0, previous.1)?;
+    Ok(Return(1))
+}
+
+/// `SetViewportOrgEx(hdc, x, y, previous)`: where the viewport's origin sits, with
+/// the one it had written back.
+fn set_viewport_org(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let (x, y) = (call.arg(1)? as i32, call.arg(2)? as i32);
+    let previous_at = call.arg(3)?;
+    let Some(context) = host.gdi.dcs.get_mut(&dc) else {
+        return Ok(Return(0));
+    };
+    let previous = std::mem::replace(&mut context.viewport_org, (x, y));
+    write_pair(call, previous_at, previous.0, previous.1)?;
+    Ok(Return(1))
+}
+
+/// `OffsetViewportOrgEx(hdc, dx, dy, previous)`: moves the viewport's origin by a
+/// step, answering where it was.
+fn offset_viewport_org(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let (dx, dy) = (call.arg(1)? as i32, call.arg(2)? as i32);
+    let previous_at = call.arg(3)?;
+    let Some(context) = host.gdi.dcs.get_mut(&dc) else {
+        return Ok(Return(0));
+    };
+    let previous = context.viewport_org;
+    context.viewport_org = (
+        previous.0.saturating_add(dx),
+        previous.1.saturating_add(dy),
+    );
+    write_pair(call, previous_at, previous.0, previous.1)?;
+    Ok(Return(1))
+}
+
+/// `ScaleWindowExtEx(hdc, xn, xd, yn, yd, previous)`: multiplies the logical
+/// extent by a ratio, writing back what it was.
+fn scale_window_ext(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let (xn, xd) = (call.arg(1)?, call.arg(2)?);
+    let (yn, yd) = (call.arg(3)?, call.arg(4)?);
+    let previous_at = call.arg(5)?;
+    let Some(context) = host.gdi.dcs.get_mut(&dc) else {
+        return Ok(Return(0));
+    };
+    let previous = context.window_ext;
+    context.window_ext = (
+        scaled(previous.0, xn, xd),
+        scaled(previous.1, yn, yd),
+    );
+    write_pair(call, previous_at, previous.0, previous.1)?;
+    Ok(Return(1))
+}
+
+/// `ScaleViewportExtEx(hdc, xn, xd, yn, yd, previous)`: multiplies the device
+/// extent by a ratio, writing back what it was.
+fn scale_viewport_ext(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let (xn, xd) = (call.arg(1)?, call.arg(2)?);
+    let (yn, yd) = (call.arg(3)?, call.arg(4)?);
+    let previous_at = call.arg(5)?;
+    let Some(context) = host.gdi.dcs.get_mut(&dc) else {
+        return Ok(Return(0));
+    };
+    let previous = context.viewport_ext;
+    context.viewport_ext = (
+        scaled(previous.0, xn, xd),
+        scaled(previous.1, yn, yd),
+    );
+    write_pair(call, previous_at, previous.0, previous.1)?;
+    Ok(Return(1))
+}
+
+/// `CreateBitmap(width, height, planes, bits, pixels)`: a bitmap GDI owns.
+///
+/// A guest that builds a picture pixel by pixel -- a shadowed title, a dithered
+/// gradient -- makes one of these, writes into the pixels it is given and blits
+/// the handle. The pixels are the guest's own buffer when it passed one, and an
+/// arena block when it did not, which `DeleteObject` gives back.
+fn create_bitmap(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let width = call.arg(0)? as i32;
+    let height = call.arg(1)? as i32;
+    let planes = call.arg(2)?;
+    let bits = call.arg(3)? as u16;
+    let source = call.arg(4)?;
+    if width <= 0 || height <= 0 || planes != 1 || !matches!(bits, 1 | 4 | 8 | 16 | 24 | 32) {
+        return Ok(Return(0));
+    }
+    let size = stride_of(width, bits)
+        .checked_mul(height as u32)
+        .ok_or_else(|| format!("CreateBitmap was handed a {width}x{height} bitmap that is too large"))?;
+    let pixels = if source != 0 {
+        source
+    } else {
+        host.allocate(size, 4)?
+    };
+    let handle = FIRST_BITMAP + 0x1000 + host.gdi.next_bitmap * 4;
+    host.gdi.next_bitmap += 1;
+    host.gdi.bitmaps.insert(
+        handle,
+        Bitmap {
+            width,
+            height,
+            bits,
+            pixels,
+            // A device-dependent bitmap takes its colours from the device it is
+            // made for, so a palettised one carries no table of its own and is
+            // read through the screen's palette when it is drawn. A monochrome
+            // one is the exception: black and white is what a mask depends on.
+            colours: if bits == 1 { grey_table(1) } else { Vec::new() },
+            owned: (source == 0).then_some(pixels),
+        },
+    );
+    Ok(Return(handle))
+}
+
+/// `CreateDIBitmap(hdc, header, init, bits, info, usage)`: a bitmap described by a
+/// `BITMAPINFOHEADER`, holding either the guest's pixels or a block of its own.
+fn create_di_bitmap(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let header = call.arg(1)?;
+    let init = call.arg(2)?;
+    let source = call.arg(3)?;
+    let colours_at = call.arg(4)?;
+    if header == 0 {
+        return Ok(Return(0));
+    }
+    let header_size = call.memory.read_u32(header)?;
+    if header_size < BITMAPINFOHEADER {
+        return Err(format!(
+            "CreateDIBitmap was handed a {header_size}-byte header, which is not a \
+             BITMAPINFOHEADER"
+        ));
+    }
+    let width = call.memory.read_u32(header + 4)? as i32;
+    let height = call.memory.read_u32(header + 8)? as i32;
+    let planes = call.memory.read_u16(header + 12)?;
+    let bits = call.memory.read_u16(header + 14)?;
+    if width <= 0 || height == 0 || planes != 1 || !matches!(bits, 1 | 4 | 8 | 16 | 24 | 32) {
+        return Ok(Return(0));
+    }
+    let supplied = init & CBM_INIT != 0 && source != 0;
+    let size = stride_of(width, bits)
+        .checked_mul(height.unsigned_abs())
+        .ok_or_else(|| {
+            format!("CreateDIBitmap was handed a {width}x{height} bitmap that is too large")
+        })?;
+    let pixels = if supplied {
+        source
+    } else {
+        host.allocate(size, 4)?
+    };
+    let entries = if bits <= 8 { 1_usize << bits } else { 0 };
+    let colours = if colours_at != 0 {
+        let table = colours_at.saturating_add(header_size);
+        read_colours(call.memory, table, entries)?
+    } else if bits == 1 {
+        grey_table(1)
+    } else {
+        // No table supplied: a device-dependent bitmap, read through the
+        // screen's palette rather than a grey ramp of its own.
+        Vec::new()
+    };
+    let handle = FIRST_BITMAP + 0x1000 + host.gdi.next_bitmap * 4;
+    host.gdi.next_bitmap += 1;
+    host.gdi.bitmaps.insert(
+        handle,
+        Bitmap {
+            width,
+            height,
+            bits,
+            pixels,
+            colours,
+            owned: (!supplied).then_some(pixels),
+        },
+    );
+    Ok(Return(handle))
+}
+
+/// `StretchDIBits(dc, ...)`: copies a device-independent bitmap from ordinary
+/// memory onto a context, stretched or one pixel for one, and answers the scan
+/// lines it copied.
+///
+/// A game that mixes its own pixel work with GDI draws a whole screen this way:
+/// the bitmap is a plain buffer with a `BITMAPINFO` beside it, so the source is
+/// read as a device and each destination pixel takes the nearest source pixel --
+/// which is what a stretch to the same size is, exactly. The raster operation is
+/// the twelfth argument and is not read: only `SRCCOPY` is ever asked for here.
+fn stretch_dibits(host: &mut Host, call: &mut Call<'_>) -> Result<Action> {
+    let dc = call.arg(0)?;
+    let (dest_x, dest_y) = (call.arg(1)? as i32, call.arg(2)? as i32);
+    let (dest_width, dest_height) = (call.arg(3)? as i32, call.arg(4)? as i32);
+    let (source_x, source_y) = (call.arg(5)? as i32, call.arg(6)? as i32);
+    let (source_width, source_height) = (call.arg(7)? as i32, call.arg(8)? as i32);
+    let bits_at = call.arg(9)?;
+    let info = call.arg(10)?;
+    // A zero destination size means "the source's own": Windows reads it that
+    // way, and it is how a launcher draws the 320x240 picture it decoded one
+    // pixel for one. Refusing it dropped every frame such a guest ever drew.
+    let (dest_width, dest_height) = if dest_width <= 0 || dest_height <= 0 {
+        (source_width, source_height)
+    } else {
+        (dest_width, dest_height)
+    };
+    if dest_width <= 0 || dest_height <= 0 || source_width <= 0 || source_height <= 0 {
+        if std::env::var("SHIMKIT_LOG_GDI").is_ok() {
+            host.notice(format!(
+                "StretchDIBits refused: dest {dest_width}x{dest_height} at {dest_x},{dest_y}, \
+                 source {source_width}x{source_height} at {source_x},{source_y}"
+            ));
+        }
+        return Ok(Return(0));
+    }
+    if info == 0 || bits_at == 0 {
+        if std::env::var("SHIMKIT_LOG_GDI").is_ok() {
+            host.notice(format!(
+                "StretchDIBits refused: pixels {bits_at:#010x}, BITMAPINFO {info:#010x}"
+            ));
+        }
+        return Ok(Return(0));
+    }
+    let header_size = call.memory.read_u32(info)?;
+    if header_size < BITMAPINFOHEADER {
+        return Err(format!(
+            "StretchDIBits was handed a {header_size}-byte header, which is not a \
+             BITMAPINFOHEADER"
+        ));
+    }
+    // The stride comes from the bitmap's own width, not the rectangle being
+    // copied: a guest that copies a strip out of a wider picture still reads rows
+    // of the picture's pitch.
+    let bitmap_width = call.memory.read_u32(info + 4)? as i32;
+    let bitmap_height = call.memory.read_u32(info + 8)? as i32;
+    let bits = call.memory.read_u16(info + 14)?;
+    let entries = if bits <= 8 { 1_usize << bits } else { 0 };
+    // The device describes the whole bitmap, not the rectangle being copied.
+    // `row` turns a picture row into a memory row with the device's height, so a
+    // device sized to the rectangle rolls every row by the height difference,
+    // and `holds` would clip the columns outside the rectangle: a strip copied
+    // out of a wider picture then lands sheared instead of offset. A guest that
+    // leaves the header's size at zero falls back to the rectangle it asked for.
+    let (bitmap_width, bitmap_height) = if bitmap_width > 0 && bitmap_height != 0 {
+        (bitmap_width, bitmap_height)
+    } else {
+        (source_width, source_height)
+    };
+    let source = Device {
+        buffer: bits_at,
+        width: bitmap_width,
+        height: bitmap_height.abs(),
+        pitch: stride_of(bitmap_width, bits),
+        bits: bits as u8,
+        bottom_up: bitmap_height > 0,
+        colours: read_colours(call.memory, info + header_size, entries)?,
+        surface: None,
+    };
+    let Ok(dest) = device_of(host, dc) else {
+        if std::env::var("SHIMKIT_LOG_GDI").is_ok() {
+            host.notice(format!(
+                "StretchDIBits refused: DC {dc:#010x} does not draw on a device this host has"
+            ));
+        }
+        return Ok(Return(0));
+    };
+    host.notice(format!(
+        "DIB bits {bits_at:#010x} {bitmap_width}x{bitmap_height}x{bits} -> dc {dc:#x} at {dest_x},{dest_y} {dest_width}x{dest_height} rop {:#010x}",
+        call.arg(12)?
+    ));
+    let clip = clip_of(host, dc, &dest);
+    let mut painter = Painter::new(dest);
+    for row in 0..dest_height {
+        let target_y = dest_y.saturating_add(row);
+        let source_row = source_y.saturating_add(row.saturating_mul(source_height) / dest_height);
+        for column in 0..dest_width {
+            let target_x = dest_x.saturating_add(column);
+            if clipped(clip, target_x, target_y) {
+                continue;
+            }
+            let source_column =
+                source_x.saturating_add(column.saturating_mul(source_width) / dest_width);
+            if !source.holds(source_column, source_row) {
+                continue;
+            }
+            let Some(colour) = read_pixel(call.memory, &source, source_column, source_row)? else {
+                continue;
+            };
+            painter.put(call.memory, target_x, target_y, colour)?;
+        }
+    }
+    if let Some(surface) = painter.surface() {
+        host.ddraw.touch(surface);
+    }
+    Ok(Return(dest_height as u32))
+}
+
+/// `Escape(hdc, code, in, in, out)`: a printer or metafile escape.
+///
+/// This host has neither a printer nor a metafile driver, so every escape answers
+/// zero -- the value Windows gives for a query it cannot serve. A guest that asks
+/// `QUERYESCSUPPORT` therefore learns the escape is unsupported, which is the
+/// truth, instead of being told yes and then handed nothing.
+fn escape(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(0))
+}
+
+/// `GdiFlush()`: there is no batch to flush, because every drawing call here has
+/// already written the pixels the page reads. A guest that flushes is waiting for
+/// its own drawing to be visible, which it is.
+fn gdi_flush(_: &mut Host, _: &mut Call<'_>) -> Result<Action> {
+    Ok(Return(1))
 }
 
 /// The palette entry closest to `colour`, by squared distance, so a blit or a
@@ -1770,6 +3248,7 @@ mod tests {
             Font {
                 height: -20,
                 face: "Courier New".to_string(),
+                variant: Face::MONO,
             },
         );
         let args = STACK_BASE + 0x4000;
@@ -2336,6 +3815,63 @@ mod tests {
     }
 
     #[test]
+    fn a_stretch_dibits_reads_a_strip_from_the_rows_of_the_whole_bitmap() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let window = window_dc(&mut host, &mut memory);
+        let screen = host
+            .ddraw
+            .window_surface()
+            .expect("GetDC gave the window a screen");
+        // A 4x3 bottom-up 32-bit bitmap, which is what a resource sprite is. The
+        // device the copy reads through describes the whole bitmap; sizing it to
+        // the rectangle instead rolls every row by the height difference and
+        // clips the columns outside the strip, so the sprite arrives sheared.
+        let (_, pixels) = dib(&mut host, &mut memory, 4, 3, 32, &[]);
+        let info = STACK_BASE + 0x6000;
+        // One distinct word per picture pixel: red from the picture row, green
+        // from the column.
+        let picture = |row: u32, column: u32| {
+            ((row + 1) << 20) | ((column + 1) << 8) | 0x11
+        };
+        for row in 0..3 {
+            for column in 0..4 {
+                // Bottom-up: the first row in memory is the last picture row.
+                memory
+                    .write_u32(pixels + (2 - row) * 16 + column * 4, picture(row, column))
+                    .unwrap();
+            }
+        }
+        // Copy picture rows 1..3, columns 1..3 into the window's screen.
+        assert_eq!(
+            dispatch(
+                &mut host,
+                &mut memory,
+                "StretchDIBits",
+                &[window, 0, 0, 2, 2, 1, 1, 2, 2, pixels, info, 0, SRCCOPY]
+            )
+            .unwrap(),
+            Return(2)
+        );
+        let (buffer, _, _) = host.ddraw.framebuffer().expect("the guest has a screen");
+        let (_, _, _, pitch, _) = host.ddraw.surface(screen).expect("the screen is a surface");
+        let onscreen = |x: u32, y: u32| memory.read_u32(buffer + pitch * y + x * 4).unwrap();
+        assert_eq!(
+            onscreen(0, 0),
+            picture(1, 1),
+            "the strip's first pixel is picture row 1, column 1"
+        );
+        assert_eq!(onscreen(1, 0), picture(1, 2));
+        assert_eq!(
+            onscreen(0, 1),
+            picture(2, 1),
+            "a second row of the strip is the next picture row, not a rolled one"
+        );
+        assert_eq!(onscreen(1, 1), picture(2, 2));
+    }
+
+    #[test]
     fn a_bit_blt_copies_one_dib_into_another() {
         let Some((mut host, mut memory)) = machine() else {
             return;
@@ -2407,6 +3943,253 @@ mod tests {
         assert_eq!(index_at(&host, &memory, surface, 0, 1), 0, "nothing left of the blit");
         // Putting a menu on the surface the page shows is a frame.
         assert!(host.ddraw.content_revision() > 0);
+    }
+
+    #[test]
+    fn a_masked_sprite_composes_on_a_palettised_bitmap() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        // Hercules and its neighbours draw on 8-bit bitmaps, where a raster op
+        // combines palette indices rather than colours: the background is index
+        // 2, the mask is 0 where the sprite covers and 0xff elsewhere, and the
+        // image holds its own index there.
+        let table = [[0, 0, 0], [255, 255, 255]];
+        let (dest_handle, dest_pixels) = dib(&mut host, &mut memory, 4, -1, 8, &table);
+        for index in 0..4u32 {
+            memory.write_u8(dest_pixels + index, 2).unwrap();
+        }
+        let dest = context(&mut host, &mut memory, dest_handle);
+        let (mask_handle, mask_pixels) = dib(&mut host, &mut memory, 4, -1, 8, &table);
+        for (index, value) in [0u8, 0, 0xff, 0xff].iter().enumerate() {
+            memory.write_u8(mask_pixels + index as u32, *value).unwrap();
+        }
+        let mask = context(&mut host, &mut memory, mask_handle);
+        assert_eq!(
+            dispatch(
+                &mut host,
+                &mut memory,
+                "BitBlt",
+                &[dest, 0, 0, 4, 1, mask, 0, 0, SRCAND]
+            )
+            .unwrap(),
+            Return(1)
+        );
+        let (image_handle, image_pixels) = dib(&mut host, &mut memory, 4, -1, 8, &table);
+        for (index, value) in [1u8, 1, 0, 0].iter().enumerate() {
+            memory.write_u8(image_pixels + index as u32, *value).unwrap();
+        }
+        let image = context(&mut host, &mut memory, image_handle);
+        assert_eq!(
+            dispatch(
+                &mut host,
+                &mut memory,
+                "BitBlt",
+                &[dest, 0, 0, 4, 1, image, 0, 0, SRCPAINT]
+            )
+            .unwrap(),
+            Return(1)
+        );
+        assert_eq!(memory.read_u8(dest_pixels).unwrap(), 1, "the sprite's index");
+        assert_eq!(memory.read_u8(dest_pixels + 1).unwrap(), 1);
+        assert_eq!(
+            memory.read_u8(dest_pixels + 2).unwrap(),
+            2,
+            "the background index outside the mask survives"
+        );
+        assert_eq!(memory.read_u8(dest_pixels + 3).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_palettised_mask_reaches_a_truecolour_destination_as_colour() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        // The screen: four white pixels.
+        let (dest_handle, dest_pixels) = dib(&mut host, &mut memory, 4, -1, 32, &[]);
+        for index in 0..4u32 {
+            memory.write_u32(dest_pixels + index * 4, 0x00ff_ffff).unwrap();
+        }
+        let dest = context(&mut host, &mut memory, dest_handle);
+        // An 8-bit mask whose table says index 1 is white: black where the sprite
+        // covers, white where it is transparent. Its indices must reach the op as
+        // colours, not as the numbers 0 and 1.
+        let table = [[0, 0, 0], [255, 255, 255]];
+        let (mask_handle, mask_pixels) = dib(&mut host, &mut memory, 4, -1, 8, &table);
+        for (index, value) in [0u8, 0, 1, 1].iter().enumerate() {
+            memory.write_u8(mask_pixels + index as u32, *value).unwrap();
+        }
+        let mask = context(&mut host, &mut memory, mask_handle);
+        assert_eq!(
+            dispatch(
+                &mut host,
+                &mut memory,
+                "BitBlt",
+                &[dest, 0, 0, 4, 1, mask, 0, 0, SRCAND]
+            )
+            .unwrap(),
+            Return(1)
+        );
+        assert_eq!(memory.read_u32(dest_pixels).unwrap(), 0, "the sprite's pixels are cleared");
+        assert_eq!(
+            memory.read_u32(dest_pixels + 8).unwrap(),
+            0x00ff_ffff,
+            "the transparent half stays white, not 0x00000001"
+        );
+        assert_eq!(memory.read_u32(dest_pixels + 12).unwrap(), 0x00ff_ffff);
+    }
+
+    #[test]
+    fn a_monochrome_mask_keeps_the_background_outside_the_sprite() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        // Four white pixels of background, and a 1-bit mask whose first two
+        // pixels are black (the sprite) and last two white (transparent).
+        let (dest_handle, dest_pixels) = dib(&mut host, &mut memory, 4, -1, 32, &[]);
+        for index in 0..4u32 {
+            memory.write_u32(dest_pixels + index * 4, 0x00ff_ffff).unwrap();
+        }
+        let dest = context(&mut host, &mut memory, dest_handle);
+        let (mask_handle, mask_pixels) = dib(&mut host, &mut memory, 4, -1, 1, &[]);
+        memory.write_u8(mask_pixels, 0b0011_0000).unwrap();
+        let mask = context(&mut host, &mut memory, mask_handle);
+        assert_eq!(
+            dispatch(
+                &mut host,
+                &mut memory,
+                "BitBlt",
+                &[dest, 0, 0, 4, 1, mask, 0, 0, SRCAND]
+            )
+            .unwrap(),
+            Return(1)
+        );
+        // Every pixel outside the mask must still be white: a monochrome source
+        // that reaches the op as 0 and 1 would leave 0x00000001 instead.
+        assert_eq!(memory.read_u32(dest_pixels + 8).unwrap(), 0x00ff_ffff);
+        assert_eq!(memory.read_u32(dest_pixels + 12).unwrap(), 0x00ff_ffff);
+        assert_eq!(memory.read_u32(dest_pixels).unwrap(), 0, "the mask cleared the sprite's pixels");
+    }
+
+    #[test]
+    fn a_gdi_sprite_is_masked_with_srcand_then_srcpaint() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        // The background: four white pixels.
+        let (dest_handle, dest_pixels) = dib(&mut host, &mut memory, 4, -1, 32, &[]);
+        for index in 0..4u32 {
+            memory.write_u32(dest_pixels + index * 4, 0x00ff_ffff).unwrap();
+        }
+        let dest = context(&mut host, &mut memory, dest_handle);
+        // The mask: black where the sprite covers, white where it does not.
+        let (mask_handle, mask_pixels) = dib(&mut host, &mut memory, 4, -1, 32, &[]);
+        for (index, value) in [0u32, 0, 0x00ff_ffff, 0x00ff_ffff].iter().enumerate() {
+            memory
+                .write_u32(mask_pixels + index as u32 * 4, *value)
+                .unwrap();
+        }
+        let mask = context(&mut host, &mut memory, mask_handle);
+        assert_eq!(
+            dispatch(
+                &mut host,
+                &mut memory,
+                "BitBlt",
+                &[dest, 0, 0, 4, 1, mask, 0, 0, SRCAND]
+            )
+            .unwrap(),
+            Return(1),
+            "the mask is a raster op this host performs"
+        );
+        // The image: the sprite's two pixels in red, nothing under the rest.
+        let (image_handle, image_pixels) = dib(&mut host, &mut memory, 4, -1, 32, &[]);
+        for (index, value) in [0x00ff_0000u32, 0x00ff_0000, 0, 0].iter().enumerate() {
+            memory
+                .write_u32(image_pixels + index as u32 * 4, *value)
+                .unwrap();
+        }
+        let image = context(&mut host, &mut memory, image_handle);
+        assert_eq!(
+            dispatch(
+                &mut host,
+                &mut memory,
+                "BitBlt",
+                &[dest, 0, 0, 4, 1, image, 0, 0, SRCPAINT]
+            )
+            .unwrap(),
+            Return(1)
+        );
+        assert_eq!(
+            memory.read_u32(dest_pixels).unwrap(),
+            0x00ff_0000,
+            "the sprite's own pixels are the image"
+        );
+        assert_eq!(memory.read_u32(dest_pixels + 4).unwrap(), 0x00ff_0000);
+        assert_eq!(
+            memory.read_u32(dest_pixels + 8).unwrap(),
+            0x00ff_ffff,
+            "the background outside the mask is untouched"
+        );
+        assert_eq!(memory.read_u32(dest_pixels + 12).unwrap(), 0x00ff_ffff);
+    }
+
+    #[test]
+    fn a_palettised_bitmap_reads_through_the_screen_palette() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        let window = window_dc(&mut host, &mut memory);
+        // A 256-entry palette whose fifth entry no grey ramp can produce.
+        let log = STACK_BASE + 0x7000;
+        memory.write_u16(log, 0x0300).unwrap();
+        memory.write_u16(log + 2, 256).unwrap();
+        for index in 0..256u32 {
+            memory
+                .write_bytes(log + 4 + index * 4, &[0x21, 0x43, 0x65, 0])
+                .unwrap();
+        }
+        memory
+            .write_bytes(log + 4 + 5 * 4, &[0x40, 0x80, 0xc0, 0])
+            .unwrap();
+        let Return(palette) = dispatch(&mut host, &mut memory, "CreatePalette", &[log]).unwrap()
+        else {
+            panic!("CreatePalette answers with a handle");
+        };
+        dispatch(
+            &mut host,
+            &mut memory,
+            "SelectPalette",
+            &[window, palette, 0],
+        )
+        .unwrap();
+        dispatch(&mut host, &mut memory, "RealizePalette", &[window]).unwrap();
+        assert_eq!(
+            host.ddraw.palette()[5],
+            [0x40, 0x80, 0xc0],
+            "the realized palette is the one the screen reads through"
+        );
+
+        // A palettised bitmap the guest makes for itself holds indices, not
+        // colours: Windows gives it the device's palette, and reading it through
+        // a grey ramp paints every sprite as a flat grey silhouette.
+        let Return(bitmap) =
+            dispatch(&mut host, &mut memory, "CreateBitmap", &[1, 1, 1, 8, 0]).unwrap()
+        else {
+            panic!("CreateBitmap answers with a handle");
+        };
+        assert!(
+            host.gdi.bitmaps.get(&bitmap).unwrap().colours.is_empty(),
+            "a device-dependent bitmap has no table of its own"
+        );
+        let pixels = host.gdi.bitmaps.get(&bitmap).unwrap().pixels;
+        memory.write_u8(pixels, 5).unwrap();
+        let dc = context(&mut host, &mut memory, bitmap);
+        let device = device_of(&host, dc).unwrap();
+        assert_eq!(
+            read_pixel(&memory, &device, 0, 0).unwrap(),
+            Some((0x40, 0x80, 0xc0)),
+            "index 5 reads through the screen palette"
+        );
     }
 
     #[test]
@@ -2618,6 +4401,56 @@ mod tests {
         assert_eq!(read(13, 7), 0x00ff_ffff);
         // Text into a DIB is not a frame: the page shows nothing yet.
         assert_eq!(host.ddraw.content_revision(), 0);
+    }
+
+    #[test]
+    fn a_negative_stretch_extent_mirrors_the_copy() {
+        let Some((mut host, mut memory)) = machine() else {
+            return;
+        };
+        // The shape a sprite facing left takes: one bitmap, blitted backwards.
+        let (source, source_pixels) = dib(&mut host, &mut memory, 4, -1, 32, &[]);
+        let (target, target_pixels) = dib(&mut host, &mut memory, 8, -1, 32, &[]);
+        for column in 0..4 {
+            memory
+                .write_u32(source_pixels + column * 4, 0x00ff_0000 | (column + 1))
+                .unwrap();
+        }
+        let source_dc = context(&mut host, &mut memory, source);
+        let target_dc = context(&mut host, &mut memory, target);
+        let read = |memory: &GuestMemory, column: u32| memory.read_u32(target_pixels + column * 4).unwrap();
+
+        // `w = -4` at `x = 4` runs leftwards to column 0 and comes back flipped.
+        assert_eq!(
+            dispatch(
+                &mut host,
+                &mut memory,
+                "StretchBlt",
+                &[target_dc, 4, 0, (-4_i32) as u32, 1, source_dc, 0, 0, 4, 1, SRCCOPY]
+            )
+            .unwrap(),
+            Return(1)
+        );
+        assert_eq!(read(&memory, 0), 0x00ff_0004, "the rightmost source pixel first");
+        assert_eq!(read(&memory, 3), 0x00ff_0001);
+        assert_eq!(read(&memory, 4), 0, "nothing is drawn past the corner given");
+
+        // A negative source extent flips too, so the two cancel: a straight copy.
+        for column in 0..4 {
+            memory.write_u32(target_pixels + column * 4, 0).unwrap();
+        }
+        assert_eq!(
+            dispatch(
+                &mut host,
+                &mut memory,
+                "StretchBlt",
+                &[target_dc, 4, 0, (-4_i32) as u32, 1, source_dc, 4, 0, (-4_i32) as u32, 1, SRCCOPY]
+            )
+            .unwrap(),
+            Return(1)
+        );
+        assert_eq!(read(&memory, 0), 0x00ff_0001, "two flips are no flip");
+        assert_eq!(read(&memory, 3), 0x00ff_0004);
     }
 
     #[test]

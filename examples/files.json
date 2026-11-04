@@ -1,0 +1,41 @@
+{
+  "kind": "shim",
+  "dll": "KERNEL32.dll",
+  "target": "madagascar",
+  "notes": "The file half of the Madagascar (2005) port. The game streams 253 MB of serialized levels through a pointer table it fills at startup: on NT it binds the real KERNEL32 async exports, and on Win9x it falls back to its own worker thread and queue -- which is the record of when its completions are allowed to run.",
+  "functions": [
+    {
+      "name": "ReadFileEx",
+      "args": [
+        "hFile: u32",
+        "lpBuffer: *mut u8",
+        "nNumberOfBytesToRead: u32",
+        "lpOverlapped: *mut u32",
+        "lpCompletionRoutine: u32"
+      ],
+      "returns": "u32",
+      "arg_bytes": 20,
+      "stub": {
+        "kind": "custom",
+        "body": "read into the buffer at the OVERLAPPED offset now, record Internal/InternalHigh, signal the OVERLAPPED event, queue the routine for the asking thread"
+      },
+      "description": "The streaming loader's async read. The bytes land now (host memory, no latency to hide); the completion routine is queued and the session runs it on the asking thread at its next switch point, the way a timer callback runs. The game resolves ReadFileEx through a pointer table it binds at startup (0x51dc80: real exports on NT 5+, its own 0x51d860 fallback with a worker thread on 9x), and its 9x worker delivers completions from a worker context, so switch-point delivery is inside the behaviour the game was written against. The game imports no alertable wait (no SleepEx, no *ObjectEx), so the strict alertable-wait rule would mean the routine never runs at all.",
+      "evidence": "import table (KERNEL32!ReadFileEx at IAT 0x5CA0B0); call through the bound pointer table 0x60D820 set at 0x51DCF5; the 9x fallback 0x51D860 queues to the worker at 0x51CB70, which performs plain ReadFile and delivers completions itself; first probe run reached the loading screen with no missing-shim stop"
+    },
+    {
+      "name": "ReadFile",
+      "args": [
+        "hFile: u32",
+        "lpBuffer: *mut u8",
+        "nNumberOfBytesToRead: u32",
+        "lpNumberOfBytesRead: *mut u32",
+        "lpOverlapped: *mut u32"
+      ],
+      "returns": "u32",
+      "arg_bytes": 20,
+      "stub": { "kind": "custom", "body": "already implemented in files.rs" },
+      "description": "The worker thread's own read (0x51CBE2 calls it through 0x60D81C), and the streaming loader's synchronous path: 4-32 KB chunks out of LEVELS\\Title.stream on the loading screen.",
+      "evidence": "trace: SHIMKIT_LOG_FILES shows handle 0x60020 read 29 chunks of 4-32 KB while the loading screen ran"
+    }
+  ]
+}

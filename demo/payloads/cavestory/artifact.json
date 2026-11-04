@@ -21,8 +21,9 @@
     "version": "0.1.0"
   },
   "module": {
-    "bytes": 1262368,
-    "name": "host_wasm.wasm"
+    "name": "host_wasm.wasm",
+    "bytes": 1979399,
+    "build": "8cc3044a859d06a0"
   },
   "screen": {
     "depth": 8,
