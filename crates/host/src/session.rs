@@ -77,6 +77,10 @@ pub struct Session {
     /// The decoded-instruction cache, which lives beside the CPU so the step
     /// loop can read an instruction it has already decoded without copying it.
     pub(crate) decodes: cpu::Decodes,
+    /// Runs of decoded instructions, which is what the step loop actually
+    /// executes: the per-instruction work around a step -- the thread check, the
+    /// native-replacement lookup, the decode-cache probe -- is paid once per run.
+    pub(crate) blocks: cpu::Blocks,
     pub host: Host,
     /// Import calls the guest made, and how many of them a shim answered.
     pub host_calls: u64,
@@ -311,6 +315,9 @@ impl Session {
             memory,
             cpu,
             decodes: cpu::Decodes::new(),
+            // The target's native replacements are the only addresses a run must
+            // never cross: each is code the host runs in place of the guest's.
+            blocks: cpu::Blocks::new(target.hle),
             host,
             host_calls: 0,
             host_returns: 0,
@@ -562,7 +569,16 @@ impl Session {
     /// call or a fault.
     pub fn run(&mut self, budget: u32) -> Outcome {
         self.seed_registry_from_payload();
+        // `budget` is instructions, and one trip round this loop now retires a
+        // whole run of them, so the loop counts what it has retired rather than
+        // how many times it has gone round. The `for` stays as the hard bound: a
+        // path that gives the CPU away without retiring anything must not spin
+        // here for ever.
+        let mut left = budget;
         for _ in 0..budget {
+            if left == 0 {
+                break;
+            }
             // The thread the CPU is on may have parked itself at the end of the
             // host call that just completed, or given way to another one, so a
             // thread that can run takes over here. With one thread this is one
@@ -588,7 +604,15 @@ impl Session {
             // Both trampolines live above the host-call base, and no guest code
             // does, so one compare keeps the two checks out of the common path.
             let eip = self.cpu.regs.eip;
-            if self.memory.watching() {
+            // Both of these are per-instruction observations, and a run would
+            // step over the instructions inside it, so an armed watch puts the
+            // loop back on the one-instruction path while it is armed. Nothing
+            // else in this loop can change between two instructions of a run:
+            // a thread switch, a timer, a native replacement and a host stub all
+            // need a branch or a call to reach, and a run stops after every one
+            // of those.
+            let watching = self.memory.watching();
+            if watching {
                 self.memory.set_pc(eip, self.cpu.regs.esp);
             }
             if self.watch == Some(eip) {
@@ -625,9 +649,7 @@ impl Session {
                         self.host.guest_result = result;
                         self.host.resumed = true;
                         self.note_host_time();
-                        self.note_host_time();
-            self.note_host_time();
-        self.host.this = self.cpu.regs.ecx;
+                        self.host.this = self.cpu.regs.ecx;
                         let mut arguments = shim::Call {
                             memory: &mut self.memory,
                             args: frame.args,
@@ -801,10 +823,36 @@ impl Session {
                 }
             }
             self.step_pc = self.cpu.regs.eip;
-            match cpu::step(&mut self.memory, &mut self.cpu, &mut self.decodes) {
+            let before = self.cpu.instructions;
+            let single = watching || self.watch.is_some();
+            let answer = if single {
+                cpu::step(&mut self.memory, &mut self.cpu, &mut self.decodes)
+            } else {
+                cpu::block::step(
+                    &mut self.memory,
+                    &mut self.cpu,
+                    &mut self.decodes,
+                    &mut self.blocks,
+                )
+            };
+            // A step that retired nothing -- a call through a host stub is the
+            // common one -- still costs the budget one instruction, or a loop of
+            // them would never end.
+            left = left.saturating_sub((self.cpu.instructions - before).max(1) as u32);
+            match answer {
                 Ok(Step::Continue) => {}
                 Ok(Step::Halt) => return Outcome::Halted,
-                Ok(Step::HostCall(call)) => {
+                Ok(Step::HostCall) => {
+                    // `step` leaves the call on the CPU rather than returning it,
+                    // because carrying it in `Step` widened the answer of every
+                    // instruction for the sake of the rare one. A `HostCall` with
+                    // nothing there is an executor bug, not a guest fault, and it
+                    // says so instead of serving a stale call.
+                    let Some(call) = self.cpu.call.take() else {
+                        return Outcome::Fault(
+                            "the executor reported a host call with none pending".to_string(),
+                        );
+                    };
                     self.host_calls += 1;
                     match self.serve(&call) {
                         Ok(Some(Served::Return(value))) => {
@@ -826,7 +874,15 @@ impl Session {
                         Err(error) => return self.fault(error),
                     }
                 }
-                Err(error) => return self.fault(error),
+                Err(error) => {
+                    // A run that faulted left the program counter on the
+                    // instruction that did it, so the fault names that
+                    // instruction instead of the start of the run.
+                    if !single {
+                        self.step_pc = self.cpu.regs.eip;
+                    }
+                    return self.fault(error);
+                }
             }
         }
         Outcome::Steps
@@ -1041,8 +1097,7 @@ impl Session {
                 ));
             };
             self.note_host_time();
-            self.note_host_time();
-        self.host.this = self.cpu.regs.ecx;
+            self.host.this = self.cpu.regs.ecx;
             let mut arguments = shim::Call {
                 memory: &mut self.memory,
                 args: call.args,
@@ -1069,8 +1124,7 @@ impl Session {
         if let Some((kind, method)) = call.thunk {
             let arg_bytes = crate::thunks::arg_bytes(kind, method);
             self.note_host_time();
-            self.note_host_time();
-        self.host.this = self.cpu.regs.ecx;
+            self.host.this = self.cpu.regs.ecx;
             let mut arguments = shim::Call {
                 memory: &mut self.memory,
                 args: call.args,

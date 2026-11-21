@@ -22,8 +22,8 @@
   },
   "module": {
     "name": "host_wasm.wasm",
-    "bytes": 1979399,
-    "build": "8cc3044a859d06a0"
+    "bytes": 1755159,
+    "build": "95192261a4c61955"
   },
   "screen": {
     "depth": 8,

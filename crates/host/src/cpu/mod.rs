@@ -21,9 +21,11 @@
 use crate::memory::GuestMemory;
 use crate::Result;
 
+pub mod block;
 pub mod decode;
 pub mod exec;
 
+pub use block::Blocks;
 pub use decode::decode;
 pub use exec::execute;
 
@@ -516,6 +518,7 @@ impl Registers {
         self.get(index) as u8
     }
 
+    #[inline]
     pub fn set_byte(&mut self, index: u8, value: u8) {
         let register = self.get(index) & !0xff;
         self.set(index, register | u32::from(value));
@@ -858,6 +861,13 @@ pub struct Cpu {
     /// stub. Copied in because a table is a `&'static` slice.
     pub table: crate::dispatch::Table,
     pub instructions: u64,
+    /// The call [`Step::HostCall`] reported, if the last instruction was one.
+    ///
+    /// It lives here rather than in [`Step`] so that the common `Continue` is a
+    /// one-byte answer instead of a forty-eight-byte one. A step that is not a
+    /// host call leaves this untouched, so a caller that ignores it cannot read
+    /// a stale call by accident -- only [`Step::HostCall`] says to look.
+    pub call: Option<HostCall>,
 }
 
 impl Cpu {
@@ -875,6 +885,7 @@ impl Cpu {
             fpu: Fpu::default(),
             table,
             instructions: 0,
+            call: None,
         }
     }
 
@@ -919,11 +930,18 @@ pub struct HostCall {
     pub arg_bytes: Option<u32>,
 }
 
+/// What one instruction did.
+///
+/// `HostCall` carries no payload on purpose. The call is about 48 bytes, and
+/// returning it by value made *every* instruction -- including the 99.99% that
+/// simply continue -- pay for a return slot wide enough to hold it, written by
+/// the executor and read again by the step loop. The call is left in
+/// [`Cpu::call`] instead, and only the host-call path ever looks at it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     Continue,
     Halt,
-    HostCall(HostCall),
+    HostCall,
 }
 
 /// Decodes and executes one instruction.
@@ -952,7 +970,7 @@ pub fn step(memory: &mut GuestMemory, cpu: &mut Cpu, decodes: &mut Decodes) -> R
             // The pop is the binding's to declare, so the session does it when it
             // knows which binding this is; nothing is popped here.
             cpu.regs.esp = args;
-            return Ok(Step::HostCall(HostCall {
+            cpu.call = Some(HostCall {
                 slot: 0,
                 thunk: None,
                 proc: Some(index),
@@ -961,7 +979,8 @@ pub fn step(memory: &mut GuestMemory, cpu: &mut Cpu, decodes: &mut Decodes) -> R
                 args,
                 esp: args,
                 arg_bytes: None,
-            }));
+            });
+            return Ok(Step::HostCall);
         }
         if let Some(slot) = host_slot_at(pc, cpu.table) {
             // The guest reached a host stub indirectly (`call ebp` after loading
@@ -973,7 +992,7 @@ pub fn step(memory: &mut GuestMemory, cpu: &mut Cpu, decodes: &mut Decodes) -> R
             let arg_bytes = entry.arg_bytes();
             cpu.regs.eip = resume;
             cpu.regs.esp = args.wrapping_add(arg_bytes.unwrap_or(0));
-            return Ok(Step::HostCall(HostCall {
+            cpu.call = Some(HostCall {
                 slot,
                 thunk: None,
                 proc: None,
@@ -982,7 +1001,8 @@ pub fn step(memory: &mut GuestMemory, cpu: &mut Cpu, decodes: &mut Decodes) -> R
                 args,
                 esp: cpu.regs.esp,
                 arg_bytes,
-            }));
+            });
+            return Ok(Step::HostCall);
         }
         if let Some((kind, method)) = crate::thunks::at(pc) {
             // A call through a vtable the host filled in: the return address is on
@@ -992,7 +1012,7 @@ pub fn step(memory: &mut GuestMemory, cpu: &mut Cpu, decodes: &mut Decodes) -> R
             let arg_bytes = crate::thunks::arg_bytes(kind, method);
             cpu.regs.eip = resume;
             cpu.regs.esp = args.wrapping_add(arg_bytes);
-            return Ok(Step::HostCall(HostCall {
+            cpu.call = Some(HostCall {
                 slot: 0,
                 thunk: Some((kind, method)),
                 proc: None,
@@ -1001,7 +1021,8 @@ pub fn step(memory: &mut GuestMemory, cpu: &mut Cpu, decodes: &mut Decodes) -> R
                 args,
                 esp: cpu.regs.esp,
                 arg_bytes: Some(arg_bytes),
-            }));
+            });
+            return Ok(Step::HostCall);
         }
     }
     let instruction = decodes.fetch(memory, pc)?;
@@ -1026,7 +1047,8 @@ mod tests {
         // The third name the host resolved, called through the guest's own table.
         cpu.regs.eip = PROC_BASE + 8;
         match step(&mut memory, &mut cpu, &mut decodes).expect("a resolved name is a call") {
-            Step::HostCall(call) => {
+            Step::HostCall => {
+                let call = cpu.call.expect("a host call leaves its call on the cpu");
                 assert_eq!(call.proc, Some(2));
                 assert_eq!(call.thunk, None);
                 assert_eq!(call.return_address, 0x0040_1234);
@@ -1154,7 +1176,8 @@ mod tests {
         cpu.regs.esp = stack;
 
         match step(&mut memory, &mut cpu, &mut decodes).expect("host call") {
-            Step::HostCall(call) => {
+            Step::HostCall => {
+                let call = cpu.call.expect("a host call leaves its call on the cpu");
                 assert_eq!(call.slot, slot);
                 assert_eq!(call.return_address, 0x0040_1234);
                 assert_eq!(call.args, stack + 4);

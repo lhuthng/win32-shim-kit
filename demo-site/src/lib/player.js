@@ -316,9 +316,11 @@ export async function boot({
   host.wh_set_screen(screen.width, screen.height, screen.depth);
 
   // A payload says which Windows it wants to be: a launcher that refuses
-  // anything newer than Windows 98 needs this before it reads the platform.
+  // anything newer than Windows 98 needs this before it reads the platform. A
+  // module older than the export answers with its own default instead, which
+  // is the same platform the bake recorded unless someone overrode it.
   const windows = artifact.windows;
-  if (windows) {
+  if (windows && typeof host.wh_set_windows === "function") {
     host.wh_set_windows(windows.major, windows.minor, windows.build, windows.platform);
   }
 

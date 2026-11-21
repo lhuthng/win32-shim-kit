@@ -131,6 +131,7 @@ fn main() -> ExitCode {
         name: "credits",
         exe_name: leak(&name),
         screen: (640, 480, 8),
+        windows: host::target::Windows::XP,
         table: table_for(&image),
         shims: host::shim::TABLES,
         provided_files: &[],

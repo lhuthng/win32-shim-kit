@@ -17,3 +17,6 @@ dist/
 # serves them to this machine only. One rule, no game named here: the published
 # tree (`demo/payloads/`) is the only one that ships, and it never contains one.
 local/
+# Notes this agent keeps about the project while it works. Local state, not
+# source: nothing here is needed to build or run the kit.
+.workbuddy-ai/

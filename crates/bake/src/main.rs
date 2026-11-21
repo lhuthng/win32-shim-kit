@@ -8,12 +8,24 @@
 //!   `<out>/game/`         every file the game needs, and nothing a patcher left
 //!   `<out>/game/files.json`  `[{ name, bytes }]`, the list the page fetches
 //!   `<out>/artifact.json`    what the build is: executable, entry point, sizes
+//!   `<out>/bundle.json`      what the bundle is for a web host: slug, title,
+//!                            entry, save globs, sizes, module stamp
 //!
 //! `artifact.json` is the answer to "what did this build produce": the bytes the
 //! page will fetch, every root executable with its entry address and import
 //! count, the screen the module should seed, the kit version that produced it,
 //! and the module's own size. Nothing in it is game-specific except the facts
 //! read out of the executables.
+//!
+//! `bundle.json` is the web-bundle contract (`docs/web-bundle-contract.md`): the
+//! manifest a game host reads to upload, serve and save a payload without
+//! knowing what a shim is. Three environment variables feed what only the
+//! publisher knows: `SHIMKIT_SLUG` (default: the install folder's name, made
+//! URL-safe), `SHIMKIT_TITLE` (default: the slug, humanized), and
+//! `SHIMKIT_SAVES` (comma-separated save-file globs; default `*`, keep
+//! everything the guest writes). A bundle that ships more than one build -- one
+//! per language, say -- is assembled by `tools/pack-bundle.sh`, which writes the
+//! root manifest with `variants` and leaves each build's own manifest alone.
 //!
 //! A payload may hold more than one executable -- a split install names one per
 //! language, and each reads its own suffixed resources -- so format 2 lists them
@@ -183,6 +195,7 @@ fn main() -> ExitCode {
         artifact["default"] = json!(name);
     }
     let module = out.join("host_wasm.wasm");
+    let mut module_stamp: Option<serde_json::Value> = None;
     if let Ok(bytes) = fs::read(&module) {
         // The build stamp is the module's content, not its length: a rebuilt
         // module that happens to come out the same size is still a different
@@ -193,11 +206,13 @@ fn main() -> ExitCode {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x0100_0000_01b3);
         }
-        artifact["module"] = json!({
+        let stamp = json!({
             "name": "host_wasm.wasm",
             "bytes": bytes.len(),
             "build": format!("{hash:016x}"),
         });
+        artifact["module"] = stamp.clone();
+        module_stamp = Some(stamp);
     }
 
     let text = serde_json::to_string_pretty(&artifact).unwrap_or_default();
@@ -206,6 +221,8 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    write_bundle_manifest(&out, &install, default.as_deref(), entries.len(), total, module_stamp);
+
     println!(
         "baked {} files ({:.1} MiB) into {}",
         entries.len(),
@@ -213,6 +230,121 @@ fn main() -> ExitCode {
         game.display()
     );
     ExitCode::SUCCESS
+}
+
+/// Writes `<out>/bundle.json`, the web-bundle contract manifest (`docs/web-bundle-contract.md`).
+///
+/// Everything in it is either read out of this build (sizes, entry, module stamp)
+/// or named by the publisher through `SHIMKIT_SLUG`, `SHIMKIT_TITLE` and
+/// `SHIMKIT_SAVES`; nothing is invented. A missing `host_wasm.wasm` only leaves
+/// the module stamp out -- the manifest stays truthful, not complete.
+fn write_bundle_manifest(
+    out: &Path,
+    install: &Path,
+    entry: Option<&str>,
+    files: usize,
+    bytes: u64,
+    module_stamp: Option<serde_json::Value>,
+) {
+    let slug = std::env::var("SHIMKIT_SLUG")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| slug_from(install));
+    let title = std::env::var("SHIMKIT_TITLE")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| title_from(&slug));
+    let saves: Vec<String> = std::env::var("SHIMKIT_SAVES")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|glob| glob.trim().to_owned())
+                .filter(|glob| !glob.is_empty())
+                .collect()
+        })
+        .filter(|globs: &Vec<String>| !globs.is_empty())
+        .unwrap_or_else(|| vec!["*".to_owned()]);
+
+    let mut bundle = json!({
+        "format": 1,
+        "kind": "shimkit",
+        "slug": slug,
+        "title": title,
+        "saves": saves,
+        "game": { "files": files, "bytes": bytes },
+    });
+    if let Some(name) = entry {
+        bundle["entry"] = json!(name);
+    }
+    if let Some(stamp) = module_stamp {
+        bundle["module"] = stamp;
+    }
+    // `tools/build-web.sh` copies a release's `shimkit.json` beside the module it
+    // ships; when it is there, the manifest records which release the payload
+    // runs, so a hosted bundle can be traced back to its tag.
+    let shimkit = out.join("shimkit.json");
+    if let Ok(text) = fs::read_to_string(&shimkit) {
+        if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) {
+            let version = manifest.get("version").and_then(|value| value.as_str());
+            let tag = manifest.get("tag").and_then(|value| value.as_str());
+            if version.is_some() || tag.is_some() {
+                bundle["release"] = json!({
+                    "version": version,
+                    "tag": tag,
+                });
+            }
+        }
+    }
+
+    let text = serde_json::to_string_pretty(&bundle).unwrap_or_default();
+    match fs::write(out.join("bundle.json"), format!("{text}\n")) {
+        Ok(()) => {}
+        Err(error) => eprintln!("warning: {}: {error}", out.join("bundle.json").display()),
+    }
+}
+
+/// The install folder's name, made URL-safe: lowercased, runs of characters a
+/// URL path cannot carry collapsed into single dashes. `My Game (1998)` becomes
+/// `my-game-1998`.
+fn slug_from(install: &Path) -> String {
+    let name = install
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut slug = String::new();
+    for character in name.to_lowercase().chars() {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            slug.push(character);
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "game".to_owned()
+    } else {
+        slug
+    }
+}
+
+/// `doraemon-monopoly` becomes `Doraemon Monopoly`: the slug, word by word.
+fn title_from(slug: &str) -> String {
+    slug.split('-')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut characters = word.chars();
+            match characters.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn walk(root: &Path, directory: &Path, entries: &mut Vec<(String, u64)>) -> Result<(), String> {

@@ -80,6 +80,13 @@ The executable form is the usual one: a path to the game's own `.exe` names both
 the folder the payload is built from and the entry point it boots, so the loader
 never has to guess between two executables in one install.
 
+To put a rebuilt module into a payload that already has its game -- after an
+engine change, without the install to hand -- `bun tools/restamp.ts
+<payload-dir> <wasm>` copies it in and rewrites `module.bytes` and
+`module.build`. The stamp is the FNV-1a 64 of the module that `shimkit-bake`
+writes, and the page keys its fetch on it, so a module swapped in without it can
+be served from a cache still holding the old shims.
+
 `dist/` holds `host_wasm.wasm`, `game/` (the install plus a `files.json`), and
 `artifact.json` with the executable name, size, entry address and import count.
 It contains no page: any page that can fetch those bytes and call the module's
@@ -136,9 +143,11 @@ runs from its own executable, unmodified, against the shims in this repository.
 - **A shim is data, and wrong data is silent until it is not.** Each entry
   declares its own argument bytes. A wrong count corrupts the guest's stack
   later, which is why `evidence` is required and not decoration.
-- **An interpreter, not a recompiler.** Instructions are decoded and executed
-  one at a time, and a run is paced by a budget per call. A heavy frame costs
-  more calls, not a higher frame rate.
+- **An interpreter, not a recompiler.** Instructions are decoded once and kept,
+  and a straight-line run of them is executed as a unit ([the block
+  cache](#the-block-cache-2026-11-05)), but each instruction is still executed by
+  a switch in the host: there is no JIT and no recompiled basic block. A heavy
+  frame costs more calls, not a higher frame rate.
 - **32-bit PE images, one at a time.** No 64-bit image, and no second process.
 - **The environment a Windows box had is gone on purpose.** No CD drive and no
   registry, so a guest that checks for either stops before it draws. Saves are
@@ -182,7 +191,11 @@ runs from its own executable, unmodified, against the shims in this repository.
 
 The shipped wasm interprets about 38-50 M guest instructions per second (V8 and
 JavaScriptCore agree), and Hercules needs 1.7-2.2 M instructions per gameplay
-frame. That is the ceiling: 20-30 guest fps with the CPU entirely busy. The
+frame. That is the ceiling: 20-30 guest fps with the CPU entirely busy. **Since
+the [block cache](#the-block-cache-2026-11-05) the shipped module measures about
+65 M busy**, so the ceiling moved with it; the rest of this section is the
+measurement that led there, and its numbers are the ones each change was
+compared against. The
 page's old 12 ms slice out of a 16.7 ms `requestAnimationFrame` used only ~72%
 of it; `sliceMs: 16` in a payload's `config.json` measured **22.5 fps / 43.5 M
 instr/s** against **20.0 / 36.9 M** at 12 ms. 20 ms bought almost nothing,
@@ -193,6 +206,74 @@ times.
 Those slice figures were taken before the loop checked its clock at the right
 place; see [Frame pacing](#frame-pacing-2026-11-04) for the corrected
 measurement and for why the frame *rate* was never the number that mattered.
+
+### Measuring the interpreter without lying to yourself (2026-11-05)
+
+`bench.mjs` drives `wh_run` in a loop until an instruction limit, and reports
+instructions over wall time. That number moves with how much the guest sleeps:
+when it parks on a deadline, `wh_run` answers `Outcome::Steps` at once and
+retires nothing, and the driver keeps calling it until the deadline passes. On a
+400 M-instruction Hercules run that is up to 19 M empty calls and 6-8% of the
+wall clock, and it varies from run to run, so a 5% change cannot be seen through
+it.
+
+`tmp/perf/interp-rate.mjs` fixes both problems: it times every call and reports
+**busy MIPS** (instructions over time spent in calls that retired something)
+separately from the idle share, and it advances the guest clock by a fixed step
+per call instead of from wall time, so every build executes the *identical*
+instruction stream. Three runs of one build then land within 0.8% of each other
+instead of 6%.
+
+The clock cannot follow the instruction count, which is the obvious choice: a
+parked guest retires no instructions, so the clock that would wake it would
+never advance, and the run would hang. It also has to advance per call, not per
+retired instruction.
+
+With that harness, measured on Hercules over 400 M instructions:
+
+| change | busy MIPS | notes |
+| --- | --- | --- |
+| before | 48.1 | `lto = true`, `codegen-units = 1` were already set |
+| `Step` carries no payload | 48.6 | within noise; kept because it is cleaner |
+| `#[inline]` on the operand helpers | 48.2 | no effect; reverted |
+| **`wasm-opt -O3`** | **51.0-51.9** | **+6-8%**, and 2.00 MB -> 1.75 MB |
+| 64 K-entry decode cache | 46.1 | *worse*: the extra footprint costs more than the misses it saves |
+| 256 K-entry decode cache | 45.6 | worse still |
+
+`wasm-opt` is the one real win, so `tools/build-web.sh` now runs it when it is
+on `PATH` (`WASM_OPT=` overrides, and a missing tool is a note rather than a
+failure). Everything else in the table was measured and rejected, which is
+worth as much as the change that landed.
+
+### What the profile actually says
+
+`node --cpu-prof` over 1 G instructions, self time:
+
+| | |
+| --- | --- |
+| `cpu::exec::execute` | 32.9% |
+| `Session::run` | 22.3% |
+| `decode` + `Cursor::next` + `modrm` | 11.5% |
+| memory (`read_general`, `write_bytes`, `read_u32`, `check_writable`, `watch_store`) | ~10% |
+| `apply_alu` + `condition_met` | 3.8% |
+
+Two things this corrected in the plan for this work:
+
+- **Lazy flags are not worth doing here.** `apply_alu` is 2.7% of the profile,
+  and `condition_met` another 1.1%; the flags are already a handful of bools and
+  `parity` is one `count_ones`. A lazy-flag scheme would rewrite 95 flag sites to
+  chase ~4%.
+- **Hoisting the per-instruction checks in `run` is not worth doing either.**
+  They look expensive in the source, but a build with them removed outright
+  measured *slower* (41.0 MIPS), because disabling the thread switch changed what
+  the guest executed. `run`'s 22.3% is the inlined decode probe and the step
+  itself, not the checks.
+
+`execute` and `run` together are 55%: that is the dispatch loop doing its job,
+one instruction at a time. The next real step was not a micro-optimisation but a
+basic-block cache, and it is [below](#the-block-cache-2026-11-05): it took the
+shipped module from about 49 M busy to about 65 M. What is left after it is
+`execute` itself, which only the x86-to-wasm JIT that `v86` uses can move.
 
 PC sampling (`tmp/hercules-probe/bench.mjs <payload> <limit> 250000 profile`,
 with `BENCH_WASM=` to point at a module other than the deployed one) says where
@@ -208,6 +289,60 @@ Measure the scene you care about. A window picked by instruction count alone is
 a trap: guest progression is driven by guest *time*, so with the default probe
 clock the intro is still on screen after 1.5 G instructions, and a "gameplay"
 window there is really the loading logo.
+
+### The block cache (2026-11-05)
+
+`cpu::step` answers one instruction at a time, and everything around it -- the
+thread check, the trampoline compare, the native-replacement lookup, the timer
+check, the tail record, the decode-cache probe -- is paid once per *instruction*.
+None of it can change between two instructions that are next to each other in
+the image: a thread switch, a timer, a native replacement and a host stub all
+need a branch or a call to reach. So a run of instructions is decoded once, kept
+in `cpu::block`, and executed as a unit; the caller's checks are paid once per
+run instead.
+
+The correctness argument is one function, `ends_block`: a run ends after any
+instruction that can change the program counter (`jmp`, `jcc`, `call`, `ret`,
+`loop`/`loope`/`loopne`, `jecxz`) or end the run (`hlt`, `int3`). That is what
+lets the cache be a straight line with no edges to maintain. A run also stops
+before any address a native replacement answers for, because the host runs that
+address instead of the guest code, and before `PROC_BASE`, where host stubs
+begin. `.text` is read-only in this host, so a decoded instruction cannot go
+stale, exactly as for the decode cache.
+
+Measured on Hercules over 400 M instructions, interleaved so a thermal drift
+cannot favour either build:
+
+| | busy MIPS |
+| --- | --- |
+| before (`wasm-opt` only) | 39.5 - 51.0, median 49.5 |
+| **block cache** | **61.6 - 67.5, median 65.9** |
+
+**+33%**, and the spread narrows from 11 MIPS to 6, because a run touches the
+instruction stream linearly instead of probing a 900 KB direct-mapped cache once
+per instruction.
+
+The profile after it:
+
+| | before | after |
+| --- | --- | --- |
+| `cpu::exec::execute` | 32.9% | 30.0% |
+| `Session::run` | 22.3% | 5.6% |
+| `cpu::block::step` | -- | 12.3% |
+| decode | 11.5% | (inside block build) |
+| `apply_alu` | 2.7% | 5.1% |
+
+`Session::run` collapsing from 22.3% to 5.6% is the win; `apply_alu` rising as a
+*share* is just the total shrinking under it. `block::step`'s 12.3% is the loop
+that walks the run and calls `execute`, and `execute`'s 30% is the dispatch
+itself -- a switch over 134 mnemonics, which is what an interpreter is.
+
+One consequence worth knowing: `run(budget)` now counts *instructions retired*
+rather than trips round its loop, because one trip retires a whole run. The
+`for` bound stays as the hard limit so a path that gives the CPU away without
+retiring anything cannot spin. Verified against the previous module on Cave
+Story: identical instruction total (396 M) and identical frames presented, so
+the budget means what it meant before.
 
 ### Native sprite rows (2026-11-04)
 

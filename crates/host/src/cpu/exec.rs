@@ -99,6 +99,7 @@ fn read_operand(memory: &GuestMemory, cpu: &Cpu, operand: Operand, size: Size) -
     }
 }
 
+#[inline]
 fn read_general(memory: &GuestMemory, cpu: &Cpu, operand: Operand, size: Size) -> Result<u32> {
     match operand {
         Operand::Reg(register) => Ok(cpu.regs.get(register)),
@@ -158,6 +159,7 @@ fn write_operand(
     }
 }
 
+#[inline]
 fn write_general(
     memory: &mut GuestMemory,
     cpu: &mut Cpu,
@@ -231,6 +233,7 @@ fn pop_sized(memory: &GuestMemory, cpu: &mut Cpu, size: Size) -> Result<u32> {
 
 /// Computes `a op b` at `size` and records the flags the operation defines.
 /// `Cmp` and `Test` share it and simply discard the result.
+#[inline]
 fn apply_alu(cpu: &mut Cpu, operation: Alu, a: u32, b: u32, size: Size) -> u32 {
     let mask = mask_of(size);
     let sign = sign_of(size);
@@ -278,6 +281,7 @@ fn apply_alu(cpu: &mut Cpu, operation: Alu, a: u32, b: u32, size: Size) -> u32 {
     result
 }
 
+#[inline]
 fn condition_met(cpu: &Cpu, condition: Condition) -> bool {
     let flags = cpu.regs.flags;
     match condition {
@@ -1504,7 +1508,9 @@ pub fn execute(
                     let args = cpu.regs.esp;
                     let esp = args.wrapping_add(arg_bytes.unwrap_or(0));
                     cpu.regs.esp = esp;
-                    return Ok(Step::HostCall(HostCall {
+                    // Left on the CPU rather than carried in `Step`: see
+                    // [`Step::HostCall`].
+                    cpu.call = Some(HostCall {
                         slot: index,
                         thunk: None,
                         proc: None,
@@ -1513,7 +1519,8 @@ pub fn execute(
                         args,
                         esp,
                         arg_bytes,
-                    }));
+                    });
+                    return Ok(Step::HostCall);
                 }
                 let target = memory.read_u32(address)?;
                 push32(memory, cpu, return_address)?;
@@ -2000,9 +2007,10 @@ mod tests {
         )
         .unwrap();
 
-        let Step::HostCall(call) = step else {
+        let Step::HostCall = step else {
             panic!("expected a host call, got {step:?}");
         };
+        let call = cpu.call.expect("a host call leaves its call on the cpu");
         assert_eq!(call.iat_va, iat_va);
         assert_eq!(call.return_address, return_address);
         assert_eq!(call.arg_bytes, Some(arg_bytes));
