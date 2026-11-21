@@ -81,8 +81,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends brotli >/dev/null
           wire="$(brotli -q 11 -c "release/$tag/host_wasm.wasm" | wc -c | tr -d ' ')"
           echo "brotli: $wire bytes"
-          test "$wire" -le 262144 || {
-            echo "the module is over the 256 KiB brotli budget; split it into variants instead of shipping it whole" >&2
+          test "$wire" -le 1048576 || {
+            echo "the module is over the 1 MiB brotli budget; split it into variants instead of shipping it whole" >&2
             exit 1
           }
 

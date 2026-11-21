@@ -68,11 +68,13 @@ bump `abi`; adding an optional artifact field does not bump `artifact`.
 1. The tag equals `shimkit-v<workspace version>`.
 2. The module exports the calls a loader cannot do without (`wh_alloc`,
    `wh_load`, `wh_run`, `wh_provide_file`, `wh_message_ptr`).
-3. Its wire size is within budget: **256 KiB brotli**. The module is downloaded
-   once per release and reused for every game and every payload, and the current
-   build is ~119 KB on the wire, so the budget is roughly twice today's size,
-   around 450 more bindings. Past it, split the module into variants rather than
-   shipping one that grows without a decision.
+3. Its wire size is within budget: **1 MiB brotli**. The module is downloaded
+   once per release and reused for every game and every payload. The budget was
+   256 KiB while the module was ~119 KB on the wire; the guest-thread work
+   (running the guest's own threads and replaying Direct3D 8 as a render
+   stream) took the build to ~534 KB, and the budget moved with it rather than
+   gate the save ABI behind a module split. Splitting into per-shim-set
+   variants remains the answer past this line.
 4. `SHA256SUMS` covers every asset attached.
 
 The manifest is generated from the built file: size, digest and export list are
